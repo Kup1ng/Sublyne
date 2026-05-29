@@ -1,24 +1,39 @@
 //! HMAC envelope for the spoofed download path.
 //!
-//! Wire layout:
+//! Wire layout (v2 — the upload×download matrix release):
 //!
 //! ```text
-//! +----+----------------+----+--------------------+
-//! | 16 |       8        |  8 |        N           |
-//! +----+----------------+----+--------------------+
-//! |HMAC|   session_id   |seq |   forwarded UDP    |
-//! |    |   (random,     |    |   payload bytes    |
-//! |    |   per-Remote-  |    |                    |
-//! |    |   startup)     |    |                    |
-//! +----+----------------+----+--------------------+
-//!    16                24   32                  32+N
+//! +---+----+----------------+----+--------------------+
+//! | 1 | 16 |       8        |  8 |        N           |
+//! +---+----+----------------+----+--------------------+
+//! |ver|HMAC|   session_id   |seq |   forwarded UDP    |
+//! |   |    |   (random,     |    |   payload bytes    |
+//! |   |    |   per-Remote-  |    |                    |
+//! |   |    |   startup)     |    |                    |
+//! +---+----+----------------+----+--------------------+
+//!   0    1               17   25  33               33+N
 //! ```
 //!
 //! The HMAC is
-//! `HMAC-SHA256(psk32, session_id || seq || SHA256(payload))[0..16]`
+//! `HMAC-SHA256(psk32, ver || session_id || seq || SHA256(payload))[0..16]`
 //! where `psk32` is the operator's PSK expanded to 32 bytes via
 //! HKDF-SHA256 with a fixed info string. 16-byte truncation is
 //! intentional and documented in `.claude/skills/raw-sockets-and-spoofing/SKILL.md`.
+//!
+//! ## Why the 1-byte `ver` prefix (v2)
+//!
+//! The spoofed download path is the only authenticated channel that
+//! crosses between the two servers, and there is no inter-server control
+//! plane (PRD §2.3) to negotiate a protocol version. Before v2, a Client
+//! and Remote running mismatched Sublyne releases surfaced only as a
+//! silent stream of HMAC-auth drops ("the tunnel just doesn't pass
+//! traffic") with no clue why. v2 prepends a cleartext-and-authenticated
+//! [`PROTO_VERSION`] byte: the receiver reads it before the HMAC compute
+//! and returns [`OpenError::Version`] on mismatch, which the Client logs
+//! as an actionable "upgrade both servers to the same release" warning.
+//! Folding `ver` into the tag means it can't be flipped to force a
+//! downgrade. The byte is the wire-format break that makes v2.0.0 a major
+//! version bump — a v1 Remote's packets no longer validate on a v2 Client.
 //!
 //! ## Why no wall-clock timestamp any more
 //!
@@ -86,10 +101,20 @@ use std::io::Read;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Sublyne download-envelope wire protocol version. Sealed into (and
+/// authenticated by) every spoofed download packet as a 1-byte prefix so
+/// a Client and Remote running different releases produce a *diagnosable*
+/// [`OpenError::Version`] instead of a silent stream of auth drops. Bump
+/// this only on a wire-breaking envelope change — both servers must then
+/// upgrade together. v2 = the upload×download matrix release.
+pub const PROTO_VERSION: u8 = 2;
+/// Length of the [`PROTO_VERSION`] prefix.
+pub const VER_LEN: usize = 1;
 pub const HMAC_LEN: usize = 16;
 pub const SESSION_ID_LEN: usize = 8;
 pub const SEQ_LEN: usize = 8;
-pub const OVERHEAD: usize = HMAC_LEN + SESSION_ID_LEN + SEQ_LEN;
+/// Total fixed envelope overhead: `ver || tag || session_id || seq`.
+pub const OVERHEAD: usize = VER_LEN + HMAC_LEN + SESSION_ID_LEN + SEQ_LEN;
 
 /// Per-tunnel HMAC key holder.
 ///
@@ -234,6 +259,7 @@ pub fn seal_with(key: &HmacKey, session_id: u64, seq: u64, payload: &[u8], out: 
     let payload_hash = payload_hash.finalize();
 
     let mut h = key.primed_hasher();
+    h.update(&[PROTO_VERSION]);
     h.update(&session_id.to_be_bytes());
     h.update(&seq.to_be_bytes());
     h.update(&payload_hash);
@@ -241,6 +267,7 @@ pub fn seal_with(key: &HmacKey, session_id: u64, seq: u64, payload: &[u8], out: 
 
     out.clear();
     out.reserve(OVERHEAD + payload.len());
+    out.push(PROTO_VERSION);
     out.extend_from_slice(&tag[..HMAC_LEN]);
     out.extend_from_slice(&session_id.to_be_bytes());
     out.extend_from_slice(&seq.to_be_bytes());
@@ -261,6 +288,10 @@ pub fn seal(psk32: &[u8; 32], session_id: u64, seq: u64, payload: &[u8], out: &m
 pub enum OpenError {
     /// Body shorter than `OVERHEAD`. Not a real HMAC attempt.
     TooShort,
+    /// Envelope carried a protocol version this build does not speak —
+    /// almost always "the peer server is running a different Sublyne
+    /// release". The Client logs this as an actionable upgrade warning.
+    Version,
     /// HMAC tag did not match. Tampering or wrong PSK.
     Auth,
     /// Sequence number was already seen for this session (replay).
@@ -443,20 +474,25 @@ pub fn verify_with<'a>(key: &HmacKey, body: &'a [u8]) -> Result<(u64, u64, &'a [
     if body.len() < OVERHEAD {
         return Err(OpenError::TooShort);
     }
+    // Read the cleartext version prefix BEFORE the HMAC compute so a
+    // mismatched peer is rejected with a clear, cheap signal rather than
+    // burning a SHA-256 only to fail the tag compare. The version is also
+    // folded into the tag below, so it can't be forged to downgrade.
+    if body[0] != PROTO_VERSION {
+        return Err(OpenError::Version);
+    }
     let (hdr, payload) = body.split_at(OVERHEAD);
-    let tag = &hdr[..HMAC_LEN];
-    let session_id =
-        u64::from_be_bytes(hdr[HMAC_LEN..HMAC_LEN + SESSION_ID_LEN].try_into().unwrap());
-    let seq = u64::from_be_bytes(
-        hdr[HMAC_LEN + SESSION_ID_LEN..HMAC_LEN + SESSION_ID_LEN + SEQ_LEN]
-            .try_into()
-            .unwrap(),
-    );
+    let tag = &hdr[VER_LEN..VER_LEN + HMAC_LEN];
+    let sid_off = VER_LEN + HMAC_LEN;
+    let session_id = u64::from_be_bytes(hdr[sid_off..sid_off + SESSION_ID_LEN].try_into().unwrap());
+    let seq_off = sid_off + SESSION_ID_LEN;
+    let seq = u64::from_be_bytes(hdr[seq_off..seq_off + SEQ_LEN].try_into().unwrap());
 
     let mut payload_hash = Sha256::new();
     payload_hash.update(payload);
     let payload_hash = payload_hash.finalize();
     let mut h = key.primed_hasher();
+    h.update(&[PROTO_VERSION]);
     h.update(&session_id.to_be_bytes());
     h.update(&seq.to_be_bytes());
     h.update(&payload_hash);
@@ -639,6 +675,35 @@ mod tests {
     }
 
     #[test]
+    fn overhead_accounts_for_version_byte() {
+        // Pins the v2 wire contract: a 1-byte version prefix precedes the
+        // 16-byte tag, 8-byte session_id, and 8-byte seq.
+        assert_eq!(VER_LEN, 1);
+        assert_eq!(PROTO_VERSION, 2);
+        assert_eq!(OVERHEAD, 1 + 16 + 8 + 8);
+        // And the sealed body's first byte is the version on the wire.
+        let key = psk();
+        let mut buf = Vec::new();
+        seal(&key, SID, 1, b"x", &mut buf);
+        assert_eq!(buf[0], PROTO_VERSION);
+    }
+
+    #[test]
+    fn wrong_proto_version_is_rejected() {
+        // A packet from a peer speaking a different envelope version must
+        // be rejected with OpenError::Version (not Auth / not accepted),
+        // so the Client can surface an "upgrade both servers" warning.
+        let key = psk();
+        let mut buf = Vec::new();
+        seal(&key, SID, 1, b"payload", &mut buf);
+        // Corrupt only the version prefix; the receiver short-circuits on
+        // the prefix before the HMAC compare.
+        buf[0] = PROTO_VERSION.wrapping_add(1);
+        let mut w = SeqWindow::new();
+        assert_eq!(open(&key, &buf, &mut w), Err(OpenError::Version));
+    }
+
+    #[test]
     fn open_wrong_psk_rejects() {
         let key_a = psk();
         let key_b = derive_key("different");
@@ -758,7 +823,12 @@ mod tests {
             let key = derive_key("k");
             let mut buf = Vec::new();
             seal(&key, session_id, seq, &payload, &mut buf);
-            buf[flip] ^= 0xff;
+            // Flip a byte inside the 16-byte HMAC tag (at offset
+            // VER_LEN..VER_LEN+HMAC_LEN, after the version prefix) so the
+            // corruption is guaranteed to land on the tag and fail the
+            // constant-time compare with Auth — flipping byte 0 (the
+            // version prefix) would instead surface as Version.
+            buf[VER_LEN + flip] ^= 0xff;
             let mut w = SeqWindow::new();
             prop_assert_eq!(open(&key, &buf, &mut w), Err(OpenError::Auth));
         }
