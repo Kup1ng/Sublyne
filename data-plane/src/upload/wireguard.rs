@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{SessionKey, UploadTransport};
 
@@ -34,6 +34,11 @@ pub struct WireguardUpload {
     /// while the transport is alive.
     upload_target: SocketAddr,
     egress: Arc<UdpSocket>,
+    /// True when the egress socket is `connect()`-ed to `upload_target`
+    /// so `send()` (no per-datagram route lookup) is used instead of
+    /// `send_to()`. False only if `connect()` was refused at bind time,
+    /// in which case we fall back to the unconnected `send_to` path.
+    connected: bool,
 }
 
 impl WireguardUpload {
@@ -52,18 +57,43 @@ impl WireguardUpload {
         };
         let egress_std = std::net::UdpSocket::bind(bind)?;
         egress_std.set_nonblocking(true)?;
+        // SO_MARK before connect() so the route the kernel caches at
+        // connect time is the fwmark-steered one (the per-tunnel policy
+        // route through the seller's WireGuard interface).
         set_so_mark_fd(&egress_std, fwmark)?;
         crate::perf::tune_socket(&egress_std, "client/egress");
+        // `connect()` the egress to the fixed upload target. The
+        // destination never changes for the life of this transport (an
+        // `upload_target_addr` edit is an internal Stop+Start), so a
+        // connected datagram socket lets every send be a plain `send()`
+        // with no per-datagram destination resolution / route lookup —
+        // a small but free win on the throughput-lane (UDP-WG) mechanism.
+        // Soft-fail: if connect() is refused we keep the send_to path so
+        // packet flow never depends on it.
+        let connected = match egress_std.connect(upload_target) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    tunnel_id,
+                    target = %upload_target,
+                    err = %e,
+                    "client: WG egress connect() refused; falling back to send_to"
+                );
+                false
+            }
+        };
         let egress = Arc::new(UdpSocket::from_std(egress_std)?);
         info!(
             tunnel_id,
             target = %upload_target,
             fwmark = format!("0x{:x}", fwmark),
-            "client: WG-mode upload transport bound (R9a)"
+            connected,
+            "client: WG-mode upload transport bound"
         );
         Ok(Self {
             upload_target,
             egress,
+            connected,
         })
     }
 }
@@ -71,18 +101,21 @@ impl WireguardUpload {
 #[async_trait]
 impl UploadTransport for WireguardUpload {
     async fn send(&self, _session: SessionKey, payload: &[u8]) -> io::Result<()> {
-        // One syscall per packet — same as the pre-R9 path; the R2
-        // batching for upload was deliberately scoped to the listener
-        // side. Egress is `recv_from → send_to` single-thread today;
-        // batching could land in a follow-up but isn't a part of R9.
+        // One syscall per packet. On the connected socket (the normal
+        // case) `send()` skips the per-datagram destination + route
+        // resolution that `send_to()` repeats every call.
         //
         // `_session` is ignored: the WG path has exactly one egress
         // socket, so there's no per-flow routing to do. SOCKS5 honours
         // it for sticky pool routing.
-        self.egress
-            .send_to(payload, self.upload_target)
-            .await
-            .map(|_| ())
+        if self.connected {
+            self.egress.send(payload).await.map(|_| ())
+        } else {
+            self.egress
+                .send_to(payload, self.upload_target)
+                .await
+                .map(|_| ())
+        }
     }
 }
 

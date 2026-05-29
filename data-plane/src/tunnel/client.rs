@@ -68,6 +68,14 @@ use super::{sleep_or_stopped, MutableConfigSlot, ReasonSlot, StateSlot};
 /// new packet with a WARN.
 const DOWNLOAD_CHANNEL_CAP: usize = 4096;
 
+/// Process-wide sampled counter for download packets dropped because the
+/// peer Remote speaks a different envelope protocol version (the v2
+/// `proto_ver` prefix doesn't match this build's [`hmac::PROTO_VERSION`]).
+/// Sampled so a fully version-mismatched peer — where *every* packet is
+/// wrong — logs roughly once per 1000 instead of flooding the rotating
+/// app log on the hot path.
+static VERSION_MISMATCH_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// One sealed body queued for HMAC verify + deliver. The recv task does
 /// the cheap filtering (source IP/port + dst port for UDP/TCP) and
 /// peeks the seq purely to route the job to `worker = seq % N`; the
@@ -620,18 +628,25 @@ async fn spawn_v4_recv_loop(
     }
 }
 
-/// Peek at the 8-byte seq field that sits at offset
-/// `HMAC_LEN..HMAC_LEN+SEQ_LEN` in the sealed body. Returns `None` if
-/// the body is too short to even contain the envelope header — those
-/// get dropped anyway. Cheap (8 bytes BE → u64).
+/// Peek at the 8-byte seq field for fan-out routing. Returns `None` if
+/// the body is too short to contain the envelope header — those get
+/// dropped anyway. Cheap (8 bytes BE → u64).
+///
+/// The seq sits AFTER `ver(1) || tag(16) || session_id(8)`, i.e. at
+/// offset [`hmac::VER_LEN`] + [`hmac::HMAC_LEN`] + [`hmac::SESSION_ID_LEN`].
+/// A prior version of this function read at `HMAC_LEN..` — which is the
+/// **session_id**, not the seq — so `seq % n_workers` was actually
+/// `session_id % n_workers`, a constant for a given Remote session. That
+/// silently pinned the entire download-verify fan-out to one worker and
+/// defeated the parallelism this pipeline's module doc describes. Reading
+/// the true seq offset spreads packets across all workers as intended.
 fn peek_seq(sealed: &[u8]) -> Option<u64> {
     if sealed.len() < hmac::OVERHEAD {
         return None;
     }
+    let off = hmac::VER_LEN + hmac::HMAC_LEN + hmac::SESSION_ID_LEN;
     Some(u64::from_be_bytes(
-        sealed[hmac::HMAC_LEN..hmac::HMAC_LEN + hmac::SEQ_LEN]
-            .try_into()
-            .ok()?,
+        sealed[off..off + hmac::SEQ_LEN].try_into().ok()?,
     ))
 }
 
@@ -872,6 +887,25 @@ async fn deliver_verified_job(
                 transport = transport_label,
                 "client: download body too short for HMAC envelope"
             );
+        }
+        Err(OpenError::Version) => {
+            // The peer Remote sealed this packet with a different envelope
+            // protocol version — it's running an incompatible Sublyne
+            // release. Sampled so a wholesale-mismatched peer doesn't
+            // flood the log; counted as an auth drop so the dashboard's
+            // drop counter still moves and the operator goes looking.
+            let prev = VERSION_MISMATCH_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if prev % 1000 == 0 {
+                warn!(
+                    tunnel_id = id,
+                    transport = transport_label,
+                    dropped_total = prev + 1,
+                    "client: download packet carries a different Sublyne wire-protocol \
+                     version — the foreign (Remote) server is running an incompatible \
+                     release; upgrade BOTH servers to the same Sublyne version"
+                );
+            }
+            metrics.record_auth_drop();
         }
         Err(OpenError::Auth) => {
             warn!(

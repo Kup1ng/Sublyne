@@ -101,6 +101,94 @@ func (m UploadListenMode) IsValid() bool {
 	return m == UploadListenModeUDP || m == UploadListenModeSocks5TCP
 }
 
+// --- v2 upload × download matrix -------------------------------------
+//
+// The upload path is a function of the download transport, not an
+// independent choice. The download transport encodes the operator's
+// regime; the upload substrate is chosen to suit it:
+//
+//	download  │ allowed upload modes      │ default
+//	──────────┼───────────────────────────┼───────────
+//	udp       │ wireguard                 │ wireguard
+//	tcp_syn   │ socks5                    │ socks5
+//	icmp      │ wireguard, socks5         │ wireguard
+//	icmpv6    │ wireguard, socks5         │ wireguard
+//
+// The Remote side mirrors this via upload_listen_mode (udp pairs with
+// wireguard upload; socks5_tcp pairs with socks5 upload). These pure
+// helpers are the single source of truth the validator, the API
+// defaulting, and the panel's TypeScript mirror all agree with.
+
+// AllowedUploadModes returns the Client-side upload modes valid for a
+// download transport under the v2 matrix. Returns nil for an unknown
+// transport (the transport enum guard rejects those separately).
+func AllowedUploadModes(t Transport) []UploadMode {
+	switch t {
+	case TransportUDP:
+		return []UploadMode{UploadModeWireguard}
+	case TransportTCPSYN:
+		return []UploadMode{UploadModeSocks5}
+	case TransportICMP, TransportICMPv6:
+		return []UploadMode{UploadModeWireguard, UploadModeSocks5}
+	}
+	return nil
+}
+
+// DefaultUploadMode returns the sensible default upload mode for a
+// download transport: SOCKS5 for tcp_syn, WireGuard for everything else
+// (including unknown transports, which fail the enum guard anyway).
+func DefaultUploadMode(t Transport) UploadMode {
+	if t == TransportTCPSYN {
+		return UploadModeSocks5
+	}
+	return UploadModeWireguard
+}
+
+// UploadModeAllowed reports whether upload mode m is valid for download
+// transport t under the matrix.
+func UploadModeAllowed(t Transport, m UploadMode) bool {
+	for _, a := range AllowedUploadModes(t) {
+		if a == m {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowedListenModes returns the Remote-side upload-listen modes valid
+// for a download transport under the v2 matrix.
+func AllowedListenModes(t Transport) []UploadListenMode {
+	switch t {
+	case TransportUDP:
+		return []UploadListenMode{UploadListenModeUDP}
+	case TransportTCPSYN:
+		return []UploadListenMode{UploadListenModeSocks5TCP}
+	case TransportICMP, TransportICMPv6:
+		return []UploadListenMode{UploadListenModeUDP, UploadListenModeSocks5TCP}
+	}
+	return nil
+}
+
+// DefaultListenMode returns the sensible default Remote-side listen mode
+// for a download transport: socks5_tcp for tcp_syn, udp otherwise.
+func DefaultListenMode(t Transport) UploadListenMode {
+	if t == TransportTCPSYN {
+		return UploadListenModeSocks5TCP
+	}
+	return UploadListenModeUDP
+}
+
+// ListenModeAllowed reports whether listen mode m is valid for download
+// transport t under the matrix.
+func ListenModeAllowed(t Transport, m UploadListenMode) bool {
+	for _, a := range AllowedListenModes(t) {
+		if a == m {
+			return true
+		}
+	}
+	return false
+}
+
 // Role identifies which side of the asymmetric pair a tunnel runs on.
 // The set is closed: each server is either a Client (Iran-side end-user
 // listener) or a Remote (foreign-side forward target).

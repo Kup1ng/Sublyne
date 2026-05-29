@@ -104,12 +104,15 @@ func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, exist
 		ve.Fields["idle_timeout"] = "Idle timeout must be greater than zero seconds."
 	}
 
-	// Default the Remote-side upload-listen mode to 'udp' so every
-	// pre-R9 Client and Remote row keeps its existing listener with no
-	// operator action; validateRemoteFields enforces IsValid() once a
-	// Remote tunnel reaches its branch.
+	// Default the Remote-side upload-listen mode from the v2 matrix so a
+	// row that omits it lands on the right listener for its download
+	// transport (udp→udp, tcp_syn→socks5_tcp, icmp/icmpv6→udp);
+	// validateRemoteFields enforces IsValid() + the matrix once a Remote
+	// tunnel reaches its branch. DefaultListenMode returns 'udp' for an
+	// unknown transport, so a bad transport still defaults cleanly and
+	// fails on the separate enum guard above.
 	if t.UploadListenMode == "" {
-		t.UploadListenMode = UploadListenModeUDP
+		t.UploadListenMode = DefaultListenMode(t.DownloadTransport)
 	}
 
 	switch t.Role {
@@ -169,7 +172,7 @@ func validateClientFields(t *Tunnel, ve *ValidationError) {
 	// The Start handler returns NOT_IMPLEMENTED for socks5-mode tunnels
 	// in R8; R9 adds the dataplane client.
 	if t.UploadMode == "" {
-		t.UploadMode = UploadModeWireguard
+		t.UploadMode = DefaultUploadMode(t.DownloadTransport)
 	}
 	if !t.UploadMode.IsValid() {
 		ve.Fields["upload_mode"] = "Upload mode must be either 'wireguard' or 'socks5'."
@@ -196,6 +199,18 @@ func validateClientFields(t *Tunnel, ve *ValidationError) {
 				ve.Fields["wireguard_config"] = "Clear the legacy WireGuard text or switch upload mode to 'wireguard'."
 			}
 		}
+	}
+
+	// v2 upload × download matrix: the chosen upload mode must be valid
+	// for the download transport (udp→wireguard, tcp_syn→socks5,
+	// icmp/icmpv6→either). The panel restricts the picker so this only
+	// fires on a hand-crafted, imported, or pre-v2 off-matrix row — and
+	// when it does, it forces the operator to fix the pairing on their
+	// next edit. We only flag it when both enums are otherwise valid so
+	// the operator isn't shown two overlapping errors for one bad field.
+	if t.DownloadTransport.IsValid() && t.UploadMode.IsValid() &&
+		!UploadModeAllowed(t.DownloadTransport, t.UploadMode) {
+		ve.Fields["upload_mode"] = uploadMatrixMessage(t.DownloadTransport)
 	}
 
 	// The ping_smoothing_target_ms / pacing_target_ms fields only
@@ -242,10 +257,44 @@ func validateRemoteFields(t *Tunnel, ve *ValidationError) {
 	// but we still enforce the closed enum so an unrecognised value
 	// can't reach the dataplane via import/restore.
 	if t.UploadListenMode == "" {
-		t.UploadListenMode = UploadListenModeUDP
+		t.UploadListenMode = DefaultListenMode(t.DownloadTransport)
 	}
 	if !t.UploadListenMode.IsValid() {
 		ve.Fields["upload_listen_mode"] = "Upload listen mode must be either 'udp' or 'socks5_tcp'."
+	} else if t.DownloadTransport.IsValid() &&
+		!ListenModeAllowed(t.DownloadTransport, t.UploadListenMode) {
+		// v2 matrix: the Remote's listen mode must match the download
+		// transport (udp→udp, tcp_syn→socks5_tcp, icmp/icmpv6→either),
+		// mirroring the Client-side upload-mode matrix.
+		ve.Fields["upload_listen_mode"] = listenMatrixMessage(t.DownloadTransport)
+	}
+}
+
+// uploadMatrixMessage is the per-field error for a Client tunnel whose
+// upload_mode is off-matrix for its download transport. Only udp and
+// tcp_syn are restrictive (icmp/icmpv6 allow either mode, so they never
+// reach here).
+func uploadMatrixMessage(t Transport) string {
+	switch t {
+	case TransportUDP:
+		return "UDP download requires WireGuard upload (native UDP). Switch the upload mode to WireGuard, or change the download transport."
+	case TransportTCPSYN:
+		return "TCP-SYN download requires SOCKS5 upload (real TCP stream). Switch the upload mode to SOCKS5, or change the download transport."
+	default:
+		return "This upload mode isn't valid for the selected download transport."
+	}
+}
+
+// listenMatrixMessage is the Remote-side counterpart to
+// uploadMatrixMessage for the upload_listen_mode field.
+func listenMatrixMessage(t Transport) string {
+	switch t {
+	case TransportUDP:
+		return "UDP download requires the UDP upload-listen mode. Switch the listen mode to UDP, or change the download transport."
+	case TransportTCPSYN:
+		return "TCP-SYN download requires the SOCKS5-TCP upload-listen mode. Switch the listen mode to SOCKS5-TCP, or change the download transport."
+	default:
+		return "This upload-listen mode isn't valid for the selected download transport."
 	}
 }
 

@@ -267,6 +267,151 @@ func TestValidate_IPv6LocalListenIsAcceptedAndScannedForConflicts(t *testing.T) 
 	}
 }
 
+// --- v2 upload × download matrix --------------------------------------
+
+func TestUploadMatrix_Helpers(t *testing.T) {
+	if got := DefaultUploadMode(TransportTCPSYN); got != UploadModeSocks5 {
+		t.Errorf("DefaultUploadMode(tcp_syn) = %q, want socks5", got)
+	}
+	if got := DefaultUploadMode(TransportUDP); got != UploadModeWireguard {
+		t.Errorf("DefaultUploadMode(udp) = %q, want wireguard", got)
+	}
+	if !UploadModeAllowed(TransportICMP, UploadModeSocks5) ||
+		!UploadModeAllowed(TransportICMP, UploadModeWireguard) {
+		t.Errorf("icmp should allow both upload modes")
+	}
+	if UploadModeAllowed(TransportUDP, UploadModeSocks5) {
+		t.Errorf("udp must not allow socks5 upload")
+	}
+	if UploadModeAllowed(TransportTCPSYN, UploadModeWireguard) {
+		t.Errorf("tcp_syn must not allow wireguard upload")
+	}
+	if got := DefaultListenMode(TransportTCPSYN); got != UploadListenModeSocks5TCP {
+		t.Errorf("DefaultListenMode(tcp_syn) = %q, want socks5_tcp", got)
+	}
+	if !ListenModeAllowed(TransportICMPv6, UploadListenModeUDP) ||
+		!ListenModeAllowed(TransportICMPv6, UploadListenModeSocks5TCP) {
+		t.Errorf("icmpv6 should allow both listen modes")
+	}
+	if ListenModeAllowed(TransportUDP, UploadListenModeSocks5TCP) {
+		t.Errorf("udp must not allow socks5_tcp listen")
+	}
+}
+
+func TestValidate_Matrix_ClientTCPSYNRejectsWireguard(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("tcpsyn-wg")
+	c.DownloadTransport = TransportTCPSYN
+	c.UploadMode = UploadModeWireguard // off-matrix; tcp_syn needs socks5
+	err := Validate(ctx, repo, RoleClient, &c, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["upload_mode"]; !ok {
+		t.Errorf("expected upload_mode matrix error, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_Matrix_ClientUDPRejectsSOCKS5(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("udp-socks5")
+	c.DownloadTransport = TransportUDP
+	c.UploadMode = UploadModeSocks5 // off-matrix; udp needs wireguard
+	c.WireguardConfig = sql.NullString{}
+	c.Socks5ProxyID = sql.NullInt64{Int64: 1, Valid: true}
+	err := Validate(ctx, repo, RoleClient, &c, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["upload_mode"]; !ok {
+		t.Errorf("expected upload_mode matrix error, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_Matrix_ClientTCPSYNWithSOCKS5OK(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("tcpsyn-socks5")
+	c.DownloadTransport = TransportTCPSYN
+	c.UploadMode = UploadModeSocks5
+	c.WireguardConfig = sql.NullString{} // clear legacy WG text
+	c.Socks5ProxyID = sql.NullInt64{Int64: 1, Valid: true}
+	if err := Validate(ctx, repo, RoleClient, &c, 0); err != nil {
+		t.Fatalf("tcp_syn + socks5 must be matrix-valid: %v", err)
+	}
+}
+
+func TestValidate_Matrix_ClientICMPAllowsEither(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+
+	// icmp + wireguard (sampleClient ships a legacy WG text → satisfies
+	// the wg requirement).
+	wgc := sampleClient("icmp-wg")
+	wgc.DownloadTransport = TransportICMP
+	wgc.UploadMode = UploadModeWireguard
+	if err := Validate(ctx, repo, RoleClient, &wgc, 0); err != nil {
+		t.Fatalf("icmp + wireguard must be matrix-valid: %v", err)
+	}
+
+	// icmp + socks5.
+	sc := sampleClient("icmp-socks5")
+	sc.DownloadTransport = TransportICMP
+	sc.UploadMode = UploadModeSocks5
+	sc.WireguardConfig = sql.NullString{}
+	sc.Socks5ProxyID = sql.NullInt64{Int64: 1, Valid: true}
+	if err := Validate(ctx, repo, RoleClient, &sc, 0); err != nil {
+		t.Fatalf("icmp + socks5 must be matrix-valid: %v", err)
+	}
+}
+
+func TestValidate_Matrix_RemoteTCPSYNRequiresSocks5TCP(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	r := sampleRemote("r-tcpsyn-udp")
+	r.DownloadTransport = TransportTCPSYN
+	r.UploadListenMode = UploadListenModeUDP // off-matrix
+	err := Validate(ctx, repo, RoleRemote, &r, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["upload_listen_mode"]; !ok {
+		t.Errorf("expected upload_listen_mode matrix error, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_Matrix_RemoteUDPRejectsSocks5TCP(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	r := sampleRemote("r-udp-socks5tcp")
+	r.DownloadTransport = TransportUDP
+	r.UploadListenMode = UploadListenModeSocks5TCP // off-matrix
+	err := Validate(ctx, repo, RoleRemote, &r, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["upload_listen_mode"]; !ok {
+		t.Errorf("expected upload_listen_mode matrix error, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_Matrix_RemoteTCPSYNWithSocks5TCPOK(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	r := sampleRemote("r-tcpsyn-ok")
+	r.DownloadTransport = TransportTCPSYN
+	r.UploadListenMode = UploadListenModeSocks5TCP
+	if err := Validate(ctx, repo, RoleRemote, &r, 0); err != nil {
+		t.Fatalf("tcp_syn + socks5_tcp must be matrix-valid: %v", err)
+	}
+}
+
 func TestValidate_LocalListenSameAsDownloadReceiveIsRejected(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()

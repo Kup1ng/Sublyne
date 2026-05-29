@@ -158,11 +158,10 @@ func TestSOCKS5_DeleteRefusedWhileReferenced(t *testing.T) {
 	_ = json.Unmarshal(create.Body, &crResp)
 
 	// Create a tunnel that links via upload_mode=socks5 +
-	// socks5_proxy_id. Drop the legacy wireguard_config blob from the
-	// fixture body so validation accepts the socks5-mode tunnel.
-	socks5Body := strings.Replace(validClientBody,
-		`"wireguard_config": "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0"`,
-		`"upload_mode": "socks5", "socks5_proxy_id": `+strconv.FormatInt(crResp.Proxy.ID, 10), 1)
+	// socks5_proxy_id. SOCKS5 upload pairs with the tcp_syn download
+	// transport under the v2 matrix (socks5ClientBody handles both the
+	// transport flip and dropping the legacy wireguard_config blob).
+	socks5Body := socks5ClientBody(crResp.Proxy.ID, "")
 	tunRes := postJSON(t, panelURL(s, "/api/tunnels"), socks5Body, hdr)
 	if tunRes.Status != http.StatusCreated {
 		t.Fatalf("seed tunnel: %d %s", tunRes.Status, string(tunRes.Body))
@@ -201,9 +200,7 @@ func TestSOCKS5Tunnel_StartFlipsEnabled(t *testing.T) {
 	}
 	_ = json.Unmarshal(cr.Body, &crResp)
 
-	socks5Body := strings.Replace(validClientBody,
-		`"wireguard_config": "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0"`,
-		`"upload_mode": "socks5", "socks5_proxy_id": `+strconv.FormatInt(crResp.Proxy.ID, 10), 1)
+	socks5Body := socks5ClientBody(crResp.Proxy.ID, "")
 	create := postJSON(t, panelURL(s, "/api/tunnels"), socks5Body, hdr)
 	if create.Status != http.StatusCreated {
 		t.Fatalf("create tunnel: %d %s", create.Status, string(create.Body))
@@ -250,9 +247,7 @@ func TestSOCKS5Tunnel_StartMissingProxyIs400(t *testing.T) {
 	}
 	_ = json.Unmarshal(cr.Body, &crResp)
 
-	socks5Body := strings.Replace(validClientBody,
-		`"wireguard_config": "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0"`,
-		`"upload_mode": "socks5", "socks5_proxy_id": `+strconv.FormatInt(crResp.Proxy.ID, 10), 1)
+	socks5Body := socks5ClientBody(crResp.Proxy.ID, "")
 	tunRes := postJSON(t, panelURL(s, "/api/tunnels"), socks5Body, hdr)
 	if tunRes.Status != http.StatusCreated {
 		t.Fatalf("create tunnel: %d %s", tunRes.Status, string(tunRes.Body))
@@ -307,10 +302,8 @@ func TestSOCKS5Tunnel_RejectsBothPickers(t *testing.T) {
 	}
 	_ = json.Unmarshal(sx.Body, &sxResp)
 
-	bothBody := strings.Replace(validClientBody,
-		`"wireguard_config": "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0"`,
-		`"upload_mode": "socks5", "socks5_proxy_id": `+strconv.FormatInt(sxResp.Proxy.ID, 10)+
-			`, "wg_config_id": `+strconv.FormatInt(wgResp.Config.ID, 10), 1)
+	bothBody := socks5ClientBody(sxResp.Proxy.ID,
+		`, "wg_config_id": `+strconv.FormatInt(wgResp.Config.ID, 10))
 	res := postJSON(t, panelURL(s, "/api/tunnels"), bothBody, hdr)
 	if res.Status != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s, want 400", res.Status, string(res.Body))

@@ -223,37 +223,83 @@ pub fn tune_socket<F: AsRawFd>(sock: &F, label: &str) {
 /// - `SO_KEEPALIVE = on` + `TCP_KEEPIDLE/INTVL/CNT` — sends probes
 ///   when idle so a NAT timeout drops the binding instead of just
 ///   freezing the socket. Probes also act as NAT-keepalive, refreshing
-///   the binding so the connection rarely goes stale in the first
-///   place. Idle detection budget: 10 + 5×3 = 25 s. The 10 s idle is
-///   deliberately shorter than common carrier-grade-NAT idle timeouts
-///   so the binding is refreshed before the proxy/NAT can drop it.
-/// - `TCP_USER_TIMEOUT = 10 s` — the case the keepalive can't catch:
-///   we ARE writing (so the idle timer keeps getting reset), but the
-///   bytes aren't being ACKed because the path is silently broken.
-///   The kernel will now abort the connection after 10 s of un-ACKed
-///   data, the next `write_all` returns Err, and our pool marks the
-///   slot broken + spawns a reconnect. Without this, the kernel keeps
-///   retransmitting for ~120 s and the application sees nothing wrong.
-const SOCKS5_KEEPALIVE_TIME: Duration = Duration::from_secs(10);
-const SOCKS5_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
-const SOCKS5_KEEPALIVE_RETRIES: u32 = 3;
-const SOCKS5_USER_TIMEOUT: Duration = Duration::from_secs(10);
+///   the binding so the connection rarely goes stale in the first place.
+/// - `TCP_USER_TIMEOUT` — the case the keepalive can't catch: we ARE
+///   writing (so the idle timer keeps getting reset), but the bytes
+///   aren't being ACKed because the path is silently broken. The kernel
+///   aborts the connection after the timeout of un-ACKed data, the next
+///   `write_all` returns Err, and our pool marks the slot broken +
+///   reconnects. Without this, the kernel retransmits for ~120 s and the
+///   application sees nothing wrong.
+///
+/// ## Two profiles (v2 upload×download matrix)
+///
+/// The right timer values depend on which of the six upload mechanisms
+/// owns the socket:
+///
+/// - [`Socks5KeepaliveProfile::Bulk`] — the **TCP-SOCKS5** mechanism. A
+///   bulk TCP stream is almost always writing, so the keepalive idle
+///   timer rarely fires; what matters is a USER_TIMEOUT long enough to
+///   ride out a transient bulk-congestion stall without tearing down a
+///   healthy-but-slow link (mirrors the 15 s `WRITE_BACKSTOP` on the
+///   client driver). Idle 25 s, USER_TIMEOUT 15 s.
+/// - [`Socks5KeepaliveProfile::Latency`] — the **ICMP / ICMPv6-SOCKS5**
+///   mechanisms (and the historical default). A low-rate trickle leaves
+///   the socket idle, so a short idle (10 s, below common CG-NAT idle
+///   timeouts) keeps the binding fresh, and a short USER_TIMEOUT (10 s)
+///   detects a silently-broken link within seconds. These are the proven
+///   pre-matrix values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Socks5KeepaliveProfile {
+    /// Bulk TCP stream — TCP-SOCKS5. Longer idle + USER_TIMEOUT.
+    Bulk,
+    /// Latency-sensitive trickle — ICMP/ICMPv6-SOCKS5. Short timers.
+    Latency,
+}
 
-/// Apply the SOCKS5-specific TCP timers documented above to `sock`.
-/// Safe to call on either side of a SOCKS5 hop (Iran client → proxy
-/// outbound, or proxy → Remote inbound). `label` shows up in WARN logs
-/// only if the kernel rejects a setsockopt — pick something short like
-/// `"socks5/client-out"` or `"socks5/remote-in"`.
-pub fn tune_socks5_tcp_socket<F: AsFd>(sock: &F, label: &str) {
+struct KeepaliveTimers {
+    idle: Duration,
+    interval: Duration,
+    retries: u32,
+    user_timeout: Duration,
+}
+
+impl Socks5KeepaliveProfile {
+    fn timers(self) -> KeepaliveTimers {
+        match self {
+            Socks5KeepaliveProfile::Bulk => KeepaliveTimers {
+                idle: Duration::from_secs(25),
+                interval: Duration::from_secs(5),
+                retries: 3,
+                user_timeout: Duration::from_secs(15),
+            },
+            Socks5KeepaliveProfile::Latency => KeepaliveTimers {
+                idle: Duration::from_secs(10),
+                interval: Duration::from_secs(5),
+                retries: 3,
+                user_timeout: Duration::from_secs(10),
+            },
+        }
+    }
+}
+
+/// Apply the SOCKS5-specific TCP timers documented above to `sock`, using
+/// the timer set for `profile`. Safe to call on either side of a SOCKS5
+/// hop (Iran client → proxy outbound, or proxy → Remote inbound).
+/// `label` shows up in WARN logs only if the kernel rejects a setsockopt
+/// — pick something short like `"socks5/client-out"` or
+/// `"socks5/remote-in"`.
+pub fn tune_socks5_tcp_socket<F: AsFd>(sock: &F, label: &str, profile: Socks5KeepaliveProfile) {
     let r = SockRef::from(sock);
+    let t = profile.timers();
     let keepalive = TcpKeepalive::new()
-        .with_time(SOCKS5_KEEPALIVE_TIME)
-        .with_interval(SOCKS5_KEEPALIVE_INTERVAL)
-        .with_retries(SOCKS5_KEEPALIVE_RETRIES);
+        .with_time(t.idle)
+        .with_interval(t.interval)
+        .with_retries(t.retries);
     if let Err(e) = r.set_tcp_keepalive(&keepalive) {
         warn!(label, err = %e, "perf: SOCKS5 set_tcp_keepalive failed (continuing)");
     }
-    if let Err(e) = r.set_tcp_user_timeout(Some(SOCKS5_USER_TIMEOUT)) {
+    if let Err(e) = r.set_tcp_user_timeout(Some(t.user_timeout)) {
         warn!(label, err = %e, "perf: SOCKS5 set_tcp_user_timeout failed (continuing)");
     }
 }
