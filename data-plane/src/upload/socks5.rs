@@ -1,43 +1,47 @@
-//! SOCKS5 upload transport — Phase R9b (N parallel connections).
+//! SOCKS5 upload transport — N parallel connections, decoupled writers.
 //!
-//! Round 2 introduces SOCKS5 as an alternative upload path. The
-//! operator's real-world setup is a SOCKS5 proxy that load-balances
-//! across N Starlink uplinks: each new TCP connection to the proxy
-//! lands on a different link, so opening N connections in parallel
-//! uses N links concurrently. R9a built the single-connection
-//! foundation; **R9b grows the pool to N** with per-session sticky
-//! routing, rehash-on-failure, background reconnect, and a live
-//! resize hook driven by the manager's hot-reload path.
+//! The operator's real-world setup is a SOCKS5 proxy that load-balances
+//! across N Starlink uplinks: each new TCP connection to the proxy lands
+//! on a different link, so opening N connections in parallel uses N
+//! links concurrently. Per-session sticky routing keeps each end-user
+//! UDP flow on one connection so the Remote sees that flow in order.
 //!
-//! ## R9b scope (this module)
+//! ## Why the writer is decoupled from the recv loop (the stability fix)
 //!
-//! - Pool of **N** TCP connections to `(target.host, target.port)`,
-//!   each completing the SOCKS5 greeting + (optional) username/password
-//!   subnegotiation + CONNECT to the Remote's `upload_target_addr`.
-//! - **Per-session sticky** routing: hash
-//!   `(client_addr, local_port) → slot_index ∈ [0, N)`. All packets
-//!   from one end-user flow go through the same TCP connection so the
-//!   Remote sees them in order.
-//! - On a write failure: mark the slot broken, kick off a background
-//!   reconnect that retries with backoff, and let the very-next send
-//!   for that session **rehash to the next healthy slot** so no flow
-//!   permanently dies because one Starlink link blipped.
-//! - **Live resize** of the pool via [`Socks5Upload::resize_pool`]
-//!   (wired through the [`super::UploadTransport`] trait so the
-//!   manager's `UpdateTunnel` path can call it without coupling to the
-//!   concrete type). Growing opens additional connections; shrinking
-//!   simply drops the surplus slot `Arc`s — outstanding sends keep the
-//!   underlying connection alive until they finish.
-//! - **`[u16 BE length][payload bytes]`** framing on every connection,
-//!   identical to R9a. The Remote-side decoder in `tunnel/remote.rs`
-//!   accepts multiple concurrent inbound TCP connections (R9a spawned
-//!   one task per `accept`), so it scales naturally to N.
+//! The upload listener (`tunnel/client.rs::spawn_upload_task`) is a
+//! single task that, for every datagram, used to `await` the upload
+//! transport's `send()` inline. For the WireGuard transport that is a
+//! non-blocking `send_to`, so it was fine. For SOCKS5-over-TCP it was
+//! the dominant cause of the user-visible "stalls then limps / sometimes
+//! won't connect" symptom: a single congested Starlink link fills its
+//! TCP send buffer, `write_all` blocks, and because it was awaited inline
+//! the **whole tunnel's** recv loop froze — no `recv_from` ran, the
+//! kernel UDP listener queue overflowed, and packets for *every* session
+//! were dropped, not just the flow on the bad link. The old 1.5 s
+//! write-timeout then tore down the healthy-but-congested connection and
+//! triggered a reconnect storm.
+//!
+//! The fix: each pool slot owns a **bounded mpsc queue** drained by a
+//! dedicated **driver task** that holds the `TcpStream` and is the only
+//! thing that writes to it, reconnects it, or closes it. The hot-path
+//! `send()` becomes a non-blocking `try_send` onto the target slot's
+//! queue (rehashing to a healthy sibling when the primary is unhealthy
+//! or its queue is full, dropping only when the whole pool is saturated —
+//! UDP best-effort). The recv loop therefore never blocks on a TCP
+//! write, one slow link can never stall good flows, and congestion
+//! degrades gracefully (localized drops) instead of freezing the tunnel.
+//!
+//! Dead-peer detection is left to the kernel: `TCP_USER_TIMEOUT` (10 s)
+//! + keepalive (see `perf::tune_socks5_tcp_socket`) make a stuck
+//! `write_all` return `Err` within seconds, which the driver turns into
+//! a reconnect. A generous [`WRITE_BACKSTOP`] only guards the
+//! pathological case where the kernel timer could not be set.
 //!
 //! ## Wire framing
 //!
-//! SOCKS5 carries TCP, not UDP. The proxy is a passthrough — anything
-//! we write on the socket arrives at the Remote in order. So we
-//! re-segment ourselves:
+//! SOCKS5 carries TCP, not UDP. The proxy is a passthrough — anything we
+//! write on the socket arrives at the Remote in order. So we re-segment
+//! ourselves:
 //!
 //! ```text
 //! [u16 BE length][payload bytes] ... repeat per UDP packet
@@ -67,13 +71,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
@@ -81,46 +86,52 @@ use crate::spec::Socks5Target;
 
 use super::{SessionKey, UploadTransport};
 
-// ---- Sublyne hardening constants ---------------------------------------
-//
-// The numbers are tuned against the user-visible symptoms reported on the
-// predecessor's live tunnel — "WG client takes 10 s to connect / stalls
-// then limps" with `upload_mode=socks5`. The three failure modes the
-// constants address are documented next to each value.
+// ---- Sublyne tuning constants ------------------------------------------
 
-/// How long we'll wait for the SOCKS5 handshake + TCP connect before
-/// declaring a slot dead and parking it. Generous against a slow proxy
-/// hop yet short enough that a truly dead Starlink link doesn't hang the
-/// tunnel start for minutes.
+/// How long the SOCKS5 handshake + TCP connect may take before a slot's
+/// connect attempt is abandoned and retried under backoff. Generous
+/// against a slow proxy hop yet short enough that a dead link doesn't
+/// hang a reconnect for minutes.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a single write_all to a slot is allowed to take before we
-/// abort it, mark the slot broken, and rehash the session to a healthy
-/// sibling. Picks an envelope wider than typical Starlink RTT (~100 ms)
-/// but shorter than the kernel's silent-stall default. Without this an
-/// idle proxy NAT binding that the kernel keepalive missed would let a
-/// write_all park forever on the awaiting ACK.
-const WRITE_TIMEOUT: Duration = Duration::from_millis(1500);
-
 /// Maximum time `connect()` waits for `min_ready_slots` of the pool to
-/// complete their SOCKS5 handshake before bouncing Start with a clear
-/// "pool warm-up failed" error. Set generously — a slow Starlink first
-/// connect can take a couple of seconds — but short enough that an
-/// honestly broken proxy fails fast.
+/// become healthy before failing Start with a clear "pool warm-up
+/// failed" error. The single Start gate — every slot is non-fatal, so a
+/// slow first link can't fail Start as long as `min_ready_slots`
+/// eventually come up within this window.
 const WARMUP_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Poll cadence inside the warm-up loop. Cheap; the loop is asleep most
-/// of the time and the workers are doing the real work.
-const WARMUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Poll cadence inside the warm-up loop. Cheap; the driver tasks do the
+/// real connect work concurrently.
+const WARMUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Exponential backoff base for the reconnect worker and the slot-park
-/// cooldown. After K consecutive failures the slot is parked for
-/// `min(BACKOFF_BASE * 2^K, BACKOFF_CAP)`.
+/// Exponential backoff base + cap for a slot driver's reconnect loop.
+/// After K consecutive failures the driver waits
+/// `min(BACKOFF_BASE * 2^K, BACKOFF_CAP)` before retrying.
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_CAP: Duration = Duration::from_secs(8);
 
-/// Compute the parking / reconnect backoff for `consecutive_failures`.
-/// Exposed as a free function so it's easy to unit-test the curve.
+/// Per-slot bounded send-queue depth, in frames. Deep enough to absorb
+/// scheduler jitter between the single recv loop and a driver task, yet
+/// shallow enough to bound added latency / memory: at a ~1400-byte MTU
+/// this is ≈ 0.7 MiB of buffering per connection. When a slot's queue is
+/// full the hot path rehashes to a sibling (or drops) instead of
+/// blocking — that is the graceful-degradation backpressure point that
+/// replaces the old recv-loop freeze.
+const SLOT_QUEUE_CAP: usize = 512;
+
+/// Backstop write timeout. Primary dead-peer detection is the kernel's
+/// `TCP_USER_TIMEOUT` (10 s) + keepalive layered in
+/// `perf::tune_socks5_tcp_socket`; this only guards the pathological
+/// case where that setsockopt was refused. It is deliberately far larger
+/// than the old 1.5 s value so a merely-congested-but-alive link is NOT
+/// torn down — a write that blocks here for 15 s means the link can't
+/// even drain the 4 MiB kernel send buffer, i.e. it is effectively dead
+/// and rotating onto a fresh proxy connection is the right move.
+const WRITE_BACKSTOP: Duration = Duration::from_secs(15);
+
+/// Compute the reconnect backoff for `consecutive_failures`. Exposed as
+/// a free function so the curve is easy to unit-test.
 fn backoff_for_failures(consecutive_failures: u32) -> Duration {
     let shift = consecutive_failures.min(5);
     let base_ms = BACKOFF_BASE.as_millis() as u64;
@@ -129,73 +140,58 @@ fn backoff_for_failures(consecutive_failures: u32) -> Duration {
     Duration::from_millis(capped)
 }
 
-/// SOCKS5 upload-path transport with a live pool of N TCP connections
-/// to one proxy. The proxy is itself a load-balancer across multiple
+/// SOCKS5 upload-path transport with a live pool of N TCP connections to
+/// one proxy. The proxy is itself a load-balancer across multiple
 /// Starlink uplinks; each new TCP connection lands on a different link,
 /// so the pool genuinely uses N links concurrently.
 pub struct Socks5Upload {
     tunnel_id: i64,
     target: Socks5Target,
     upload_target: SocketAddr,
-    /// The pool. Reads are cheap (clone the inner `Vec<Arc<Slot>>` and
-    /// release the lock immediately so awaits don't hold it). Writes
-    /// happen only on `resize_pool`. The inner `Vec` itself is owned by
-    /// the `RwLock`; slot `Arc`s live as long as someone holds a
-    /// reference, so a `resize_pool` that shrinks the pool doesn't
-    /// yank a connection out from under an in-flight `send`.
+    /// The pool. Reads clone the inner `Vec<Arc<Slot>>` and release the
+    /// lock immediately so the hot path never holds it across an await.
+    /// Writes happen only on `resize_pool` / `shutdown`.
     slots: Arc<RwLock<Vec<Arc<Slot>>>>,
-    /// Snapshot of the tunnel's stop watch so background reconnect
-    /// tasks abandon cleanly on shutdown.
+    /// Tunnel stop watch — propagated to each driver task so they wind
+    /// down cleanly on `StopTunnel`.
     stop_rx: watch::Receiver<bool>,
+    /// Count of frames dropped because the whole pool was saturated /
+    /// unhealthy. Sampled into the log to avoid per-packet spam.
+    drops: Arc<AtomicU64>,
 }
 
-/// One slot in the pool. Holds the TCP stream (when healthy) and a
-/// `Notify` the background reconnect task waits on to gate retry
-/// attempts. The slot mutex serialises concurrent writes from the hot
-/// path AND any reconnect-install: a `send` that's mid-write will
-/// finish before a reconnect can replace the stream, and vice versa.
+/// One slot in the pool. The hot path only ever touches `tx` (a
+/// non-blocking `try_send`) and `healthy` (a lock-free flag); everything
+/// stream-related lives inside the slot's driver task.
 struct Slot {
-    /// Stable per-tunnel index for log lines and tests. Doesn't
-    /// influence routing — the hash does.
-    index: usize,
-    /// `Some(stream)` = live TCP+SOCKS5-handshake'd connection.
-    /// `None` = slot is broken; the background reconnect task is
-    /// either already trying to fix it or about to. Either way, the
-    /// hot path skips this slot and probes the next one.
-    state: Mutex<SlotState>,
-    /// Background reconnect task is parked on this until the next
-    /// `notify_one()` call. The hot path nudges it when it detects a
-    /// broken slot; the task also wakes itself on its own backoff
-    /// timer if no one nudged.
-    reconnect_kick: Notify,
-}
-
-struct SlotState {
-    stream: Option<TcpStream>,
-    /// True when a background reconnect task is in flight for this
-    /// slot. Prevents a burst of write failures from spawning N
-    /// duplicate reconnect tasks all racing on the same proxy.
-    reconnecting: bool,
-    /// Sublyne hardening: number of consecutive failures (handshake
-    /// failures during reconnect or write failures during the hot
-    /// path). Resets to 0 on the next successful reconnect or write.
-    consecutive_failures: u32,
-    /// When `Some(t)`, this slot is "parked" until `t` and the hot
-    /// path skips it without holding the mutex. Parked slots are still
-    /// woken by the background reconnect task which honours the same
-    /// deadline. Cleared on successful reconnect.
-    parked_until: Option<Instant>,
+    /// Bounded queue feeding this slot's driver task. Each item is a
+    /// fully framed `[u16 BE len][payload]` buffer ready to write.
+    tx: mpsc::Sender<Vec<u8>>,
+    /// `true` once the driver holds a live, handshaked connection;
+    /// flipped to `false` the instant a write fails or a reconnect
+    /// starts, so the hot path stops routing to a dead link immediately.
+    healthy: Arc<AtomicBool>,
+    /// Liveness latch. The driver task holds the paired
+    /// [`watch::Receiver`] and selects on it in EVERY phase (connect,
+    /// backoff, drain). When this slot leaves the pool (shrink /
+    /// `shutdown` / warm-up failure) the `Slot` drops, this sender
+    /// drops, and the driver's `changed()` resolves `Err`, so the driver
+    /// exits promptly from any phase — not only when it next polls the
+    /// queue. Without it a driver stuck retrying a dead proxy during
+    /// `connect()` warm-up (where no tunnel stop signal is ever sent)
+    /// would reconnect forever after Start already returned an error.
+    ///
+    /// Held purely for its `Drop` (an RAII liveness latch) — never read,
+    /// so `dead_code` is explicitly allowed on it.
+    #[allow(dead_code)]
+    _alive: watch::Sender<bool>,
 }
 
 impl Socks5Upload {
-    /// Open N connections (where N = `target.parallel_connections`),
-    /// complete the SOCKS5 CONNECT handshake on each, and return a
-    /// ready-to-use upload transport. If the **first** connection
-    /// fails the call bubbles back to the manager as `io::Error` so
-    /// Start surfaces a clear panel message ("could not reach SOCKS5
-    /// proxy"). Subsequent connection failures during initial pool
-    /// fill are logged and leave a hole that the background reconnect
-    /// task fills in.
+    /// Build the pool: spawn one driver task per slot, then block until
+    /// `min_ready_slots` are healthy or [`WARMUP_DEADLINE`] elapses. On
+    /// timeout the whole transport is torn down and Start fails with a
+    /// panel-readable error rather than handing back a limp tunnel.
     pub async fn connect(
         tunnel_id: i64,
         target: Socks5Target,
@@ -204,97 +200,35 @@ impl Socks5Upload {
     ) -> io::Result<Self> {
         let n = target.parallel_connections.max(1) as usize;
         let min_ready = (target.min_ready_slots.max(1) as usize).min(n);
-        let mut initial_slots: Vec<Arc<Slot>> = Vec::with_capacity(n);
 
-        // Open the FIRST connection inline so an unreachable proxy
-        // fails Start with a real error. Subsequent connection failures
-        // during pool fill are non-fatal: we install the slot in a
-        // broken state and let the background reconnect task heal it.
-        let first_stream = timeout(
-            CONNECT_TIMEOUT,
-            open_socks5_connection(tunnel_id, &target, upload_target, 0),
-        )
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "first SOCKS5 connect to {}:{} timed out",
-                    target.host, target.port
-                ),
-            )
-        })??;
-        initial_slots.push(Arc::new(Slot::healthy(0, first_stream)));
-
-        for idx in 1..n {
-            match timeout(
-                CONNECT_TIMEOUT,
-                open_socks5_connection(tunnel_id, &target, upload_target, idx),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => initial_slots.push(Arc::new(Slot::healthy(idx, stream))),
-                Ok(Err(e)) => {
-                    warn!(
-                        tunnel_id,
-                        slot = idx,
-                        err = %e,
-                        "client: SOCKS5 initial pool fill connection failed; slot will reconnect in background"
-                    );
-                    initial_slots.push(Arc::new(Slot::broken(idx)));
-                }
-                Err(_) => {
-                    warn!(
-                        tunnel_id,
-                        slot = idx,
-                        timeout_ms = CONNECT_TIMEOUT.as_millis() as u64,
-                        "client: SOCKS5 initial pool fill timed out; slot will reconnect in background"
-                    );
-                    initial_slots.push(Arc::new(Slot::broken(idx)));
-                }
-            }
+        let mut slots = Vec::with_capacity(n);
+        for idx in 0..n {
+            slots.push(make_slot(
+                tunnel_id,
+                target.clone(),
+                upload_target,
+                idx,
+                stop_rx.clone(),
+            ));
         }
-
-        let initial_healthy = initial_slots
-            .iter()
-            .filter(|s| s.is_healthy_blocking())
-            .count();
-        info!(
-            tunnel_id,
-            requested = target.parallel_connections,
-            initial_healthy,
-            min_ready,
-            "client: SOCKS5 initial pool fill complete"
-        );
 
         let upload = Self {
             tunnel_id,
             target,
             upload_target,
-            slots: Arc::new(RwLock::new(initial_slots)),
+            slots: Arc::new(RwLock::new(slots)),
             stop_rx,
+            drops: Arc::new(AtomicU64::new(0)),
         };
-        // Spawn one background reconnect task per slot up front. Slots
-        // that come online later (via resize) get their own task started
-        // in `resize_pool`.
-        upload.spawn_reconnect_workers();
 
         // ---- Warm-up gate ------------------------------------------
         //
-        // The predecessor's "pool reports ready with broken slots" was
-        // the dominant cause of the user-visible "WG client connects
-        // then immediately stalls" symptom. Block here until at least
-        // `min_ready` slots are healthy or the deadline fires. If we
-        // can't meet the threshold within the deadline, fail Start
-        // with a clear panel-readable error rather than handing back a
-        // limp tunnel.
+        // "pool reports ready with broken slots" was the dominant cause
+        // of "WG client connects then immediately stalls". Block until
+        // at least `min_ready` slots are healthy or the deadline fires.
         let deadline = Instant::now() + WARMUP_DEADLINE;
-        // `initial_healthy` is the "X/N healthy" number we surface in
-        // the warm-up failure message; it gets refreshed every loop
-        // iteration so the error reflects the latest snapshot.
-        let _ = initial_healthy;
         loop {
-            let healthy = upload.healthy_slot_count().await;
+            let healthy = upload.healthy_count();
             if healthy >= min_ready {
                 info!(
                     tunnel_id,
@@ -303,11 +237,12 @@ impl Socks5Upload {
                 break;
             }
             if Instant::now() >= deadline {
+                let total = upload.pool_snapshot().len();
                 upload.shutdown().await;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "SOCKS5 pool warm-up failed: only {healthy}/{n} slots healthy after {ms}ms (min_ready_slots={min_ready})",
+                        "SOCKS5 pool warm-up failed: only {healthy}/{total} slots healthy after {ms}ms (min_ready_slots={min_ready})",
                         ms = WARMUP_DEADLINE.as_millis() as u64
                     ),
                 ));
@@ -318,252 +253,86 @@ impl Socks5Upload {
         Ok(upload)
     }
 
-    /// Snapshot how many pool slots currently hold a healthy stream.
-    /// Used by the warm-up gate and by tests asserting pool health.
-    async fn healthy_slot_count(&self) -> usize {
-        let snap = self.pool_snapshot();
-        let mut count = 0usize;
-        for slot in &snap {
-            let g = slot.state.lock().await;
-            if g.stream.is_some() {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Spawn a background reconnect task for every slot in the current
-    /// pool snapshot. Idempotent inside each task — the task observes
-    /// `reconnecting` to avoid stepping on itself.
-    fn spawn_reconnect_workers(&self) {
-        let slot_snapshot = {
-            let guard = self.slots.read().expect("slots read");
-            guard.clone()
-        };
-        for slot in slot_snapshot {
-            self.spawn_reconnect_worker(slot);
-        }
-    }
-
-    /// Spawn a single reconnect worker for `slot`. Holds an `Arc` on
-    /// the slot so the worker outlives a pool shrink that drops the
-    /// outer Vec's reference — when the last `Arc` drops, the worker's
-    /// next wake-up will observe the stop watch firing OR the slot
-    /// state becoming unobservable and exit.
-    fn spawn_reconnect_worker(&self, slot: Arc<Slot>) {
-        let tunnel_id = self.tunnel_id;
-        let target = self.target.clone();
-        let upload_target = self.upload_target;
-        let mut stop_rx = self.stop_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                // Wait for someone to kick us (a send hit a broken
-                // slot) or for an exponential-backoff timer to elapse
-                // on its own.
-                let wait = {
-                    let g = slot.state.lock().await;
-                    match g.parked_until {
-                        Some(t) => t
-                            .saturating_duration_since(Instant::now())
-                            .max(Duration::from_millis(1)),
-                        None => backoff_for_failures(g.consecutive_failures),
-                    }
-                };
-                tokio::select! {
-                    _ = stop_rx.changed() => return,
-                    _ = slot.reconnect_kick.notified() => {}
-                    _ = sleep(wait) => {}
-                }
-                if *stop_rx.borrow() {
-                    return;
-                }
-                // Atomically check + claim the reconnect slot. If the
-                // slot is already healthy or another worker is mid-
-                // reconnect, just loop back to sleep.
-                {
-                    let mut guard = slot.state.lock().await;
-                    if guard.stream.is_some() {
-                        guard.reconnecting = false;
-                        continue;
-                    }
-                    if guard.reconnecting {
-                        continue;
-                    }
-                    // Respect the park deadline if a kick beat the
-                    // timer — we don't want to hot-spin reconnects on
-                    // a chronically broken slot.
-                    if let Some(deadline) = guard.parked_until {
-                        if Instant::now() < deadline {
-                            continue;
-                        }
-                    }
-                    guard.reconnecting = true;
-                }
-                // Drop the lock before the (potentially seconds-long)
-                // connect+handshake await so a concurrent successful
-                // `send` on a different slot doesn't block on us.
-                let connect_result = timeout(
-                    CONNECT_TIMEOUT,
-                    open_socks5_connection(tunnel_id, &target, upload_target, slot.index),
-                )
-                .await;
-                match connect_result {
-                    Ok(Ok(stream)) => {
-                        let mut guard = slot.state.lock().await;
-                        guard.stream = Some(stream);
-                        guard.reconnecting = false;
-                        guard.consecutive_failures = 0;
-                        guard.parked_until = None;
-                        info!(
-                            tunnel_id,
-                            slot = slot.index,
-                            "client: SOCKS5 slot reconnected (health reset)"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        let mut guard = slot.state.lock().await;
-                        guard.reconnecting = false;
-                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-                        let cooldown = backoff_for_failures(guard.consecutive_failures);
-                        guard.parked_until = Some(Instant::now() + cooldown);
-                        warn!(
-                            tunnel_id,
-                            slot = slot.index,
-                            err = %e,
-                            consecutive_failures = guard.consecutive_failures,
-                            park_ms = cooldown.as_millis() as u64,
-                            "client: SOCKS5 slot reconnect failed; parked for exponential backoff"
-                        );
-                    }
-                    Err(_elapsed) => {
-                        let mut guard = slot.state.lock().await;
-                        guard.reconnecting = false;
-                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-                        let cooldown = backoff_for_failures(guard.consecutive_failures);
-                        guard.parked_until = Some(Instant::now() + cooldown);
-                        warn!(
-                            tunnel_id,
-                            slot = slot.index,
-                            timeout_ms = CONNECT_TIMEOUT.as_millis() as u64,
-                            consecutive_failures = guard.consecutive_failures,
-                            park_ms = cooldown.as_millis() as u64,
-                            "client: SOCKS5 slot reconnect timed out; parked for exponential backoff"
-                        );
-                    }
-                }
-            }
-        });
-    }
-
-    /// Take a snapshot of the current pool. Cheap — clones the
-    /// per-slot `Arc`s, not the inner state, and releases the outer
-    /// RwLock before any await.
+    /// Snapshot of the current pool. Cheap — clones the per-slot `Arc`s
+    /// and releases the outer `RwLock` before any await.
     fn pool_snapshot(&self) -> Vec<Arc<Slot>> {
-        let guard = self.slots.read().expect("slots read");
-        guard.clone()
+        self.slots.read().expect("slots read").clone()
     }
 
-    /// Resize the pool to `new_n` slots. Public via the trait method
-    /// `set_parallel_connections`. Returns `Ok(true)` if the live
-    /// pool was actually resized, `Ok(false)` if it was already at
-    /// the requested size.
+    /// How many slots currently hold a healthy connection (lock-free).
+    fn healthy_count(&self) -> usize {
+        self.slots
+            .read()
+            .expect("slots read")
+            .iter()
+            .filter(|s| s.healthy.load(Ordering::Acquire))
+            .count()
+    }
+
+    /// Sampled drop accounting: bump the counter and log roughly once
+    /// per 1000 drops so a saturated pool is visible without flooding
+    /// the rotating app log on the hot path.
+    fn record_drop(&self) {
+        let prev = self.drops.fetch_add(1, Ordering::Relaxed);
+        if prev % 1000 == 0 {
+            warn!(
+                tunnel_id = self.tunnel_id,
+                dropped_total = prev + 1,
+                "client: SOCKS5 upload dropping frames (every slot saturated or unhealthy)"
+            );
+        }
+    }
+
+    /// Resize the pool to `new_n` slots. Returns `Ok(true)` if the live
+    /// pool changed size, `Ok(false)` if it was already `new_n`.
     pub async fn resize_pool(&self, new_n: usize) -> io::Result<bool> {
         let new_n = new_n.max(1);
         let current_n = self.slots.read().expect("slots read").len();
         if current_n == new_n {
             return Ok(false);
         }
-        match new_n.cmp(&current_n) {
-            std::cmp::Ordering::Greater => {
-                // GROW: open additional connections, then append under
-                // a brief write lock. The new slots come online live —
-                // the hot path's snapshot picks them up on the next
-                // send. We open every new slot SEQUENTIALLY so we
-                // don't hammer the proxy with N concurrent SYNs; the
-                // operator-edit path is rare and per-connection
-                // handshake is ~50ms.
-                let mut additions: Vec<Arc<Slot>> = Vec::with_capacity(new_n - current_n);
-                for idx in current_n..new_n {
-                    let slot = match open_socks5_connection(
-                        self.tunnel_id,
-                        &self.target,
-                        self.upload_target,
-                        idx,
-                    )
-                    .await
-                    {
-                        Ok(stream) => Arc::new(Slot::healthy(idx, stream)),
-                        Err(e) => {
-                            warn!(
-                                tunnel_id = self.tunnel_id,
-                                slot = idx,
-                                err = %e,
-                                "client: SOCKS5 grow-pool initial connect failed; slot will reconnect in background"
-                            );
-                            Arc::new(Slot::broken(idx))
-                        }
-                    };
-                    additions.push(slot);
-                }
-                let new_arcs_for_workers: Vec<Arc<Slot>> = additions.clone();
-                {
-                    let mut guard = self.slots.write().expect("slots write");
-                    guard.extend(additions);
-                }
-                // Spawn one reconnect worker per freshly-added slot so
-                // a slot that came up broken (or fails later) gets
-                // healed. Existing slots already have their workers
-                // from `connect()`.
-                for slot in new_arcs_for_workers {
-                    self.spawn_reconnect_worker(slot);
-                }
-                info!(
-                    tunnel_id = self.tunnel_id,
-                    from = current_n,
-                    to = new_n,
-                    "client: SOCKS5 pool grown live"
-                );
-                Ok(true)
+        if new_n > current_n {
+            // GROW: spawn fresh driver tasks for the new slots and append
+            // them under a brief write lock. New slots come online live —
+            // the hot path's next snapshot picks them up.
+            let mut additions = Vec::with_capacity(new_n - current_n);
+            for idx in current_n..new_n {
+                additions.push(make_slot(
+                    self.tunnel_id,
+                    self.target.clone(),
+                    self.upload_target,
+                    idx,
+                    self.stop_rx.clone(),
+                ));
             }
-            std::cmp::Ordering::Less => {
-                // SHRINK: truncate the live Vec. Outstanding sends
-                // that already cloned an Arc for one of the dropped
-                // slots keep that slot alive until they finish; the
-                // kernel's TCP connection stays open until the last
-                // Arc drops. New sends see the smaller pool on their
-                // next snapshot and rehash to a surviving slot. UDP
-                // semantics tolerate the brief flow-rehoming.
-                let removed: Vec<Arc<Slot>> = {
-                    let mut guard = self.slots.write().expect("slots write");
-                    guard.drain(new_n..).collect()
-                };
-                // Best-effort: nudge any in-flight reconnect tasks on
-                // the dropped slots so they can wake, observe the
-                // stream-is-None plus no-one-holding-the-slot-Arc-
-                // outside-themselves, and exit cleanly via the stop
-                // watch on the next iteration.
-                for slot in &removed {
-                    slot.reconnect_kick.notify_one();
-                }
-                // Drain the streams so the kernel closes the FDs
-                // promptly even if a reconnect worker is still
-                // holding a clone of the slot Arc.
-                for slot in &removed {
-                    let mut guard = slot.state.lock().await;
-                    if let Some(mut stream) = guard.stream.take() {
-                        let _ = stream.shutdown().await;
-                    }
-                }
-                info!(
-                    tunnel_id = self.tunnel_id,
-                    from = current_n,
-                    to = new_n,
-                    "client: SOCKS5 pool shrunk live"
-                );
-                Ok(true)
+            {
+                let mut guard = self.slots.write().expect("slots write");
+                guard.extend(additions);
             }
-            std::cmp::Ordering::Equal => Ok(false),
+            info!(
+                tunnel_id = self.tunnel_id,
+                from = current_n,
+                to = new_n,
+                "client: SOCKS5 pool grown live"
+            );
+        } else {
+            // SHRINK: drop the surplus slot `Arc`s. Each dropped `Slot`
+            // releases its `tx`; once the last reference to it goes (any
+            // in-flight `send` snapshot finishes), the driver's
+            // `rx.recv()` returns `None`, it shuts its stream and exits.
+            let removed: Vec<Arc<Slot>> = {
+                let mut guard = self.slots.write().expect("slots write");
+                guard.drain(new_n..).collect()
+            };
+            drop(removed);
+            info!(
+                tunnel_id = self.tunnel_id,
+                from = current_n,
+                to = new_n,
+                "client: SOCKS5 pool shrunk live"
+            );
         }
+        Ok(true)
     }
 
     /// Current pool size — used by tests to assert post-resize state.
@@ -571,45 +340,175 @@ impl Socks5Upload {
     pub fn pool_len(&self) -> usize {
         self.slots.read().expect("slots read").len()
     }
+
+    /// Total frames dropped due to a saturated/unhealthy pool — test hook.
+    #[cfg(test)]
+    pub fn drop_count(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
+    }
 }
 
-impl Slot {
-    fn healthy(index: usize, stream: TcpStream) -> Self {
-        Self {
-            index,
-            state: Mutex::new(SlotState {
-                stream: Some(stream),
-                reconnecting: false,
-                consecutive_failures: 0,
-                parked_until: None,
-            }),
-            reconnect_kick: Notify::new(),
-        }
-    }
+/// Create a slot: a bounded queue, a shared health flag, and a spawned
+/// driver task that owns the connection. Returns the `Arc<Slot>` the
+/// pool holds; the driver keeps only the `Receiver` + health flag, so it
+/// exits once the slot is dropped (queue closed) or the stop watch fires.
+fn make_slot(
+    tunnel_id: i64,
+    target: Socks5Target,
+    upload_target: SocketAddr,
+    index: usize,
+    stop_rx: watch::Receiver<bool>,
+) -> Arc<Slot> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(SLOT_QUEUE_CAP);
+    let healthy = Arc::new(AtomicBool::new(false));
+    let (alive_tx, alive_rx) = watch::channel(true);
+    tokio::spawn(slot_driver(
+        tunnel_id,
+        target,
+        upload_target,
+        index,
+        rx,
+        healthy.clone(),
+        stop_rx,
+        alive_rx,
+    ));
+    Arc::new(Slot {
+        tx,
+        healthy,
+        _alive: alive_tx,
+    })
+}
 
-    fn broken(index: usize) -> Self {
-        Self {
-            index,
-            state: Mutex::new(SlotState {
-                stream: None,
-                reconnecting: false,
-                consecutive_failures: 1,
-                parked_until: Some(Instant::now() + backoff_for_failures(0)),
-            }),
-            reconnect_kick: Notify::new(),
+/// One slot's lifecycle: connect (with backoff on failure), drain framed
+/// payloads to the TCP stream, and reconnect on write error — forever,
+/// until the queue closes (slot removed) or the stop watch fires.
+async fn slot_driver(
+    tunnel_id: i64,
+    target: Socks5Target,
+    upload_target: SocketAddr,
+    index: usize,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    healthy: Arc<AtomicBool>,
+    mut stop_rx: watch::Receiver<bool>,
+    mut alive_rx: watch::Receiver<bool>,
+) {
+    // Mark the initial liveness value seen so `changed()` only ever
+    // fires on sender-drop (slot removal), never spuriously on the first
+    // poll. If the slot was already removed before the driver started,
+    // the first `changed()` in a select returns `Err` and we exit.
+    let _ = alive_rx.borrow_and_update();
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        if *stop_rx.borrow() {
+            return;
         }
-    }
+        // Back off before a retry (not before the very first attempt).
+        if consecutive_failures > 0 {
+            healthy.store(false, Ordering::Release);
+            let wait = backoff_for_failures(consecutive_failures);
+            tokio::select! {
+                biased;
+                _ = stop_rx.changed() => { if *stop_rx.borrow() { return; } }
+                _ = alive_rx.changed() => return,
+                _ = sleep(wait) => {}
+            }
+            if *stop_rx.borrow() {
+                return;
+            }
+        }
 
-    /// Quick health probe that bypasses the async lock when nothing
-    /// else is contending. Used at startup logging — the real hot path
-    /// always grabs the lock before attempting a write.
-    fn is_healthy_blocking(&self) -> bool {
-        match self.state.try_lock() {
-            Ok(g) => g.stream.is_some(),
-            // If the lock is contended someone is mid-send → almost
-            // certainly healthy.
-            Err(_) => true,
+        // Connect + SOCKS5 handshake.
+        let connect_fut = timeout(
+            CONNECT_TIMEOUT,
+            open_socks5_connection(tunnel_id, &target, upload_target, index),
+        );
+        let mut stream = tokio::select! {
+            biased;
+            _ = stop_rx.changed() => { if *stop_rx.borrow() { return; } continue; }
+            _ = alive_rx.changed() => return,
+            res = connect_fut => match res {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    warn!(
+                        tunnel_id, slot = index, err = %e, consecutive_failures,
+                        "client: SOCKS5 slot connect failed; will retry under backoff"
+                    );
+                    continue;
+                }
+                Err(_elapsed) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    warn!(
+                        tunnel_id, slot = index,
+                        timeout_ms = CONNECT_TIMEOUT.as_millis() as u64, consecutive_failures,
+                        "client: SOCKS5 slot connect timed out; will retry under backoff"
+                    );
+                    continue;
+                }
+            }
+        };
+
+        consecutive_failures = 0;
+        healthy.store(true, Ordering::Release);
+        info!(tunnel_id, slot = index, "client: SOCKS5 slot connected (healthy)");
+
+        // Drain framed payloads until a write error, a closed queue, or
+        // stop. `biased` checks stop first so shutdown is prompt.
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                }
+                _ = alive_rx.changed() => {
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                maybe = rx.recv() => {
+                    let frame = match maybe {
+                        Some(f) => f,
+                        None => {
+                            // Slot removed (pool shrunk / shutdown): no
+                            // more senders. Close the stream and exit.
+                            let _ = stream.shutdown().await;
+                            return;
+                        }
+                    };
+                    match timeout(WRITE_BACKSTOP, stream.write_all(&frame)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            healthy.store(false, Ordering::Release);
+                            warn!(
+                                tunnel_id, slot = index, err = %e,
+                                "client: SOCKS5 slot write failed; reconnecting"
+                            );
+                            let _ = stream.shutdown().await;
+                            consecutive_failures = 1;
+                            break;
+                        }
+                        Err(_elapsed) => {
+                            healthy.store(false, Ordering::Release);
+                            warn!(
+                                tunnel_id, slot = index,
+                                backstop_s = WRITE_BACKSTOP.as_secs(),
+                                "client: SOCKS5 slot write backstop elapsed (link cannot drain); reconnecting"
+                            );
+                            let _ = stream.shutdown().await;
+                            consecutive_failures = 1;
+                            break;
+                        }
+                    }
+                }
+            }
         }
+        // Fell out of the drain loop on a write failure → loop back to
+        // the top, which backs off (consecutive_failures == 1) then
+        // reconnects. Frames already queued stay buffered for the new
+        // connection (up to SLOT_QUEUE_CAP); the hot path meanwhile sees
+        // `healthy == false` and routes new frames to a sibling.
     }
 }
 
@@ -633,19 +532,16 @@ impl UploadTransport for Socks5Upload {
                 format!("socks5 frame too large: {} bytes", payload.len()),
             ));
         }
-        // Build the frame in a stack-allocated header + zero-copy
-        // payload slice. tokio's AsyncWriteExt only exposes the single
-        // `write_all`/`write_all_vectored` shapes; we want a single
-        // syscall per frame so concat into a small Vec.
+        // Build the framed buffer once: [u16 BE len][payload].
         let mut frame = Vec::with_capacity(2 + payload.len());
         frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         frame.extend_from_slice(payload);
 
-        // Snapshot the pool ONCE per send so a concurrent resize_pool
-        // can never change the index space mid-probe. The Arc clones
-        // are cheap; this releases the outer RwLock immediately.
-        let slot_arcs = self.pool_snapshot();
-        let n = slot_arcs.len();
+        // Snapshot the pool ONCE so a concurrent resize can't change the
+        // index space mid-probe. Arc clones are cheap and the outer lock
+        // is released immediately.
+        let slots = self.pool_snapshot();
+        let n = slots.len();
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -654,105 +550,35 @@ impl UploadTransport for Socks5Upload {
         }
         let primary = primary_slot(session, n);
 
-        // Try the primary slot, then linear-probe through the pool to
-        // find the next healthy one. Each probe locks the slot's
-        // inner Mutex briefly, tries the write, and on failure marks
-        // the slot broken + nudges its reconnect task before falling
-        // through to the next slot. Worst case (every slot down) the
-        // last probe surfaces a `BrokenPipe` to the caller, which
-        // logs and drops the packet — UDP semantics, application
-        // retransmits.
-        let now = Instant::now();
-        let mut last_err: Option<io::Error> = None;
+        // Try the sticky primary, then linear-probe healthy siblings.
+        // `try_send` never blocks — the recv loop keeps reading no matter
+        // how congested any single link is. On a full queue the frame is
+        // handed back to us so we can try the next slot without a realloc.
         for offset in 0..n {
             let idx = (primary + offset) % n;
-            let slot = &slot_arcs[idx];
-            let mut guard = slot.state.lock().await;
-
-            // Skip slots that are parked under exponential-backoff
-            // cooldown. The reconnect worker will lift the park when
-            // a fresh handshake succeeds; until then the hot path
-            // must not keep slamming a known-bad slot.
-            if let Some(deadline) = guard.parked_until {
-                if now < deadline {
-                    last_err = Some(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        format!(
-                            "socks5 slot {idx} parked for {}ms",
-                            deadline.saturating_duration_since(now).as_millis() as u64
-                        ),
-                    ));
+            let slot = &slots[idx];
+            if !slot.healthy.load(Ordering::Acquire) {
+                continue;
+            }
+            match slot.tx.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    frame = returned;
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(returned)) => {
+                    frame = returned;
                     continue;
                 }
             }
-
-            if let Some(stream) = guard.stream.as_mut() {
-                match timeout(WRITE_TIMEOUT, stream.write_all(&frame)).await {
-                    Ok(Ok(())) => {
-                        // Successful write resets the failure counter so
-                        // a previously parked slot starts each session
-                        // fresh again.
-                        guard.consecutive_failures = 0;
-                        guard.parked_until = None;
-                        if offset != 0 {
-                            // Hot-path observation: an unhealthy primary
-                            // forced a rehash. INFO breadcrumb for live
-                            // link blips, only on the rehash path so the
-                            // steady-state primary-hit path stays silent.
-                            info!(
-                                tunnel_id = self.tunnel_id,
-                                primary,
-                                landed = idx,
-                                "client: SOCKS5 send rehashed to alternate slot"
-                            );
-                        }
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-                        let cooldown = backoff_for_failures(guard.consecutive_failures);
-                        guard.parked_until = Some(Instant::now() + cooldown);
-                        guard.stream = None;
-                        warn!(
-                            tunnel_id = self.tunnel_id,
-                            slot = idx,
-                            err = %e,
-                            consecutive_failures = guard.consecutive_failures,
-                            park_ms = cooldown.as_millis() as u64,
-                            "client: SOCKS5 slot write failed; parked and rehashing"
-                        );
-                        last_err = Some(e);
-                    }
-                    Err(_elapsed) => {
-                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-                        let cooldown = backoff_for_failures(guard.consecutive_failures);
-                        guard.parked_until = Some(Instant::now() + cooldown);
-                        guard.stream = None;
-                        warn!(
-                            tunnel_id = self.tunnel_id,
-                            slot = idx,
-                            timeout_ms = WRITE_TIMEOUT.as_millis() as u64,
-                            consecutive_failures = guard.consecutive_failures,
-                            park_ms = cooldown.as_millis() as u64,
-                            "client: SOCKS5 slot write timed out; parked and rehashing"
-                        );
-                        last_err = Some(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "socks5 slot write_all exceeded WRITE_TIMEOUT",
-                        ));
-                    }
-                }
-            }
-            drop(guard);
-            // Kick the reconnect task on the slot we just gave up on.
-            // The task races its own backoff timer with our nudge but
-            // will still honour the parked_until deadline before it
-            // attempts another handshake.
-            slot.reconnect_kick.notify_one();
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "socks5 pool entirely unhealthy")
-        }))
+
+        // Every slot was unhealthy or its queue full. Drop (UDP is
+        // best-effort; the application/WireGuard will retransmit) and
+        // account it. Returning Ok keeps the recv loop hot — the drop is
+        // surfaced via the sampled counter, not a per-packet error.
+        self.record_drop();
+        Ok(())
     }
 
     async fn set_parallel_connections(&self, n: u32) -> io::Result<bool> {
@@ -760,32 +586,21 @@ impl UploadTransport for Socks5Upload {
     }
 
     async fn shutdown(&self) {
-        // Drain every slot's TCP stream and drop the Vec so any
-        // background reconnect task sees the stop watch on its next
-        // wake and exits.
-        let drained: Vec<Arc<Slot>> = {
+        // Drop every slot. That releases all `tx` senders, so each driver
+        // task observes its queue closing (or the stop watch) and exits,
+        // closing its TCP stream. Belt-and-suspenders with the tunnel's
+        // stop watch, which the drivers also honour.
+        let removed: Vec<Arc<Slot>> = {
             let mut guard = self.slots.write().expect("slots write");
             guard.drain(..).collect()
         };
-        for slot in &drained {
-            slot.reconnect_kick.notify_one();
-        }
-        for slot in drained {
-            let mut guard = slot.state.lock().await;
-            if let Some(mut stream) = guard.stream.take() {
-                // Best-effort shutdown — ignore errors, the kernel
-                // cleans up the fd anyway when the stream drops.
-                let _ = stream.shutdown().await;
-            }
-        }
+        drop(removed);
     }
 }
 
-/// Open one TCP connection to the proxy and complete the SOCKS5
-/// CONNECT handshake. Returns a TCP stream ready to carry framed
-/// payloads. `slot_index` is for log correlation only — the kernel
-/// picks the source port and the SOCKS5 protocol doesn't carry slot
-/// numbers on the wire.
+/// Open one TCP connection to the proxy and complete the SOCKS5 CONNECT
+/// handshake. Returns a TCP stream ready to carry framed payloads.
+/// `slot_index` is for log correlation only.
 async fn open_socks5_connection(
     tunnel_id: i64,
     target: &Socks5Target,
@@ -799,20 +614,18 @@ async fn open_socks5_connection(
             format!("connect to SOCKS5 proxy {proxy_addr}: {e}"),
         )
     })?;
-    // Disable Nagle so each frame goes on the wire promptly. The
-    // proxy passthrough preserves bytes either way, but on a real
-    // Starlink link the 40 ms TCP coalescing delay would add visible
-    // latency to small UDP payloads.
+    // Disable Nagle so each frame goes on the wire promptly. The proxy
+    // passthrough preserves bytes either way, but on a real Starlink link
+    // the 40 ms TCP coalescing delay would add visible latency to small
+    // UDP payloads.
     if let Err(e) = stream.set_nodelay(true) {
         warn!(tunnel_id, slot = slot_index, err = %e, "client: SOCKS5 set_nodelay failed (continuing)");
     }
     // Layer aggressive TCP keepalive + USER_TIMEOUT on the socket so a
     // stale proxy / NAT binding is noticed within seconds instead of
-    // hanging on the kernel default RTO (~120 s). Both options together
-    // catch the two failure modes that produced the user-visible "WG
-    // client takes 10 s to connect / stalls then limps" symptom on the
-    // Phase R9b live tunnel — see `perf::tune_socks5_tcp_socket` for
-    // the rationale and the chosen timer values.
+    // hanging on the kernel default RTO (~120 s). This is the PRIMARY
+    // dead-peer detector now that the application no longer tears down a
+    // connection on a short write timeout — see `perf::tune_socks5_tcp_socket`.
     crate::perf::tune_socks5_tcp_socket(&stream, "socks5/client-out");
     let has_auth = target.username.as_deref().is_some_and(|s| !s.is_empty())
         && target.password.as_deref().is_some_and(|s| !s.is_empty());
@@ -985,23 +798,18 @@ mod tests {
     use tokio::sync::watch;
 
     /// Per-test capture types. The framing tests want to inspect the
-    /// payloads each TCP connection saw, so each connection writes
-    /// into its own bag of `Vec<u8>` payloads; the outer Vec collects
-    /// every connection's bag. Behind tokio mutexes so the stub server
-    /// tasks and the test body can read/write without deadlocking on
-    /// std::sync across awaits. Clippy's `type_complexity` lint
-    /// otherwise fires on the four-level nested generic.
+    /// payloads each TCP connection saw, so each connection writes into
+    /// its own bag of `Vec<u8>` payloads; the outer Vec collects every
+    /// connection's bag. Behind tokio mutexes so the stub server tasks
+    /// and the test body can read/write without deadlocking on std::sync
+    /// across awaits.
     type ConnFrameBag = Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>;
     type FramesPerConn = Arc<tokio::sync::Mutex<Vec<ConnFrameBag>>>;
 
     /// Tiny SOCKS5 server that accepts no-auth or user/pass plus a
-    /// CONNECT, replies success, then drains the rest of the connection
-    /// (the framed payloads from the client). Just enough RFC
-    /// compliance to verify our client's handshake bytes are correct
-    /// and that framed sends succeed.
-    ///
-    /// Accepts any number of incoming connections (each on a fresh
-    /// tokio task) and bumps `accepted` for the test to assert on.
+    /// CONNECT, replies success, then drains the rest of the connection.
+    /// Accepts any number of incoming connections (each on a fresh tokio
+    /// task) and bumps `accepted` for the test to assert on.
     async fn run_stub_socks5_pool(
         listener: TcpListener,
         require_auth: Option<(&'static str, &'static str)>,
@@ -1086,8 +894,8 @@ mod tests {
         {
             return;
         }
-        // Drain framed traffic until EOF so the client can keep
-        // writing without TCP backpressure stalling its write_all.
+        // Drain framed traffic until EOF so the client can keep writing
+        // without TCP backpressure stalling its write_all.
         let mut scratch = [0u8; 4096];
         loop {
             match client.read(&mut scratch).await {
@@ -1134,6 +942,51 @@ mod tests {
         }
     }
 
+    /// Wait until at least `want` slots report healthy, or panic after a
+    /// generous deadline. Replaces fixed sleeps so the async driver tasks
+    /// have deterministically connected before assertions run.
+    async fn await_healthy(upload: &Socks5Upload, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if upload.healthy_count() >= want {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "only {}/{} slots became healthy in time",
+                    upload.healthy_count(),
+                    want
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Poll until the stub captured at least `want` frames across all
+    /// connections, or panic after a deadline — a deterministic
+    /// alternative to a fixed sleep so the assertion never races the
+    /// driver tasks on a loaded CI runner.
+    async fn await_total_frames(frames: &FramesPerConn, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let total: usize = {
+                let outer = frames.lock().await;
+                let mut sum = 0usize;
+                for bag in outer.iter() {
+                    sum += bag.lock().await.len();
+                }
+                sum
+            };
+            if total >= want {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("only {total}/{want} frames captured in time");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[test]
     fn backoff_grows_then_caps() {
         // Curve: 500, 1000, 2000, 4000, 8000, then capped.
@@ -1150,9 +1003,9 @@ mod tests {
     #[tokio::test]
     async fn warmup_gate_fails_when_proxy_is_dead() {
         // Bind a TCP listener and *immediately drop it* so every
-        // outbound connect lands on a port with no listener. The
-        // warm-up gate should bubble up an io::Error rather than
-        // returning a half-built pool.
+        // outbound connect lands on a port with no listener. The warm-up
+        // gate should bubble up an io::Error rather than returning a
+        // half-built pool.
         let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = proxy.local_addr().unwrap().port();
         drop(proxy);
@@ -1175,10 +1028,9 @@ mod tests {
 
     #[test]
     fn primary_slot_spreads_across_pool() {
-        // Hash many distinct client addrs into a pool of 8; we should
-        // hit every slot at least once. (Not a uniformity test —
-        // just a "no degenerate all-one-slot" smoke test on
-        // DefaultHasher.)
+        // Hash many distinct client addrs into a pool of 8; we should hit
+        // every slot at least once. (Not a uniformity test — just a "no
+        // degenerate all-one-slot" smoke test on DefaultHasher.)
         let mut seen: HashSet<usize> = HashSet::new();
         for i in 0..1024 {
             let addr: SocketAddr = format!("10.0.{}.{}:60000", (i / 256) & 0xff, i & 0xff)
@@ -1194,9 +1046,8 @@ mod tests {
         );
     }
 
-    /// Pool of 4 against one shared microsocks-stub; assert that
-    /// `connect()` opened exactly 4 inbound connections, and that
-    /// `pool_len()` reports 4.
+    /// Pool of 4 against one shared stub; assert that the drivers opened
+    /// exactly 4 inbound connections and that `pool_len()` reports 4.
     #[tokio::test]
     async fn pool_opens_n_connections() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1212,9 +1063,7 @@ mod tests {
             .await
             .expect("connect pool");
 
-        // Give the stub a heartbeat to finish each handshake — the
-        // last one may have raced our pool_len check.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        await_healthy(&upload, 4).await;
         assert_eq!(upload.pool_len(), 4);
         assert_eq!(
             accepted.load(Ordering::SeqCst),
@@ -1224,18 +1073,13 @@ mod tests {
         upload.shutdown().await;
     }
 
-    /// Per-session sticky routing: two consecutive sends from the
-    /// same SessionKey must land on the same connection on the
-    /// proxy side. We test this by tagging each accepted connection
-    /// with an incrementing id (the stub's "connection number") and
-    /// reading from the slot the SessionKey hashes to.
+    /// Per-session sticky routing: consecutive sends from the same
+    /// SessionKey must land on the same connection on the proxy side.
     #[tokio::test]
     async fn sticky_routing_keeps_flow_on_one_connection() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let proxy_port = proxy.local_addr().unwrap().port();
 
-        // Custom stub that buffers per-connection received payloads
-        // into ConnFrameBag so the test can read them back.
         let frames_per_conn: FramesPerConn = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let frames_for_stub = frames_per_conn.clone();
         tokio::spawn(async move {
@@ -1257,7 +1101,7 @@ mod tests {
         let upload = Socks5Upload::connect(7, make_target(proxy_port, 4), dummy_target(), stop_rx)
             .await
             .expect("connect");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        await_healthy(&upload, 4).await;
         assert_eq!(upload.pool_len(), 4);
 
         let key_a = key("10.1.1.1:50001".parse().unwrap());
@@ -1267,11 +1111,9 @@ mod tests {
         upload.send(key_a, b"a-3").await.expect("send a-3");
         upload.send(key_b, b"b-1").await.expect("send b-1");
 
-        // Give the proxy a heartbeat to drain.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Wait deterministically for all four frames to land on the stub.
+        await_total_frames(&frames_per_conn, 4).await;
 
-        // For each connection, collect the frame payloads. Find the
-        // one that has all three "a-*" frames (proves stickiness).
         let conns = frames_per_conn.lock().await;
         assert_eq!(conns.len(), 4, "expected 4 connections");
         let mut a_conn_idx: Option<usize> = None;
@@ -1309,11 +1151,11 @@ mod tests {
         upload.shutdown().await;
     }
 
-    /// Re-hash on connection failure: kill the connection that
-    /// session A hashes to mid-flight; the next send must still
-    /// succeed (it lands on a healthy slot).
+    /// Re-hash on slot unhealth: force the slot a session hashes to
+    /// unhealthy; the next send must still be delivered (rehashed to a
+    /// healthy sibling, NOT dropped).
     #[tokio::test]
-    async fn rehash_on_failure_keeps_flow_alive() {
+    async fn rehash_on_unhealthy_slot_keeps_flow_alive() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let proxy_port = proxy.local_addr().unwrap().port();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -1326,34 +1168,65 @@ mod tests {
         let upload = Socks5Upload::connect(3, make_target(proxy_port, 4), dummy_target(), stop_rx)
             .await
             .expect("connect");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        await_healthy(&upload, 4).await;
         let session = key("10.2.2.2:50002".parse().unwrap());
 
-        // First send establishes which slot session is sticky to.
+        // First send establishes which slot the session is sticky to.
         upload.send(session, b"first").await.expect("send first");
 
-        // Forcibly break the slot session is sticky to by stealing
-        // its stream and dropping it.
+        // Force the sticky slot unhealthy so the hot path must rehash.
         let primary_idx = primary_slot(session, upload.pool_len());
-        {
-            let snap = upload.pool_snapshot();
-            let mut guard = snap[primary_idx].state.lock().await;
-            if let Some(mut s) = guard.stream.take() {
-                let _ = s.shutdown().await;
-            }
-        }
+        upload.pool_snapshot()[primary_idx]
+            .healthy
+            .store(false, Ordering::SeqCst);
 
-        // Next send must succeed via rehash to another healthy slot.
+        // Next send must rehash to a healthy sibling and NOT be dropped.
         upload
             .send(session, b"after-break")
             .await
-            .expect("send after-break must rehash and succeed");
+            .expect("send after-break");
+        assert_eq!(
+            upload.drop_count(),
+            0,
+            "frame should have rehashed to a healthy slot, not dropped"
+        );
         upload.shutdown().await;
     }
 
-    /// Live pool grow: connect with N=2, resize to N=4, assert that
-    /// both the local pool_len and the proxy's inbound connection
-    /// count reach 4.
+    /// When the entire pool is unhealthy, sends drop (best-effort) and
+    /// the drop counter advances — but the call still returns Ok so the
+    /// recv loop is never blocked or errored per-packet.
+    #[tokio::test]
+    async fn all_unhealthy_drops_without_blocking() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stub_accepted = accepted.clone();
+        tokio::spawn(async move {
+            run_stub_socks5_pool(proxy, None, stub_accepted).await;
+        });
+
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let upload = Socks5Upload::connect(8, make_target(proxy_port, 3), dummy_target(), stop_rx)
+            .await
+            .expect("connect");
+        await_healthy(&upload, 3).await;
+
+        // Force every slot unhealthy.
+        for slot in upload.pool_snapshot() {
+            slot.healthy.store(false, Ordering::SeqCst);
+        }
+        let session = key("10.5.5.5:50005".parse().unwrap());
+        upload.send(session, b"into-the-void").await.expect("ok");
+        assert!(
+            upload.drop_count() >= 1,
+            "expected the frame to be counted as dropped"
+        );
+        upload.shutdown().await;
+    }
+
+    /// Live pool grow: connect with N=2, resize to N=4, assert both the
+    /// local pool_len and the proxy's inbound connection count reach 4.
     #[tokio::test]
     async fn resize_grow_opens_extra_connections() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1368,13 +1241,12 @@ mod tests {
         let upload = Socks5Upload::connect(11, make_target(proxy_port, 2), dummy_target(), stop_rx)
             .await
             .expect("connect");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        await_healthy(&upload, 2).await;
         assert_eq!(upload.pool_len(), 2);
-        assert_eq!(accepted.load(Ordering::SeqCst), 2);
 
         let changed = upload.set_parallel_connections(4).await.expect("resize");
-        assert!(changed, "resize from 2→4 should report changed=true");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(changed, "resize from 2->4 should report changed=true");
+        await_healthy(&upload, 4).await;
         assert_eq!(upload.pool_len(), 4);
         assert_eq!(accepted.load(Ordering::SeqCst), 4);
 
@@ -1388,8 +1260,8 @@ mod tests {
         upload.shutdown().await;
     }
 
-    /// Live pool shrink: connect with N=4, resize to N=2, assert
-    /// pool_len drops and that subsequent sends still succeed.
+    /// Live pool shrink: connect with N=4, resize to N=2, assert pool_len
+    /// drops and that subsequent sends still succeed.
     #[tokio::test]
     async fn resize_shrink_drops_surplus_slots() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1404,16 +1276,16 @@ mod tests {
         let upload = Socks5Upload::connect(12, make_target(proxy_port, 4), dummy_target(), stop_rx)
             .await
             .expect("connect");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        await_healthy(&upload, 4).await;
         assert_eq!(upload.pool_len(), 4);
-        assert_eq!(accepted.load(Ordering::SeqCst), 4);
 
         let changed = upload.set_parallel_connections(2).await.expect("shrink");
         assert!(changed);
         assert_eq!(upload.pool_len(), 2);
+        await_healthy(&upload, 2).await;
 
-        // Hash several sessions over the smaller pool; they should
-        // all succeed.
+        // Hash several sessions over the smaller pool; they should all
+        // be accepted (not dropped).
         for i in 0..6 {
             let addr: SocketAddr = format!("10.3.{}.1:50003", i).parse().unwrap();
             upload
@@ -1421,6 +1293,7 @@ mod tests {
                 .await
                 .expect("post-shrink send");
         }
+        assert_eq!(upload.drop_count(), 0, "post-shrink sends must not drop");
         upload.shutdown().await;
     }
 
@@ -1444,7 +1317,7 @@ mod tests {
         )
         .await
         .expect("connect with auth");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        await_healthy(&upload, 3).await;
         assert_eq!(upload.pool_len(), 3);
         assert_eq!(accepted.load(Ordering::SeqCst), 3);
         let session = key("10.4.4.4:50004".parse().unwrap());
@@ -1452,10 +1325,9 @@ mod tests {
         upload.shutdown().await;
     }
 
-    /// Framing across N connections: send into each of the 4
-    /// connections and verify the `[u16 BE length][bytes]` layout
-    /// arrives intact on the wire (the stub captures bytes and the
-    /// test parses them back).
+    /// Framing across N connections: send into each of the 4 connections
+    /// and verify the `[u16 BE length][bytes]` layout arrives intact on
+    /// the wire (the stub captures bytes and the test parses them back).
     #[tokio::test]
     async fn framing_intact_across_n_connections() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1482,20 +1354,20 @@ mod tests {
         let upload = Socks5Upload::connect(14, make_target(proxy_port, 4), dummy_target(), stop_rx)
             .await
             .expect("connect");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        await_healthy(&upload, 4).await;
 
-        // Send many distinct payloads with distinct keys so they
-        // spread across the pool.
+        // Send many distinct payloads with distinct keys so they spread
+        // across the pool.
         for i in 0..32u8 {
             let addr: SocketAddr = format!("10.9.{}.{}:50005", i, i).parse().unwrap();
             let payload = vec![i; (i as usize) + 1];
             upload.send(key(addr), &payload).await.expect("send");
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(upload.drop_count(), 0, "no frame should have been dropped");
+        await_total_frames(&frames_per_conn, 32).await;
 
-        // Assert that every byte recovered from every connection's
-        // frame stream matches a payload we sent. We don't pin which
-        // payload went to which connection — just total reachability.
+        // Every byte recovered from every connection's frame stream must
+        // match a payload we sent.
         let conns = frames_per_conn.lock().await;
         let mut all: Vec<Vec<u8>> = Vec::new();
         for conn in conns.iter() {
@@ -1503,8 +1375,6 @@ mod tests {
             all.extend(payloads.iter().cloned());
         }
         assert_eq!(all.len(), 32, "expected to receive 32 frames total");
-        // Each frame is `[i; i+1]` for distinct i — recover the set
-        // of distinct first-bytes and confirm we got 0..32.
         let mut firsts: Vec<u8> = all.iter().map(|p| p[0]).collect();
         firsts.sort_unstable();
         firsts.dedup();
