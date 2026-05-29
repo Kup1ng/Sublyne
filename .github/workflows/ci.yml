@@ -277,7 +277,11 @@ jobs:
         # the script runs cleanly under `set -e` and emits content.
         run: |
           chmod +x scripts/changelog.sh
-          out="$(./scripts/changelog.sh --tag v0.0.0-ci HEAD~5..HEAD 2>&1)"
+          # Range from the repo root so the smoke test is robust to a short
+          # history — the fresh repo has only a handful of commits and a
+          # fixed HEAD~5 would reference a non-existent revision.
+          root="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          out="$(./scripts/changelog.sh --tag v0.0.0-ci "${root}..HEAD" 2>&1)"
           echo "---- changelog smoke output ----"
           echo "$out"
           echo "--------------------------------"
