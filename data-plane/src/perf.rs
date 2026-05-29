@@ -224,7 +224,9 @@ pub fn tune_socket<F: AsRawFd>(sock: &F, label: &str) {
 ///   when idle so a NAT timeout drops the binding instead of just
 ///   freezing the socket. Probes also act as NAT-keepalive, refreshing
 ///   the binding so the connection rarely goes stale in the first
-///   place. Idle detection budget: 20 + 5×3 = 35 s.
+///   place. Idle detection budget: 10 + 5×3 = 25 s. The 10 s idle is
+///   deliberately shorter than common carrier-grade-NAT idle timeouts
+///   so the binding is refreshed before the proxy/NAT can drop it.
 /// - `TCP_USER_TIMEOUT = 10 s` — the case the keepalive can't catch:
 ///   we ARE writing (so the idle timer keeps getting reset), but the
 ///   bytes aren't being ACKed because the path is silently broken.
@@ -232,7 +234,7 @@ pub fn tune_socket<F: AsRawFd>(sock: &F, label: &str) {
 ///   data, the next `write_all` returns Err, and our pool marks the
 ///   slot broken + spawns a reconnect. Without this, the kernel keeps
 ///   retransmitting for ~120 s and the application sees nothing wrong.
-const SOCKS5_KEEPALIVE_TIME: Duration = Duration::from_secs(20);
+const SOCKS5_KEEPALIVE_TIME: Duration = Duration::from_secs(10);
 const SOCKS5_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const SOCKS5_KEEPALIVE_RETRIES: u32 = 3;
 const SOCKS5_USER_TIMEOUT: Duration = Duration::from_secs(10);
