@@ -4,6 +4,10 @@ import { ChevronDown } from 'lucide-vue-next'
 interface Option {
   value: string | number
   label: string
+  // When true the option renders but cannot be chosen (grayed out).
+  // Used by the tunnel form to show upload modes that exist but are
+  // off-matrix for the selected download transport.
+  disabled?: boolean
 }
 
 const props = defineProps<{
@@ -30,7 +34,9 @@ function onChange(e: Event) {
       :disabled="disabled"
       @change="onChange"
     >
-      <option v-for="o in options" :key="o.value" :value="o.value">{{ o.label }}</option>
+      <option v-for="o in options" :key="o.value" :value="o.value" :disabled="o.disabled">
+        {{ o.label }}
+      </option>
     </select>
     <ChevronDown
       class="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-subtle"

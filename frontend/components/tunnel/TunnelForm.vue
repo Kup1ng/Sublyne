@@ -11,6 +11,16 @@ import type {
 import { useAuth } from '~/composables/useAuth'
 import { useWireguard } from '~/composables/useWireguard'
 import { useSocks5 } from '~/composables/useSocks5'
+import {
+  MATRIX_HELP,
+  allowedListenModes,
+  allowedUploadModes,
+  defaultListenMode,
+  defaultUploadMode,
+  listenModeAllowed,
+  mechanismName,
+  uploadModeAllowed,
+} from '~/utils/uploadMatrix'
 
 const props = defineProps<{
   initial?: Partial<Tunnel>
@@ -62,6 +72,26 @@ watch(
   },
 )
 
+// v2 upload/download matrix: the upload path follows the download
+// transport. When the operator changes the download transport, snap the
+// upload mode (client) or listen mode (remote) to the matrix default if
+// the current choice is no longer valid, so the form can never sit in an
+// off-matrix state the backend would reject on save. Only an INVALID
+// selection is auto-corrected; a still-valid one (icmp allows either) is
+// left as the operator set it.
+watch(
+  () => draft.value.download_transport,
+  (dt) => {
+    if (isClient.value) {
+      if (!uploadModeAllowed(dt, draft.value.upload_mode)) {
+        draft.value.upload_mode = defaultUploadMode(dt)
+      }
+    } else if (!listenModeAllowed(dt, draft.value.upload_listen_mode)) {
+      draft.value.upload_listen_mode = defaultListenMode(dt)
+    }
+  },
+)
+
 onMounted(async () => {
   if (isClient.value) {
     if (!wg.list.value.length) await wg.refresh().catch(() => undefined)
@@ -79,18 +109,47 @@ const icmpModeOptions: { value: IcmpEchoMode; label: string }[] = [
   { value: 'request', label: 'echo-request (recommended)' },
   { value: 'reply', label: 'echo-reply (legacy)' },
 ]
-const uploadModeOptions: { value: UploadMode; label: string }[] = [
-  { value: 'wireguard', label: 'WireGuard' },
-  { value: 'socks5', label: 'SOCKS5 (multi-link)' },
-]
-const remoteListenOptions: { value: UploadListenMode; label: string }[] = [
-  { value: 'udp', label: 'UDP (default)' },
-  { value: 'socks5_tcp', label: 'SOCKS5-TCP (when Client uses SOCKS5)' },
-]
+// Upload-mode / listen-mode pickers are matrix-aware: every mode is
+// shown, but the ones off-matrix for the selected download transport are
+// disabled (grayed out) with a "(not for X)" suffix so the operator sees
+// why they can't pick it.
+const uploadModeLabels: Record<UploadMode, string> = {
+  wireguard: 'WireGuard',
+  socks5: 'SOCKS5 (multi-link)',
+}
+const remoteListenLabels: Record<UploadListenMode, string> = {
+  udp: 'UDP',
+  socks5_tcp: 'SOCKS5-TCP',
+}
 
-const wgOptions = computed(() =>
-  wg.list.value.map((c) => ({ value: c.id, label: c.name })),
+// Build select options from a label map, graying out (and explaining)
+// the modes that are off-matrix for the current download transport.
+function modeOptions<T extends string>(labels: Record<T, string>, allowed: T[]) {
+  const dt = draft.value.download_transport
+  const suffix = dt ? ` (not for ${dt.toUpperCase()})` : ''
+  return (Object.keys(labels) as T[]).map((v) => ({
+    value: v,
+    label: allowed.includes(v) ? labels[v] : `${labels[v]}${suffix}`,
+    disabled: !allowed.includes(v),
+  }))
+}
+
+const uploadModeOptions = computed(() =>
+  modeOptions(uploadModeLabels, allowedUploadModes(draft.value.download_transport)),
 )
+const remoteListenOptions = computed(() =>
+  modeOptions(remoteListenLabels, allowedListenModes(draft.value.download_transport)),
+)
+
+// The resolved mechanism (one of: udp-wg, tcp-socks5, icmp-wg,
+// icmp-socks5, icmpv6-wg, icmpv6-socks5) for the current download/upload
+// pair, shown as a confirmation line under the upload-mode picker.
+const resolvedMechanism = computed(() =>
+  mechanismName(draft.value.download_transport, draft.value.upload_mode),
+)
+const matrixHelp = MATRIX_HELP
+
+const wgOptions = computed(() => wg.list.value.map((c) => ({ value: c.id, label: c.name })))
 const socksOptions = computed(() =>
   socks.list.value.map((p) => ({ value: p.id, label: `${p.name} (${p.host}:${p.port})` })),
 )
@@ -116,10 +175,15 @@ function submit() {
         >
           <AppInput v-model="draft.name" :invalid="!!err('name')" placeholder="iran-3xui-443" />
         </FieldGroup>
-        <FieldGroup label="Enabled" help="When disabled, the listener isn't started on service restart.">
+        <FieldGroup
+          label="Enabled"
+          help="When disabled, the listener isn't started on service restart."
+        >
           <div class="flex h-10 items-center gap-2.5">
             <AppSwitch v-model="draft.enabled" />
-            <span class="text-[13px] text-subtle">{{ draft.enabled ? 'Will start' : 'Stopped' }}</span>
+            <span class="text-[13px] text-subtle">
+              {{ draft.enabled ? 'Will start' : 'Stopped' }}
+            </span>
           </div>
         </FieldGroup>
       </div>
@@ -208,9 +272,13 @@ function submit() {
         </FieldGroup>
         <FieldGroup
           label="Upload mode"
-          help="WireGuard = single encrypted tunnel. SOCKS5 = N parallel TCP connections to a load-balancing proxy fronting multiple Starlink links."
+          :help="`Follows the download transport. ${matrixHelp}`"
+          :error="err('upload_mode')"
         >
           <AppSelect v-model="draft.upload_mode" :options="uploadModeOptions" />
+          <p v-if="resolvedMechanism" class="mt-1.5 text-[12px] font-medium text-brand">
+            Mechanism: {{ resolvedMechanism }}
+          </p>
         </FieldGroup>
 
         <FieldGroup
@@ -220,11 +288,7 @@ function submit() {
           :error="err('wg_config_id')"
           required
         >
-          <AppSelect
-            v-if="wgOptions.length"
-            v-model="draft.wg_config_id"
-            :options="wgOptions"
-          />
+          <AppSelect v-if="wgOptions.length" v-model="draft.wg_config_id" :options="wgOptions" />
           <NuxtLink
             v-else
             to="/wireguard/new"
@@ -281,7 +345,8 @@ function submit() {
         </FieldGroup>
         <FieldGroup
           label="Listen mode"
-          help="UDP for the WireGuard upload mode; SOCKS5-TCP when the matching Client tunnel uses SOCKS5 upload."
+          :help="`Must mirror the Client. ${matrixHelp}`"
+          :error="err('upload_listen_mode')"
         >
           <AppSelect v-model="draft.upload_listen_mode" :options="remoteListenOptions" />
         </FieldGroup>
@@ -361,16 +426,16 @@ function submit() {
         >
           <AppSelect v-model="draft.icmp_echo_mode" :options="icmpModeOptions" />
         </FieldGroup>
-        <FieldGroup
-          label="MTU"
-          help="Default 1400 — leaves headroom for WG + HMAC overhead."
-        >
+        <FieldGroup label="MTU" help="Default 1400 — leaves headroom for WG + HMAC overhead.">
           <AppInput v-model="draft.mtu" type="number" placeholder="1400" monospace />
         </FieldGroup>
       </div>
     </AppCard>
 
-    <AppCard title="Security" description="The PSK is shared by both sides; rotation requires both at once.">
+    <AppCard
+      title="Security"
+      description="The PSK is shared by both sides; rotation requires both at once."
+    >
       <div class="grid gap-5 md:grid-cols-2">
         <FieldGroup
           label="Pre-shared key (PSK)"
@@ -391,7 +456,10 @@ function submit() {
 
     <AppCard title="Capacity" description="Per-tunnel session cap and idle eviction.">
       <div class="grid gap-5 md:grid-cols-3">
-        <FieldGroup label="Max connections" help="Drop new sessions above this cap with a WARN log.">
+        <FieldGroup
+          label="Max connections"
+          help="Drop new sessions above this cap with a WARN log."
+        >
           <AppInput v-model="draft.max_connections" type="number" monospace />
         </FieldGroup>
         <FieldGroup
@@ -415,8 +483,8 @@ function submit() {
             <AppSwitch v-model="draft.ping_smoothing_enabled" />
           </div>
           <p class="text-[12px] text-subtle">
-            Synthesise ICMP echo replies locally to mask the up/down RTT asymmetry. The real
-            request still travels — reachability is unaffected.
+            Synthesise ICMP echo replies locally to mask the up/down RTT asymmetry. The real request
+            still travels — reachability is unaffected.
           </p>
           <AppInput
             v-if="draft.ping_smoothing_enabled"
@@ -449,12 +517,7 @@ function submit() {
     <div
       class="sticky bottom-0 -mx-6 flex items-center justify-between gap-2 border-t border-line/70 bg-bg/90 px-6 py-4 backdrop-blur-md md:-mx-10 md:px-10"
     >
-      <AppButton
-        v-if="onDelete"
-        type="button"
-        variant="ghost"
-        @click="onDelete"
-      >
+      <AppButton v-if="onDelete" type="button" variant="ghost" @click="onDelete">
         <Trash2 class="size-4" />
         Delete tunnel
       </AppButton>
