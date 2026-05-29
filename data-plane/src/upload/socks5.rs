@@ -32,7 +32,7 @@
 //! degrades gracefully (localized drops) instead of freezing the tunnel.
 //!
 //! Dead-peer detection is left to the kernel: `TCP_USER_TIMEOUT` (10 s)
-//! + keepalive (see `perf::tune_socks5_tcp_socket`) make a stuck
+//! plus keepalive (see `perf::tune_socks5_tcp_socket`) make a stuck
 //! `write_all` return `Err` within seconds, which the driver turns into
 //! a reconnect. A generous [`WRITE_BACKSTOP`] only guards the
 //! pathological case where the kernel timer could not be set.
@@ -382,6 +382,7 @@ fn make_slot(
 /// One slot's lifecycle: connect (with backoff on failure), drain framed
 /// payloads to the TCP stream, and reconnect on write error — forever,
 /// until the queue closes (slot removed) or the stop watch fires.
+#[allow(clippy::too_many_arguments)]
 async fn slot_driver(
     tunnel_id: i64,
     target: Socks5Target,
@@ -490,7 +491,7 @@ async fn slot_driver(
                                 "client: SOCKS5 slot write failed; reconnecting"
                             );
                             let _ = stream.shutdown().await;
-                            consecutive_failures = 1;
+                            consecutive_failures = consecutive_failures.saturating_add(1);
                             break;
                         }
                         Err(_elapsed) => {
@@ -501,7 +502,7 @@ async fn slot_driver(
                                 "client: SOCKS5 slot write backstop elapsed (link cannot drain); reconnecting"
                             );
                             let _ = stream.shutdown().await;
-                            consecutive_failures = 1;
+                            consecutive_failures = consecutive_failures.saturating_add(1);
                             break;
                         }
                     }
