@@ -450,7 +450,11 @@ async fn slot_driver(
 
         consecutive_failures = 0;
         healthy.store(true, Ordering::Release);
-        info!(tunnel_id, slot = index, "client: SOCKS5 slot connected (healthy)");
+        info!(
+            tunnel_id,
+            slot = index,
+            "client: SOCKS5 slot connected (healthy)"
+        );
 
         // Drain framed payloads until a write error, a closed queue, or
         // stop. `biased` checks stop first so shutdown is prompt.
