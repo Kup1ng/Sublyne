@@ -1,0 +1,41 @@
+# Default: auto-detect text vs binary; normalize LF in the repo.
+* text=auto eol=lf
+
+# Force LF for files that run on Linux at runtime. Even when checked out
+# on Windows, these must stay LF or the kernel rejects them.
+*.sh        text eol=lf
+*.bash      text eol=lf
+Makefile    text eol=lf
+
+# Source code — always LF
+*.go        text eol=lf
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.js        text eol=lf
+*.mjs       text eol=lf
+*.cjs       text eol=lf
+*.vue       text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+
+# Lockfiles — text, LF
+pnpm-lock.yaml  text eol=lf
+go.sum          text eol=lf
+Cargo.lock      text eol=lf
+
+# Binary blobs that we don't want git to touch
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.woff      binary
+*.woff2     binary
+*.ttf       binary
+*.eot       binary

@@ -1,0 +1,1115 @@
+//! Remote-side tunnel actor.
+//!
+//! Three concurrent flows mirror the Client side:
+//!
+//! 1. **Upload listener.** Bind a regular UDP socket on
+//!    `upload_listen_addr`. When traffic arrives (already through the
+//!    seller's WG path), forward the payload to `forward_target`
+//!    using a second UDP socket. Record the upload peer in the
+//!    session table.
+//!
+//! 2. **Forward-target listener (download recv).** The same egress
+//!    socket also receives the reply traffic from `forward_target`.
+//!    On receive, hand the reply payload to one of N seal-and-spoof-
+//!    send workers via a bounded `mpsc` channel. Each worker seals
+//!    the payload with the per-tunnel HMAC envelope (using a
+//!    pre-derived key) and `sendmmsg`s the spoofed packet through its
+//!    own raw send socket — source = (`download_spoof_source_ip`,
+//!    `download_spoof_source_port`), destination = (`client_real_ip`,
+//!    `download_send_port`).
+//!
+//! 3. **Idle sweeper.** Same eviction loop as the Client.
+//!
+//! ## Why fan out workers, not the recv socket (R2)
+//!
+//! Same reason as the Client side: the recv pipeline drains kernel
+//! buffers with `recvmmsg(16)` from a single socket; the per-packet
+//! HMAC seal + raw `sendto` is what costs CPU, so the fan-out lives
+//! on the worker side. Each worker owns its OWN raw send socket
+//! because raw socket send queues are per-fd, so N independent fds
+//! parallelise the kernel-side send path; sharing one Arc<RawSocket>
+//! across workers would serialise on the kernel socket lock.
+
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::unix::AsyncFd;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
+use tracing::{debug, info, trace, warn};
+
+use crate::batch::{self, SendBatch};
+use crate::hmac;
+use crate::manager::SpawnError;
+use crate::metrics::TunnelMetrics;
+use crate::session::{InsertOutcome, SessionTable};
+use crate::spec::{ResolvedSpec, Transport, TunnelSpec, UploadListenMode};
+use crate::time_util::now_unix;
+use crate::transport::udp::MAX_UDP_DATAGRAM;
+use crate::transport::{icmp, icmpv6, tcp_syn, udp};
+
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
+
+use super::{sleep_or_stopped, MutableConfigSlot, ReasonSlot, StateSlot};
+
+/// Per-seal-worker input channel cap. Bounds how far a slow seal
+/// worker can fall behind its peers: at most `SEAL_WORKER_CHANNEL_CAP`
+/// jobs of its own arithmetic subset, which is
+/// `SEAL_WORKER_CHANNEL_CAP * n_workers` wire-seqs of potential
+/// reorder when its sealed output finally reaches the send worker.
+///
+/// Raised from 64 to 256 in the perf-seal-pipeline-headroom pass after
+/// the production Remote logged 75 000+ "seal channel full" drops over
+/// 24 h with peaks of 450/sec under 30 Mbit/s tunnel load. At cap=64
+/// a single scheduler hiccup was enough to fill the queue. Cap=256
+/// gives ~4× more burst absorption and keeps the worst-case wire
+/// reorder (`256 * n_workers` = 1024 with 4 workers) at exactly Iran's
+/// 1024-slot `SeqWindow` — see `hmac.rs::SEQ_WINDOW_WORDS`, which was
+/// simultaneously expanded from `u128` (128 effective slots) to a
+/// `[u64; 16]` so the docstring contract and the actual replay window
+/// now match.
+///
+/// Don't raise further without also bumping `SEQ_WINDOW_WORDS`: the
+/// downstream replay protection on Iran would start dropping the
+/// trailing burst.
+const SEAL_WORKER_CHANNEL_CAP: usize = 256;
+/// Shared sealed-packet queue between seal workers and the send
+/// worker. Sized to absorb several sendmmsg batches' worth of packets
+/// so the send worker can always fill a full batch without blocking
+/// while the seal workers stay ahead.
+const SEND_QUEUE_CAP: usize = 1024;
+
+/// One queued reply payload + per-packet HMAC sequence. The seq is
+/// captured by the recv task (single producer, monotonic AtomicU64
+/// fetch_add) so workers don't fight on it.
+struct DownloadSpoofJob {
+    /// Bytes received from `forward_target`. Will be sealed by the
+    /// worker (HMAC envelope + IP/L4 header + spoof source).
+    payload: Vec<u8>,
+    /// HMAC sequence number assigned at recv time so the seq stays
+    /// strictly monotonic at the wire regardless of which worker
+    /// happens to send first.
+    hmac_seq: u64,
+    /// ICMP 16-bit sequence (separate counter, only meaningful for
+    /// ICMP transports). Same monotonic property as `hmac_seq`.
+    icmp_seq: u16,
+}
+
+/// A spoof packet that's been HMAC-sealed and serialised into its
+/// final IP + L4 + envelope bytes. Produced by the seal workers,
+/// consumed by the single send worker — owning the bytes makes the
+/// hand-off a move through the channel.
+struct SealedPacket {
+    /// Complete IP + L4 + HMAC envelope + payload bytes, ready for
+    /// `sendmmsg`.
+    bytes: Vec<u8>,
+    /// Destination address for `sendto`. v4 carries the client + send
+    /// port; v6 zeroes the port (the AF_INET6 raw socket rejects a
+    /// non-zero `sin6_port`).
+    dest: SocketAddr,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn spawn(
+    spec: &TunnelSpec,
+    resolved: &ResolvedSpec,
+    _state: StateSlot,
+    _error_reason: ReasonSlot,
+    tasks: &mut JoinSet<()>,
+    stop_rx: watch::Receiver<bool>,
+    mutable_config: MutableConfigSlot,
+    session_table: Arc<SessionTable>,
+    metrics: Arc<TunnelMetrics>,
+) -> Result<(), SpawnError> {
+    let upload_listen = resolved
+        .upload_listen_addr
+        .expect("validate ensured upload_listen_addr");
+    let forward_target = resolved
+        .forward_target
+        .expect("validate ensured forward_target");
+    let send_port = resolved
+        .download_send_port
+        .expect("validate ensured download_send_port");
+    let client_ip = resolved
+        .client_real_ip
+        .expect("validate ensured client_real_ip");
+
+    // Validate the address family matches the chosen transport.
+    let family_check = check_address_family(spec.download_transport, resolved.spoof_ip, client_ip);
+    let initial_send_target = family_check?;
+
+    let id = spec.id;
+    let name = Arc::new(spec.name.clone());
+    let seq_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let icmp_seq_counter = Arc::new(std::sync::atomic::AtomicU32::new(1));
+    // Random non-zero u64 read from /dev/urandom once per tunnel start.
+    // Sealed into every spoofed download packet's HMAC envelope (see
+    // hmac.rs). When the Remote restarts this changes, which is the
+    // Client's signal to reset its sliding seq window — that replaced
+    // the old wall-clock `ts` check, so a skewed Iran box no longer
+    // silently drops every download.
+    let session_id = hmac::random_session_id().map_err(SpawnError::Io)?;
+    info!(
+        tunnel_id = id,
+        session_id = format!("0x{session_id:016x}"),
+        "remote: spoof session_id generated"
+    );
+    // Phase R4: pick a random per-tunnel ICMP identifier so a concurrent
+    // local `ping` can't collide. The value is logged at INFO so an
+    // operator running `tcpdump -nn icmp` can correlate the on-wire
+    // identifier with the tunnel it belongs to. For non-ICMP transports
+    // we still compute one so the value is available if hot-reload
+    // flips the transport later — the Remote side hot-reload triggers
+    // an internal restart, but the field stays meaningful.
+    let icmp_identifier = crate::icmp_id::pick_identifier(spec.id);
+    if matches!(spec.download_transport, Transport::Icmp | Transport::Icmpv6) {
+        info!(
+            tunnel_id = id,
+            transport = match spec.download_transport {
+                Transport::Icmp => "icmp",
+                Transport::Icmpv6 => "icmpv6",
+                _ => unreachable!(),
+            },
+            echo_mode = ?spec.icmp_echo_mode,
+            icmp_identifier,
+            "remote: ICMP identifier picked for this tunnel; will appear in tcpdump output"
+        );
+    }
+    let icmp_echo_mode = spec.icmp_echo_mode;
+
+    // (2) Forward-target socket. Bind on the same family as the forward
+    // target so v6 forward_target works. The download path uses this
+    // socket for both directions: send to forward_target on upload,
+    // recv from forward_target on download. Bind it first so we have a
+    // single shared destination for either upload-listen mode below.
+    let forward_bind = if forward_target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let forward_sock = UdpSocket::bind(forward_bind)
+        .await
+        .map_err(SpawnError::Io)?;
+    // The forward socket is the busiest one on the Remote — it both
+    // sends to forward_target and receives the reply stream. Tune it
+    // so a momentary spike doesn't lose reply packets at the kernel.
+    crate::perf::tune_socket(&forward_sock, "remote/forward");
+    let forward_sock = Arc::new(forward_sock);
+
+    // (1) Upload listener — UDP (historical default) or SOCKS5/TCP
+    // (Phase R9a, paired with the Client's upload_mode='socks5').
+    // The UDP path is byte-for-byte unchanged from pre-R9. The TCP
+    // path decodes `[u16 BE length][bytes]` frames into UDP payloads
+    // and forwards them to forward_target through `forward_sock`.
+    match spec.upload_listen_mode {
+        UploadListenMode::Udp => {
+            let upload_sock = bind_dualstack_udp(upload_listen).map_err(SpawnError::Io)?;
+            // Enlarge SO_RCVBUF/SO_SNDBUF beyond the 208 KiB Ubuntu
+            // default so the upload listener doesn't drop packets at
+            // the kernel queue when a tunnel pushes hundreds of
+            // Mbit/s. See the `perf` module.
+            crate::perf::tune_socket(&upload_sock, "remote/upload");
+            let upload_sock = Arc::new(upload_sock);
+            info!(tunnel_id = id, addr = %upload_listen,
+                family = address_family_label(upload_listen),
+                "remote: upload_listen bound (UDP)");
+
+            spawn_upload_task(
+                tasks,
+                id,
+                name.clone(),
+                upload_sock.clone(),
+                forward_sock.clone(),
+                session_table.clone(),
+                mutable_config.clone(),
+                metrics.clone(),
+                forward_target,
+                stop_rx.clone(),
+            );
+        }
+        UploadListenMode::Socks5Tcp => {
+            let tcp_listener = TcpListener::bind(upload_listen)
+                .await
+                .map_err(SpawnError::Io)?;
+            info!(tunnel_id = id, addr = %upload_listen,
+                family = address_family_label(upload_listen),
+                "remote: upload_listen bound (SOCKS5/TCP, R9a)");
+            spawn_socks5_upload_listener(
+                tasks,
+                id,
+                name.clone(),
+                tcp_listener,
+                forward_sock.clone(),
+                session_table.clone(),
+                mutable_config.clone(),
+                metrics.clone(),
+                forward_target,
+                stop_rx.clone(),
+            );
+        }
+    }
+
+    // Download-side: forward_sock recv → bounded channel → N seal +
+    // spoof-send workers. Each worker owns its own raw send socket so
+    // sendmmsg traffic parallelises at the kernel-socket layer.
+    spawn_download_pipeline(
+        tasks,
+        spec.download_transport,
+        icmp_echo_mode,
+        icmp_identifier,
+        id,
+        name.clone(),
+        forward_sock.clone(),
+        session_table.clone(),
+        mutable_config.clone(),
+        metrics.clone(),
+        seq_counter,
+        icmp_seq_counter,
+        session_id,
+        initial_send_target,
+        send_port,
+        client_ip,
+        stop_rx.clone(),
+    )?;
+
+    // (4) Idle sweeper.
+    spawn_idle_sweeper(
+        tasks,
+        id,
+        spec.idle_timeout_sec,
+        session_table.clone(),
+        metrics.clone(),
+        stop_rx.clone(),
+    );
+
+    Ok(())
+}
+
+fn address_family_label(addr: SocketAddr) -> &'static str {
+    if addr.is_ipv6() {
+        "ipv6"
+    } else {
+        "ipv4"
+    }
+}
+
+/// Bind a UDP socket on `addr`, explicitly enabling dual-stack
+/// behaviour for IPv6 wildcards so a single tunnel can carry both v4
+/// and v6 inbound traffic without depending on the host's
+/// /proc/sys/net/ipv6/bindv6only sysctl.
+fn bind_dualstack_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(false)?;
+    }
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
+}
+
+/// Per-transport address-family enforcement. ICMPv6 needs IPv6 on
+/// both spoof IP and client real IP; every other transport needs IPv4
+/// on both. Returning a single `SendTarget` lets the spawn caller hand
+/// the right sockaddr to `sendto` without re-matching at runtime.
+fn check_address_family(
+    transport: Transport,
+    spoof_ip: IpAddr,
+    client_ip: IpAddr,
+) -> Result<SendTarget, SpawnError> {
+    match transport {
+        Transport::Udp | Transport::TcpSyn | Transport::Icmp => match (spoof_ip, client_ip) {
+            (IpAddr::V4(s), IpAddr::V4(c)) => Ok(SendTarget::V4 {
+                spoof: s,
+                client: c,
+            }),
+            _ => Err(SpawnError::Io(io::Error::other(
+                "udp/tcp_syn/icmp transports require IPv4 spoof and client addresses",
+            ))),
+        },
+        Transport::Icmpv6 => match (spoof_ip, client_ip) {
+            (IpAddr::V6(s), IpAddr::V6(c)) => Ok(SendTarget::V6 {
+                spoof: s,
+                client: c,
+            }),
+            _ => Err(SpawnError::Io(io::Error::other(
+                "icmpv6 transport requires IPv6 spoof and client addresses",
+            ))),
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SendTarget {
+    V4 { spoof: Ipv4Addr, client: Ipv4Addr },
+    V6 { spoof: Ipv6Addr, client: Ipv6Addr },
+}
+
+impl SendTarget {
+    /// Rebuild a SendTarget with a new spoof IP while keeping the same
+    /// client real IP. Returns `None` if the families don't match
+    /// (defensive — the apply_updates path on the tunnel handle
+    /// rejects such a spoof-IP family swap, but we double-check here
+    /// since this is the actual outbound code path).
+    fn with_spoof(self, new_spoof: IpAddr) -> Option<Self> {
+        match (self, new_spoof) {
+            (SendTarget::V4 { client, .. }, IpAddr::V4(spoof)) => {
+                Some(SendTarget::V4 { spoof, client })
+            }
+            (SendTarget::V6 { client, .. }, IpAddr::V6(spoof)) => {
+                Some(SendTarget::V6 { spoof, client })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn open_send_socket_for_transport(t: Transport) -> Result<socket2::Socket, SpawnError> {
+    match t {
+        Transport::Udp => udp::open_raw_udp_send_socket().map_err(SpawnError::Io),
+        Transport::TcpSyn => tcp_syn::open_raw_tcp_send_socket().map_err(SpawnError::Io),
+        Transport::Icmp => icmp::open_raw_icmp_send_socket().map_err(SpawnError::Io),
+        Transport::Icmpv6 => icmpv6::open_raw_icmpv6_send_socket().map_err(SpawnError::Io),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_upload_task(
+    tasks: &mut JoinSet<()>,
+    id: i64,
+    name: Arc<String>,
+    upload_sock: Arc<UdpSocket>,
+    forward_sock: Arc<UdpSocket>,
+    session_table: Arc<SessionTable>,
+    mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
+    forward_target: SocketAddr,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    tasks.spawn(async move {
+        // See PR #15 for why this is MAX_UDP_DATAGRAM, not mtu.
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    info!(tunnel_id = id, name = %name, "remote: upload task stopping");
+                    return;
+                }
+                res = upload_sock.recv_from(&mut buf) => {
+                    let (n, src) = match res {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(tunnel_id = id, err = %e, "remote: upload recv");
+                            continue;
+                        }
+                    };
+                    // Sample mtu fresh so hot-reload of mtu takes effect
+                    // on the next packet.
+                    let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+                    let payload_cap = mtu.max(64);
+                    if n > payload_cap {
+                        warn!(tunnel_id = id, n, max = payload_cap,
+                            "remote: dropping oversized upload packet (raise tunnel MTU or shrink app packet)");
+                        continue;
+                    }
+                    let outcome = session_table.insert_or_refresh(src, src);
+                    if matches!(outcome, InsertOutcome::Rejected) {
+                        warn!(tunnel_id = id, %src,
+                            "remote: session table full, dropping new session");
+                        metrics.record_session_reject();
+                        continue;
+                    }
+                    if let Err(e) = forward_sock.send_to(&buf[..n], forward_target).await {
+                        warn!(tunnel_id = id, target = %forward_target, err = %e,
+                            "remote: forward to target failed");
+                    } else {
+                        // From the Remote's perspective the upstream
+                        // direction (toward the forward target) carries
+                        // the user's request — that's "upload-ish" in
+                        // the Client's framing. Record it on the same
+                        // counter so both sides' dashboards report a
+                        // symmetric bytes-out number.
+                        metrics.record_upload(n, now_unix());
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// SOCKS5 upload-listen path: accept TCP connections on
+/// `upload_listen_addr`, decode each `[u16 BE length][payload bytes]`
+/// frame, and forward the payload to `forward_target` exactly the way
+/// the UDP listener does.
+///
+/// R9a opened one SOCKS5 TCP connection on the Client side; R9b grew
+/// the Client to **N parallel connections**, and the Remote handles
+/// every accepted connection as its own independent tokio task. So
+/// this listener already scales to N inbound connections — no
+/// per-connection capacity bound — and the per-task `forward_sock`
+/// is a clone of the shared `Arc<UdpSocket>` so the merged payloads
+/// arrive at `forward_target` as a single in-order UDP stream
+/// (subject to the per-flow ordering the Client's sticky routing
+/// guarantees).
+#[allow(clippy::too_many_arguments)]
+fn spawn_socks5_upload_listener(
+    tasks: &mut JoinSet<()>,
+    id: i64,
+    name: Arc<String>,
+    listener: TcpListener,
+    forward_sock: Arc<UdpSocket>,
+    session_table: Arc<SessionTable>,
+    mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
+    forward_target: SocketAddr,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    info!(tunnel_id = id, name = %name, "remote: socks5 upload listener stopping");
+                    return;
+                }
+                accept = listener.accept() => {
+                    let (stream, peer) = match accept {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(tunnel_id = id, err = %e, "remote: socks5 upload accept");
+                            continue;
+                        }
+                    };
+                    // Same SOCKS5 TCP keepalive / USER_TIMEOUT as the
+                    // Client outbound side so an upstream NAT timeout
+                    // (proxy egress NAT, transit middlebox) is detected
+                    // here in seconds rather than ~120 s.
+                    crate::perf::tune_socks5_tcp_socket(&stream, "socks5/remote-in");
+                    info!(tunnel_id = id, %peer, "remote: socks5 upload connection accepted");
+                    let forward_sock = forward_sock.clone();
+                    let session_table = session_table.clone();
+                    let mutable_config = mutable_config.clone();
+                    let metrics = metrics.clone();
+                    let conn_stop_rx = stop_rx.clone();
+                    let name = name.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = drive_socks5_upload_connection(
+                            id,
+                            name,
+                            stream,
+                            peer,
+                            forward_sock,
+                            session_table,
+                            mutable_config,
+                            metrics,
+                            forward_target,
+                            conn_stop_rx,
+                        )
+                        .await
+                        {
+                            warn!(tunnel_id = id, %peer, err = %e,
+                                "remote: socks5 upload connection ended with error");
+                        }
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Pump frames off one accepted TCP connection. Reads `[u16 length]
+/// [payload]` pairs in a loop and forwards each payload to
+/// `forward_target` via `forward_sock`. Honours the same mtu cap,
+/// session-table insert, and metrics recording as the UDP path so
+/// dashboard counters look identical.
+#[allow(clippy::too_many_arguments)]
+async fn drive_socks5_upload_connection(
+    id: i64,
+    name: Arc<String>,
+    mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    forward_sock: Arc<UdpSocket>,
+    session_table: Arc<SessionTable>,
+    mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
+    forward_target: SocketAddr,
+    mut stop_rx: watch::Receiver<bool>,
+) -> io::Result<()> {
+    let mut len_buf = [0u8; 2];
+    let mut payload = vec![0u8; MAX_UDP_DATAGRAM];
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                info!(tunnel_id = id, name = %name, %peer,
+                    "remote: socks5 upload connection stopping");
+                return Ok(());
+            }
+            len_res = stream.read_exact(&mut len_buf) => {
+                if let Err(e) = len_res {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        info!(tunnel_id = id, %peer,
+                            "remote: socks5 upload connection closed by peer");
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+                let n = u16::from_be_bytes(len_buf) as usize;
+                if n == 0 {
+                    // Zero-length frames are a protocol violation —
+                    // they'd hang the reader. Close the connection so
+                    // the Client reconnects fresh.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "socks5_tcp upload: zero-length frame",
+                    ));
+                }
+                if n > payload.len() {
+                    // Defensive: should never happen because the
+                    // Client caps frames at u16::MAX which is
+                    // already > MAX_UDP_DATAGRAM. But keep the buf
+                    // dynamic so a future framing change can't UB.
+                    payload.resize(n, 0);
+                }
+                stream.read_exact(&mut payload[..n]).await?;
+                let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+                let payload_cap = mtu.max(64);
+                if n > payload_cap {
+                    warn!(tunnel_id = id, n, max = payload_cap,
+                        "remote: dropping oversized socks5_tcp upload frame (raise tunnel MTU)");
+                    continue;
+                }
+                // The SOCKS5 upload doesn't carry a real source
+                // peer per frame — every frame from this TCP
+                // connection is logically the same upstream session
+                // from the operator's perspective. Use the TCP peer
+                // as the session key so insert/refresh increments
+                // sessions sensibly and idle eviction can sweep when
+                // the connection drops.
+                let outcome = session_table.insert_or_refresh(peer, peer);
+                if matches!(outcome, InsertOutcome::Rejected) {
+                    warn!(tunnel_id = id, %peer,
+                        "remote: session table full, dropping new socks5 upload session");
+                    metrics.record_session_reject();
+                    continue;
+                }
+                if let Err(e) = forward_sock.send_to(&payload[..n], forward_target).await {
+                    warn!(tunnel_id = id, target = %forward_target, err = %e,
+                        "remote: socks5_tcp forward to target failed");
+                } else {
+                    metrics.record_upload(n, now_unix());
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_download_pipeline(
+    tasks: &mut JoinSet<()>,
+    transport: Transport,
+    icmp_echo_mode: crate::spec::IcmpEchoMode,
+    icmp_identifier: u16,
+    id: i64,
+    name: Arc<String>,
+    forward_sock: Arc<UdpSocket>,
+    session_table: Arc<SessionTable>,
+    mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
+    seq_counter: Arc<std::sync::atomic::AtomicU64>,
+    icmp_seq_counter: Arc<std::sync::atomic::AtomicU32>,
+    session_id: u64,
+    initial_send_target: SendTarget,
+    send_port: u16,
+    client_ip_for_log: IpAddr,
+    stop_rx: watch::Receiver<bool>,
+) -> Result<(), SpawnError> {
+    let label: &'static str = match transport {
+        Transport::Udp => "udp",
+        Transport::TcpSyn => "tcp_syn",
+        Transport::Icmp => "icmp",
+        Transport::Icmpv6 => "icmpv6",
+    };
+    let send_batch_size = crate::perf::send_batch();
+    let n_workers = crate::perf::per_core_sockets().max(1);
+
+    // Pipeline shape: recv → N seal workers → 1 send worker → wire.
+    //
+    // Recv loop assigns each reply a monotonic `hmac_seq` and routes
+    // the job to `seal_workers[hmac_seq % N]`. Each seal worker does
+    // HMAC-SHA256 + IP/L4 build into a fresh `Vec<u8>` and pushes a
+    // `SealedPacket` to the shared `sealed_tx`. The single send
+    // worker drains `sealed_rx` greedily up to `send_batch_size` and
+    // makes one `sendmmsg` per batch, preserving wire FIFO at the
+    // socket level.
+    //
+    // Why parallelise the seal but not the send: HMAC + checksum is
+    // the CPU-bound step (measurable on the new 4-vCPU Xeon). The
+    // sendmmsg syscall itself is cheap (16 packets per call) and a
+    // single-task sender keeps wire order monotonic enough for
+    // Iran's per-worker `SeqWindow` to absorb. Earlier round 2 tried
+    // fan-out at the SEND socket (each worker emitting through its
+    // own raw socket) and that produced wire-skew >128 seqs because
+    // workers' send timing was unrelated. This design keeps the
+    // single send socket so the wire is FIFO from the kernel's
+    // perspective; the only reorder source is seal-completion
+    // disparity, which `SEAL_WORKER_CHANNEL_CAP` bounds.
+    //
+    // n_workers comes from `SUBLYNE_PER_CORE_SOCKETS` (defaults to
+    // `available_parallelism()`). Setting it to 1 reverts to the
+    // historical single-seal-task behaviour without code changes.
+    let mut seal_txs: Vec<mpsc::Sender<DownloadSpoofJob>> = Vec::with_capacity(n_workers);
+    let mut seal_rxs: Vec<mpsc::Receiver<DownloadSpoofJob>> = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let (tx, rx) = mpsc::channel::<DownloadSpoofJob>(SEAL_WORKER_CHANNEL_CAP);
+        seal_txs.push(tx);
+        seal_rxs.push(rx);
+    }
+
+    let (sealed_tx, sealed_rx) = mpsc::channel::<SealedPacket>(SEND_QUEUE_CAP);
+
+    // One raw send socket — exclusively owned by the send worker so
+    // wire FIFO is preserved at the syscall layer.
+    let raw_send = open_send_socket_for_transport(transport)?;
+    let raw_send_fd = std::os::fd::OwnedFd::from(raw_send);
+    let send_sock = Arc::new(AsyncFd::new(raw_send_fd).map_err(SpawnError::Io)?);
+
+    info!(
+        tunnel_id = id,
+        transport = label,
+        dst = %client_ip_for_log,
+        port = send_port,
+        send_batch = send_batch_size,
+        seal_workers = n_workers,
+        seal_channel_cap = SEAL_WORKER_CHANNEL_CAP,
+        send_queue_cap = SEND_QUEUE_CAP,
+        "remote: spoof send socket ready, parallel seal + serial send pipeline spinning up"
+    );
+
+    tasks.spawn(spawn_download_recv_loop(
+        forward_sock,
+        seal_txs,
+        session_table.clone(),
+        mutable_config.clone(),
+        metrics.clone(),
+        seq_counter.clone(),
+        icmp_seq_counter.clone(),
+        id,
+        name.clone(),
+        label,
+        stop_rx.clone(),
+    ));
+
+    for (worker_id, rx) in seal_rxs.into_iter().enumerate() {
+        tasks.spawn(download_seal_worker(
+            rx,
+            sealed_tx.clone(),
+            initial_send_target,
+            send_port,
+            transport,
+            icmp_echo_mode,
+            icmp_identifier,
+            session_id,
+            label,
+            mutable_config.clone(),
+            id,
+            worker_id,
+            name.clone(),
+            stop_rx.clone(),
+        ));
+    }
+    // Drop the spawner's clone so the channel closes after every seal
+    // worker has dropped its `sealed_tx`, which lets the send worker
+    // exit cleanly on tunnel stop.
+    drop(sealed_tx);
+
+    tasks.spawn(download_send_worker(
+        sealed_rx,
+        send_sock,
+        label,
+        metrics.clone(),
+        mutable_config.clone(),
+        id,
+        name.clone(),
+        stop_rx.clone(),
+        send_batch_size,
+    ));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_download_recv_loop(
+    forward_sock: Arc<UdpSocket>,
+    seal_txs: Vec<mpsc::Sender<DownloadSpoofJob>>,
+    session_table: Arc<SessionTable>,
+    mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
+    seq_counter: Arc<std::sync::atomic::AtomicU64>,
+    icmp_seq_counter: Arc<std::sync::atomic::AtomicU32>,
+    id: i64,
+    name: Arc<String>,
+    label: &'static str,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+    let n_workers = seal_txs.len().max(1);
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                info!(tunnel_id = id, name = %name, transport = label,
+                    "remote: download recv stopping");
+                return;
+            }
+            res = forward_sock.recv_from(&mut buf) => {
+                let (n, _from) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(tunnel_id = id, err = %e, "remote: forward recv");
+                        continue;
+                    }
+                };
+                // Reply from the forward target is an "ingress" event
+                // on the download direction — record it before any
+                // further work so even a drop-by-no-session is counted.
+                metrics.record_download(n, now_unix());
+                // Sample mtu fresh so hot-reload of mtu takes effect
+                // on the next packet.
+                let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+                let payload_cap = mtu.max(64);
+                if n > payload_cap {
+                    warn!(tunnel_id = id, n, max = payload_cap,
+                        "remote: dropping oversized forward reply (raise tunnel MTU)");
+                    continue;
+                }
+                if session_table.any_session().is_none() {
+                    // Per-packet hot-path log: until the first upload
+                    // establishes a session, every forward-target reply
+                    // hits this branch. trace! (not debug!) so flipping
+                    // the panel to DEBUG doesn't flood the log with one
+                    // line per spoofed download attempt.
+                    trace!(tunnel_id = id, transport = label,
+                        "remote: dropped reply with no live session");
+                    continue;
+                }
+                let seq = seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let icmp_seq16 = icmp_seq_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u16;
+                let job = DownloadSpoofJob {
+                    payload: buf[..n].to_vec(),
+                    hmac_seq: seq,
+                    icmp_seq: icmp_seq16,
+                };
+                // Route by `seq % N` so each seal worker sees a
+                // strictly-monotonic subset of seqs. Combined with the
+                // small `SEAL_WORKER_CHANNEL_CAP`, this bounds the
+                // wire-order skew that reaches Iran's per-worker
+                // `SeqWindow`.
+                let worker = (seq as usize) % n_workers;
+                if let Err(e) = seal_txs[worker].try_send(job) {
+                    match e {
+                        mpsc::error::TrySendError::Full(_) => {
+                            warn!(tunnel_id = id, transport = label, worker,
+                                "remote: seal channel full, dropping spoof reply");
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {
+                            info!(tunnel_id = id, transport = label, worker,
+                                "remote: seal channel closed, recv exiting");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One of N parallel HMAC-seal + packet-build workers. Drains its own
+/// bounded input channel, computes the HMAC envelope and assembles the
+/// full IP + L4 + envelope bytes into a fresh `Vec<u8>`, then moves a
+/// [`SealedPacket`] through `sealed_tx` to the single send worker.
+///
+/// The per-packet `Vec<u8>` allocation is intentional — the bytes have
+/// to leave this task by value through the channel, so a reusable
+/// scratch wouldn't help. The HMAC clone + SHA-256 + checksum work
+/// dwarfs the allocation cost.
+#[allow(clippy::too_many_arguments)]
+async fn download_seal_worker(
+    mut rx: mpsc::Receiver<DownloadSpoofJob>,
+    sealed_tx: mpsc::Sender<SealedPacket>,
+    initial_send_target: SendTarget,
+    send_port: u16,
+    transport: Transport,
+    icmp_echo_mode: crate::spec::IcmpEchoMode,
+    icmp_identifier: u16,
+    session_id: u64,
+    label: &'static str,
+    mutable_config: MutableConfigSlot,
+    id: i64,
+    worker_id: usize,
+    name: Arc<String>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let initial_mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+    // Reuse one scratch buffer for the HMAC envelope across packets in
+    // this worker; the per-packet `packet_buf` has to be freshly
+    // allocated because it moves through the channel to the send
+    // worker.
+    let mut sealed_scratch: Vec<u8> = Vec::with_capacity(initial_mtu + crate::hmac::OVERHEAD);
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                info!(tunnel_id = id, worker = worker_id, name = %name, transport = label,
+                    "remote: seal worker stopping");
+                return;
+            }
+            job = rx.recv() => {
+                let job = match job {
+                    Some(j) => j,
+                    None => {
+                        info!(tunnel_id = id, worker = worker_id,
+                            "remote: seal channel closed, worker exiting");
+                        return;
+                    }
+                };
+                // Snapshot mutable config so hot-reload of PSK / spoof
+                // IP / spoof port takes effect on the next packet.
+                let (psk, spoof_ip, spoof_src_port) = {
+                    let cfg = mutable_config.read().expect("mutable_config read");
+                    (cfg.psk.clone(), cfg.spoof_ip, cfg.spoof_port)
+                };
+                let send_target = match initial_send_target.with_spoof(spoof_ip) {
+                    Some(t) => t,
+                    None => {
+                        warn!(tunnel_id = id, worker = worker_id, transport = label, %spoof_ip,
+                            "remote: hot-reloaded spoof_ip family does not match transport, dropping");
+                        continue;
+                    }
+                };
+                hmac::seal_with(&psk, session_id, job.hmac_seq, &job.payload, &mut sealed_scratch);
+                let mut packet_buf: Vec<u8> = Vec::with_capacity(initial_mtu + 128);
+                build_for_transport(
+                    transport,
+                    icmp_echo_mode,
+                    icmp_identifier,
+                    spoof_src_port,
+                    send_port,
+                    send_target,
+                    job.hmac_seq,
+                    job.icmp_seq,
+                    &sealed_scratch,
+                    &mut packet_buf,
+                );
+                let dest = match send_target {
+                    SendTarget::V4 { client, .. } => {
+                        SocketAddr::V4(std::net::SocketAddrV4::new(client, send_port))
+                    }
+                    SendTarget::V6 { client, .. } => {
+                        SocketAddr::V6(std::net::SocketAddrV6::new(client, 0, 0, 0))
+                    }
+                };
+                let sealed = SealedPacket { bytes: packet_buf, dest };
+                if let Err(e) = sealed_tx.try_send(sealed) {
+                    match e {
+                        mpsc::error::TrySendError::Full(_) => {
+                            warn!(tunnel_id = id, worker = worker_id, transport = label,
+                                "remote: send queue full, dropping sealed packet");
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {
+                            info!(tunnel_id = id, worker = worker_id,
+                                "remote: send queue closed, seal worker exiting");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Single send worker. Drains the shared sealed-packet queue, packs
+/// up to `send_batch_size` packets into a `SendBatch`, and issues one
+/// `sendmmsg` per batch. Wire order = queue pop order ≈ seal-
+/// completion order ≈ HMAC-seq order with `n_workers`-bounded skew.
+#[allow(clippy::too_many_arguments)]
+async fn download_send_worker(
+    mut sealed_rx: mpsc::Receiver<SealedPacket>,
+    raw_send: Arc<AsyncFd<std::os::fd::OwnedFd>>,
+    label: &'static str,
+    metrics: Arc<TunnelMetrics>,
+    mutable_config: MutableConfigSlot,
+    id: i64,
+    name: Arc<String>,
+    mut stop_rx: watch::Receiver<bool>,
+    send_batch_size: usize,
+) {
+    let initial_mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+    // Slot buf must hold IP (20 v4 / 40 v6) + L4 (TCP 20, UDP 8, ICMP
+    // 8) + HMAC envelope (32 B) + payload (up to mtu). 128 B headroom
+    // covers worst case; if a sealed packet pushes past capacity the
+    // slot's Vec just grows.
+    let slot_buf_size = initial_mtu + 128;
+    let mut send_batch = SendBatch::new(send_batch_size, slot_buf_size);
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                info!(tunnel_id = id, name = %name, transport = label,
+                    "remote: send worker stopping");
+                return;
+            }
+            sealed = sealed_rx.recv() => {
+                let first = match sealed {
+                    Some(s) => s,
+                    None => {
+                        info!(tunnel_id = id, transport = label,
+                            "remote: send queue closed, send worker exiting");
+                        return;
+                    }
+                };
+                send_batch.reset();
+                stage_sealed(&first, &mut send_batch.slots[0]);
+                let mut count = 1;
+                // Greedy drain more sealed packets without awaiting so
+                // we fill the batch up to `send_batch_size`.
+                while count < send_batch.capacity() {
+                    match sealed_rx.try_recv() {
+                        Ok(s) => {
+                            stage_sealed(&s, &mut send_batch.slots[count]);
+                            count += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Single sendmmsg attempt. On partial accept (kernel
+                // returns n < count), the unsent tail is dropped —
+                // UDP semantics, application layer retransmits.
+                let result = match raw_send.writable().await {
+                    Ok(mut guard) => guard.try_io(|fd| {
+                        batch::sendmmsg(fd.get_ref().as_raw_fd(), &mut send_batch, count)
+                    }),
+                    Err(e) => {
+                        warn!(tunnel_id = id, err = %e, transport = label,
+                            "remote: raw writable awaiter failed");
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(Ok(n)) => {
+                        if n < count {
+                            warn!(tunnel_id = id, sent = n, count, transport = label,
+                                "remote: sendmmsg partial accept, dropped tail");
+                        }
+                        for _ in 0..n {
+                            metrics.record_transport_packet(label);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!(tunnel_id = id, err = %e, transport = label,
+                            "remote: sendmmsg failed");
+                    }
+                    Err(_would_block) => {
+                        debug!(tunnel_id = id, transport = label,
+                            "remote: sendmmsg would block, dropping batch");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Copy a `SealedPacket` into a `SendBatch` slot. The seal + build
+/// work is already done by the seal worker; this only memcpy's the
+/// bytes and sets the destination sockaddr.
+fn stage_sealed(sealed: &SealedPacket, slot: &mut crate::batch::SendSlot) {
+    slot.buf.clear();
+    slot.buf.extend_from_slice(&sealed.bytes);
+    slot.len = sealed.bytes.len();
+    slot.set_dest(sealed.dest);
+    slot.active = true;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_for_transport(
+    transport: Transport,
+    icmp_echo_mode: crate::spec::IcmpEchoMode,
+    icmp_identifier: u16,
+    src_port: u16,
+    dst_port: u16,
+    send_target: SendTarget,
+    hmac_seq: u64,
+    icmp_seq: u16,
+    sealed: &[u8],
+    out: &mut Vec<u8>,
+) {
+    match (transport, send_target) {
+        (Transport::Udp, SendTarget::V4 { spoof, client }) => {
+            udp::build_packet(spoof, src_port, client, dst_port, sealed, out);
+        }
+        (Transport::TcpSyn, SendTarget::V4 { spoof, client }) => {
+            tcp_syn::build_packet(spoof, src_port, client, dst_port, hmac_seq, sealed, out);
+        }
+        (Transport::Icmp, SendTarget::V4 { spoof, client }) => {
+            icmp::build_packet(
+                spoof,
+                icmp_identifier,
+                client,
+                dst_port,
+                icmp_seq,
+                icmp_echo_mode,
+                sealed,
+                out,
+            );
+        }
+        (Transport::Icmpv6, SendTarget::V6 { spoof, client }) => {
+            icmpv6::build_packet(
+                spoof,
+                icmp_identifier,
+                client,
+                dst_port,
+                icmp_seq,
+                icmp_echo_mode,
+                sealed,
+                out,
+            );
+        }
+        // The address-family check in `check_address_family` rules out
+        // every other combination before we reach this builder; an
+        // assertion here would panic at runtime under misuse.
+        _ => unreachable!("address family mismatch escaped validate()"),
+    }
+}
+
+fn spawn_idle_sweeper(
+    tasks: &mut JoinSet<()>,
+    id: i64,
+    idle_timeout_sec: u32,
+    session_table: Arc<SessionTable>,
+    metrics: Arc<TunnelMetrics>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let timeout = idle_timeout_sec.max(1);
+    tasks.spawn(async move {
+        let tick = Duration::from_secs((timeout / 4).max(1) as u64);
+        loop {
+            if sleep_or_stopped(tick, &mut stop_rx).await {
+                return;
+            }
+            let n = session_table.evict_idle(std::time::Instant::now());
+            if n > 0 {
+                debug!(
+                    tunnel_id = id,
+                    evicted = n,
+                    remaining = session_table.len(),
+                    "remote: evicted idle sessions"
+                );
+            }
+            metrics.set_active_sessions(session_table.len() as u32);
+        }
+    });
+}

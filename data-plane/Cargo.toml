@@ -1,0 +1,87 @@
+[package]
+name = "sublyne-dataplane"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "Sublyne data plane (UDP / TCP-SYN / ICMP / ICMPv6 spoof transports, HMAC-authenticated)"
+license = "MIT"
+repository = "https://github.com/Kup1ng/Sublyne"
+publish = false
+
+[lib]
+name = "sublyne_dataplane"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sublyne-dataplane"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime. We use the multi-thread runtime so future Phase 10
+# can spawn per-core workers without an architectural change.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "signal",
+    "time",
+] }
+
+# Wire format. JSON over a length-prefixed envelope — see
+# .claude/skills/rust-go-ipc/SKILL.md for the contract.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto for the HMAC envelope on the spoofed download path.
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+constant_time_eq = "0.4"
+
+# Raw / capability-aware socket creation. We open AF_INET RAW sockets
+# with IP_HDRINCL on the send side (so we forge the IPv4 source IP) and
+# rely on the systemd unit's AmbientCapabilities=CAP_NET_RAW for the
+# permission. The `all` feature exposes the `set_header_included_v4`
+# method we need for IP_HDRINCL.
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+
+# Logging. tracing-subscriber's env-filter is what honors the
+# SetLogLevel IPC command at runtime. The `json` feature enables the
+# optional SUBLYNE_LOG_FORMAT=json mode (R5) that lets the Go supervisor
+# parse each dataplane line into structured slog attrs.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Misc.
+anyhow = "1"
+thiserror = "2"
+bytes = "1"
+
+# `async fn` in traits via the standard proc-macro shim. Rust 1.83
+# supports native async fn in traits, but the trait-object form
+# (`Arc<dyn UploadTransport>`) still needs the `async_trait` adapter
+# because async fns in traits aren't yet dyn-safe on stable. The crate
+# is tiny and adds no runtime cost beyond one extra heap allocation
+# per invocation (which the trait dispatch was going to do anyway).
+async-trait = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+# `process` is only needed by the R9a tests/loopback_socks5.rs
+# integration suite to spawn microsocks as a child process; adding it
+# as a dev-dep keeps the release binary's tokio feature set small.
+tokio = { version = "1", features = ["test-util", "process"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0

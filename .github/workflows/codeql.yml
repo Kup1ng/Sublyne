@@ -1,0 +1,84 @@
+name: codeql
+
+# Static analysis on push to main, on every PR, and weekly so we pick
+# up new query packs CodeQL adds upstream without waiting for the next
+# code change. Phase 15 (PRD §10.1/§11) requires CodeQL coverage; Go
+# and JS/TS are the two GitHub-supported languages in our repo. The
+# Rust data plane is covered by `cargo audit` + `cargo deny` in the
+# main `ci` workflow, since CodeQL does not yet support Rust on GHA.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays at 06:13 UTC — off any popular cron minute to avoid the
+    # midnight-UTC scheduler hot zone.
+    - cron: '13 6 * * 1'
+
+# Avoid duplicate runs on the same ref. Releases tag pushes are
+# separately covered by release.yml; codeql does not need to rerun
+# there.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # CodeQL uploads SARIF results to the GitHub Code Scanning API.
+  security-events: write
+  # Required when CodeQL needs to enumerate workflows on the runner.
+  actions: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Go needs its toolchain present for autobuild to pick up the
+      # module. Match the version pinned in ci.yml so CodeQL analyses
+      # the same compiler output the production build uses.
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: control-plane/go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # `security-extended` widens the query set beyond the
+          # default and catches taint flows the default suite skips.
+          queries: security-extended
+
+      # JavaScript/TypeScript analysis does not need a build; CodeQL
+      # walks the sources directly. Go's autobuild handles the
+      # build itself.
+
+      - name: Perform CodeQL Analysis
+        # `continue-on-error: true` lets this job pass until the
+        # operator enables Code scanning under Settings → Code
+        # security → Code scanning. CodeQL itself still runs and
+        # any findings appear in the workflow log; only the SARIF
+        # upload to the Security tab is gated by the repo setting.
+        # Once enabled this line can be removed so failures gate the
+        # PR like every other check.
+        continue-on-error: true
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:${{ matrix.language }}'

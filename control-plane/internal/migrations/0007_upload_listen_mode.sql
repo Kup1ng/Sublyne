@@ -1,0 +1,31 @@
+-- 0007_upload_listen_mode: per-tunnel Remote-side upload-listen mode.
+-- Created in Phase R9a.
+--
+-- R8 added `tunnels.upload_mode` (Client-side selector — 'wireguard' or
+-- 'socks5') and the `socks5_proxies` table. Starting a `socks5`-mode
+-- tunnel in R8 returns NOT_IMPLEMENTED. R9a wires the dataplane through
+-- so a SOCKS5 upload tunnel actually passes traffic over a single
+-- TCP connection (R9b adds the N-parallel-connection pool).
+--
+-- SOCKS5 carries TCP, not UDP. The Client wraps every outbound UDP
+-- payload in a `[u16 BE length][payload bytes]` frame and writes it
+-- over the TCP socket. The Remote therefore needs to know whether to
+-- bind a UDP socket on `upload_listen_addr` (the existing path, default
+-- 'udp') or accept a TCP connection and decode those frames back into
+-- UDP payloads ('socks5_tcp').
+--
+-- This is a Remote-side decision and lives on the same `tunnels` row as
+-- the Client-side `upload_mode` so a paired tunnel keeps both halves of
+-- the choice in one place. Operators are responsible for the symmetry —
+-- Client `upload_mode='socks5'` must pair with Remote
+-- `upload_listen_mode='socks5_tcp'` (PRD invariant §2.3: no inter-server
+-- control plane; symmetry is enforced via shared static config the
+-- operator copies to both sides).
+--
+-- Default is 'udp' so every pre-R9 tunnel keeps its existing upload
+-- listener with no operator action. The CHECK constraint matches the
+-- closed set the validator and dataplane both know about; an
+-- unrecognised value can't sneak in via import/restore.
+
+ALTER TABLE tunnels ADD COLUMN upload_listen_mode TEXT NOT NULL DEFAULT 'udp'
+    CHECK (upload_listen_mode IN ('udp', 'socks5_tcp'));

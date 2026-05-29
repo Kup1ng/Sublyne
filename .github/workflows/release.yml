@@ -1,0 +1,146 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Releases run one-at-a-time per tag. Two concurrent runs on the same
+# tag would race when uploading artifacts; concurrency: cancel-in-progress
+# is wrong here because we want the first run to finish, not be killed
+# by a duplicate tag-push event.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # softprops/action-gh-release needs this to create the Release
+
+jobs:
+  build:
+    name: build sublyne-linux-amd64 and publish release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          # The changelog script walks `git log <prev-tag>..HEAD`; a
+          # shallow checkout would hide every previous tag and emit an
+          # empty range. fetch-depth: 0 is the supported "give me
+          # everything" sentinel.
+          fetch-depth: 0
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          # github.ref is "refs/tags/vX.Y.Z" on a tag push.
+          tag="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$tag' does not match vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building release for tag: $tag"
+
+      - name: Set up Rust toolchain (musl)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85.0'
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: data-plane
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Match ci.yml so the release binary is built with the same
+          # toolchain the test matrix validates against. go.mod still
+          # declares the minimum (1.23); 1.25 satisfies it.
+          go-version: '1.25'
+          cache-dependency-path: control-plane/go.sum
+
+      - name: Enable corepack and activate pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9 --activate
+
+      - name: Set up Node 20
+        # First-push: no committed pnpm-lock.yaml. setup-node's
+        # cache-dependency-path needs a real file; we drop it for now
+        # and rely on pnpm's own cache. Once a lockfile lands we can
+        # re-enable cache: pnpm.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install musl-tools
+        # Cross-linking the Rust musl target needs musl-gcc. The
+        # GitHub runner doesn't ship it by default.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build artifact (scripts/build.sh)
+        # scripts/build.sh runs the same pipeline a developer would
+        # locally: frontend → Rust dataplane (musl) → Go control plane
+        # with -tags=embed. The output is the single
+        # sublyne-linux-amd64 we ship.
+        run: |
+          chmod +x scripts/build.sh
+          ./scripts/build.sh
+
+      - name: Verify build artifact exists and runs --version
+        run: |
+          ls -lh sublyne-linux-amd64
+          # Sanity: the binary must announce a non-empty version
+          # string. If --version prints "sublyne 0.0.0-dev" we know
+          # the -ldflags substitution didn't take and the release
+          # would be misleadingly versioned. Tagged builds must
+          # include the tag in their version string.
+          version_line="$(./sublyne-linux-amd64 --version)"
+          echo "Built version line: $version_line"
+          if [[ ! "$version_line" == *"${{ steps.tag.outputs.tag }}"* ]]; then
+            echo "::error::version line '$version_line' does not contain the tag '${{ steps.tag.outputs.tag }}'; -ldflags substitution failed."
+            exit 1
+          fi
+          # `-dirty` shows up on CI because the build pipeline writes
+          # frontend/pnpm-lock.yaml (and Rust-cache restores can update
+          # tracked files in passing). It does NOT mean the released
+          # binary is wrong. Surface it as a warning and a worktree
+          # snapshot for forensics, but don't fail the release.
+          if [[ "$version_line" == *"-dirty"* ]]; then
+            echo "::warning::version line '$version_line' carries a -dirty suffix from CI build-time generated files. Worktree status follows."
+            git status --porcelain
+          fi
+
+      - name: Generate changelog
+        run: |
+          chmod +x scripts/changelog.sh
+          ./scripts/changelog.sh --tag "${{ steps.tag.outputs.tag }}" > /tmp/changelog.md
+          echo "---- changelog.md ----"
+          cat /tmp/changelog.md
+          echo "----------------------"
+
+      - name: Create GitHub Release
+        # softprops/action-gh-release@v2:
+        #   - creates the release if it doesn't already exist
+        #   - uploads each file listed under `files`
+        #   - uses body_path as the release notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body_path: /tmp/changelog.md
+          # `draft: false` and `prerelease: false` make this a real,
+          # latest-release entry visible at /releases/latest. The
+          # PRD §10.2 quick-start command wgets from latest, so
+          # draft would break the install flow.
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            sublyne-linux-amd64
+            scripts/setup.sh

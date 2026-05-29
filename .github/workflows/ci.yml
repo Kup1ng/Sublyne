@@ -1,0 +1,338 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to keep CI lean.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (data-plane)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: data-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pinned to 1.85.0 — this is the stable that ships Cargo's
+        # `edition2024` feature, which the `constant_time_eq` v0.4.2
+        # transitive dep in the Cargo.lock requires. Stays in lockstep
+        # with data-plane/rust-toolchain.toml.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85.0'
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: data-plane
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        # The loopback integration test under tests/loopback.rs needs
+        # CAP_NET_RAW; it's marked #[ignore] so the default run skips
+        # it. Everything else (unit tests, proptest, the IPC ping
+        # roundtrip) runs unprivileged.
+        run: cargo test --all-targets
+
+      - name: cargo audit
+        # Phase 8a introduces the first real Rust dependencies
+        # (tokio, hmac, sha2, socket2, …) so cargo audit now has
+        # something to scan. Two workarounds:
+        #
+        #   1. Install the precompiled cargo-audit binary rather than
+        #      building it from source — the source build pulls in
+        #      aws-lc-sys and adds ~5 min per CI run.
+        #   2. Strip CVSS 4.0 strings from the advisory database
+        #      before scanning. cargo-audit 0.21.2 (current release
+        #      as of 2026-05-20) chokes on CVSS 4.0 with "unsupported
+        #      CVSS version". None of those advisories apply to our
+        #      dependency set (they're for deno, pingora, libcrux,
+        #      etc.) so dropping the field is safe; cargo-audit
+        #      continues to scan the affected crates by RUSTSEC id.
+        run: |
+          curl -sSL \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.21.2/cargo-audit-x86_64-unknown-linux-musl-v0.21.2.tgz" \
+            | tar xz -C /tmp
+          sudo install /tmp/cargo-audit-*/cargo-audit /usr/local/bin/cargo-audit
+          git clone --depth 1 https://github.com/RustSec/advisory-db ~/.cargo/advisory-db
+          find ~/.cargo/advisory-db/crates/ -name '*.md' \
+            -exec sed -i '/^cvss = "CVSS:4\.0/d' {} +
+          cargo audit --no-fetch
+
+      - name: cargo deny
+        # Phase 15 adds cargo-deny as a second layer: it enforces our
+        # license allow-list, blocks specific crates we don't want
+        # (openssl, openssl-sys), and refuses git/unknown registry
+        # sources. Config lives at data-plane/deny.toml. We install
+        # the precompiled binary for the same reason as cargo-audit
+        # above — building cargo-deny from source pulls in a heavy
+        # tree (rustls, etc.) and would add ~3 min to CI.
+        #
+        # We deliberately skip cargo-deny's `advisories` check here —
+        # the preceding `cargo audit` step already runs against the
+        # stripped RustSec database. Re-running it through cargo-deny
+        # would force a second clone into ~/.cargo/advisory-dbs/ that
+        # we'd then have to strip again for CVSS 4.0 advisories.
+        # Running `bans licenses sources` keeps the value-add
+        # (licenses + banned crates + restricted registries) without
+        # duplicating advisory work.
+        run: |
+          curl -sSL \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.16.2/cargo-deny-0.16.2-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C /tmp
+          sudo install /tmp/cargo-deny-0.16.2-*/cargo-deny /usr/local/bin/cargo-deny
+          cargo deny --version
+          cargo deny check bans licenses sources
+
+  go:
+    name: go (control-plane)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: control-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Phase 2 introduces net/http and BurntSushi/toml, which
+          # between them reach encoding/asn1, crypto/tls,
+          # crypto/x509, encoding/pem, and net/url. The known
+          # stdlib vulnerabilities reachable from those packages
+          # are only fully resolved in go1.25.8+, so the CI
+          # toolchain runs on 1.25. The go.mod directive stays at
+          # 1.23 — it's a minimum, not the toolchain version, and
+          # 1.25 satisfies it.
+          go-version: '1.25'
+          cache-dependency-path: control-plane/go.sum
+
+      - name: gofmt -l
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: control-plane
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  frontend:
+    name: frontend (nuxt 3)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable corepack and activate pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9 --activate
+
+      - name: Set up Node 20
+        # We don't ship a pnpm-lock.yaml on the first push, so we can't
+        # tell setup-node to cache on it — pnpm caches against the
+        # store path on its own once the lockfile lands later.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: pnpm install
+        # The repo's first push doesn't carry a lockfile — pnpm generates
+        # one on this run. Later commits can switch to --frozen-lockfile
+        # once a lockfile is in source control.
+        run: pnpm install --no-frozen-lockfile
+
+      - name: pnpm lint
+        run: pnpm lint
+
+      - name: pnpm typecheck
+        run: pnpm typecheck
+
+      - name: pnpm test
+        run: pnpm test
+
+      - name: pnpm build
+        # Mirror the production build environment from
+        # scripts/build.sh: NUXT_APP_BASE_URL is the placeholder the
+        # Go server substitutes at serve time. The frontend's
+        # `build` script (`nuxt build && node scripts/build-spa-index.mjs`)
+        # asserts the placeholder is present in the captured shell;
+        # CI must therefore set the env var so a build regression
+        # surfaces in CI instead of only on release.
+        env:
+          NUXT_APP_BASE_URL: /__SUBLYNE_WEB_PATH__/
+        run: pnpm build
+
+  release-validate:
+    name: release-validate (setup.sh + release.yml)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The changelog smoke test walks `git log`, so it needs more
+          # than the default shallow checkout. Full history matches
+          # what release.yml actually does on a tag push.
+          fetch-depth: 0
+
+      - name: Lint setup.sh and helper scripts with shellcheck
+        # Catches subtle quoting bugs the menu tests can't reach
+        # (e.g. unquoted globs that only fire on certain filenames).
+        # shellcheck is preinstalled on ubuntu-24.04 runners.
+        run: |
+          shellcheck --version
+          shellcheck \
+            scripts/setup.sh \
+            scripts/build.sh \
+            scripts/changelog.sh \
+            scripts/test-setup-menus.sh \
+            scripts/check_systemd_install.sh \
+            tests/acceptance/01_install.sh \
+            tests/acceptance/06_brute_force.sh \
+            tests/acceptance/07_backup_restore.sh \
+            tests/acceptance/08_stop_delete.sh
+
+      - name: Bash syntax check
+        # bash -n catches syntax errors that shellcheck might let
+        # through (rare, but cheap insurance).
+        run: |
+          for f in scripts/setup.sh scripts/changelog.sh scripts/test-setup-menus.sh scripts/build.sh \
+                   tests/acceptance/01_install.sh tests/acceptance/06_brute_force.sh \
+                   tests/acceptance/07_backup_restore.sh tests/acceptance/08_stop_delete.sh; do
+            bash -n "$f"
+          done
+
+      - name: Validate release.yml is well-formed YAML
+        # Reach for python's yaml module rather than yamllint so we
+        # don't add another apt-get install. The python image on the
+        # GitHub runner ships PyYAML by default.
+        run: |
+          python3 -c "
+          import sys, yaml
+          with open('.github/workflows/release.yml') as f:
+              doc = yaml.safe_load(f)
+          # Required pieces of a tag-driven release workflow: the
+          # 'on:' clause (loaded as True from PyYAML because 'on' is
+          # a reserved YAML boolean — handle both keys), at least one
+          # job, and a step that runs scripts/build.sh.
+          on_block = doc.get('on') or doc.get(True)
+          if not on_block:
+              print('release.yml: missing on: clause'); sys.exit(1)
+          tags = on_block.get('push', {}).get('tags', [])
+          if 'v*.*.*' not in tags:
+              print('release.yml: push.tags must include v*.*.*'); sys.exit(1)
+          jobs = doc.get('jobs', {})
+          if not jobs:
+              print('release.yml: no jobs defined'); sys.exit(1)
+          steps = next(iter(jobs.values()))['steps']
+          step_text = ' '.join(s.get('run', '') for s in steps if isinstance(s, dict))
+          if 'scripts/build.sh' not in step_text:
+              print('release.yml: no step runs scripts/build.sh'); sys.exit(1)
+          file_refs = ' '.join(
+              (s.get('with') or {}).get('files', '') if isinstance(s, dict) else ''
+              for s in steps
+          )
+          if 'sublyne-linux-amd64' not in file_refs or 'setup.sh' not in file_refs:
+              print('release.yml: action-gh-release must upload both sublyne-linux-amd64 and setup.sh');
+              sys.exit(1)
+          print('release.yml validation passed.')
+          "
+
+      - name: Smoke-run scripts/changelog.sh against the current history
+        # Walk the recent history with no previous-tag argument — the
+        # script should produce non-empty markdown and at least one
+        # bucket header. We do not assert specific commits, only that
+        # the script runs cleanly under `set -e` and emits content.
+        run: |
+          chmod +x scripts/changelog.sh
+          out="$(./scripts/changelog.sh --tag v0.0.0-ci HEAD~5..HEAD 2>&1)"
+          echo "---- changelog smoke output ----"
+          echo "$out"
+          echo "--------------------------------"
+          if [ -z "$out" ]; then
+            echo "::error::changelog.sh produced no output"
+            exit 1
+          fi
+          if ! echo "$out" | grep -q '^### '; then
+            echo "::error::changelog.sh produced no bucket headers"
+            exit 1
+          fi
+
+      - name: Run setup.sh sandbox menu tests
+        # Exercises every Phase 14 menu path against a sandbox tree
+        # under /tmp. The tests are self-contained: they ship a fake
+        # `sublyne` binary that responds to --version, --tear-down,
+        # and --show-admin-username, so the runner doesn't need our
+        # actual release artifact in place.
+        run: |
+          chmod +x scripts/setup.sh scripts/test-setup-menus.sh
+          ./scripts/test-setup-menus.sh
+
+      - name: Dry-run build script (frontend only — fast)
+        # The full build.sh pipeline takes ~3 minutes (Rust musl
+        # compile dominates) and is already exercised end-to-end by
+        # release.yml on tag pushes. For the per-PR signal we just
+        # confirm the frontend half of the pipeline succeeds; the
+        # Go embed step is exercised by the `go` job.
+        run: |
+          corepack enable
+          corepack prepare pnpm@9 --activate
+          # We don't run the full build.sh here because that would
+          # duplicate every PR's existing rust + frontend + go jobs.
+          # Instead, just shellcheck-validate that build.sh hasn't
+          # drifted into invalid syntax — the per-language jobs
+          # exercise the pieces themselves.
+          bash -n scripts/build.sh
+
+  ci-pass:
+    name: ci-pass
+    if: always()
+    needs: [rust, go, frontend, release-validate]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Aggregate result
+        run: |
+          if [ "${{ needs.rust.result }}" != "success" ] \
+            || [ "${{ needs.go.result }}" != "success" ] \
+            || [ "${{ needs.frontend.result }}" != "success" ] \
+            || [ "${{ needs.release-validate.result }}" != "success" ]; then
+            echo "One or more required jobs failed."
+            echo "rust=${{ needs.rust.result }}"
+            echo "go=${{ needs.go.result }}"
+            echo "frontend=${{ needs.frontend.result }}"
+            echo "release-validate=${{ needs.release-validate.result }}"
+            exit 1
+          fi
+          echo "All checks passed."

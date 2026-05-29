@@ -1,0 +1,190 @@
+/* Sublyne design tokens.
+ *
+ * Two-theme system driven by CSS custom properties. Light is the
+ * default; the dark theme activates when <html> carries the `.dark`
+ * class (set by useTheme on first paint to avoid a flash).
+ *
+ * Tokens are intentionally few: bg / surface / elevated / muted / line
+ * + ink / subtle / faint + brand / accent / ok / warn / danger. Every
+ * component uses Tailwind utilities that resolve into these tokens, so
+ * a redesign is a few values in this file — never a sweep through
+ * every component.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Light theme (default) */
+    --bg: 250 250 252;          /* zinc-50 with a hint of blue */
+    --surface: 255 255 255;     /* card surface */
+    --elevated: 246 247 250;    /* slightly raised */
+    --muted: 240 240 245;       /* subtle fills */
+    --line: 228 228 234;        /* hairline borders */
+    --ink: 23 23 28;            /* primary text */
+    --subtle: 90 90 102;        /* secondary text */
+    --faint: 152 152 165;       /* tertiary text / placeholders */
+
+    --brand: 124 58 237;        /* violet-600 */
+    --brand-strong: 109 40 217; /* violet-700 — primary button fill */
+    --brand-soft: 237 233 254;  /* violet-100 — chip / soft bg */
+    --brand-edge: 167 139 250;  /* violet-400 — gradient edge */
+
+    --accent: 6 182 212;        /* cyan-500 — live indicator */
+    --ok: 16 185 129;           /* emerald-500 */
+    --warn: 245 158 11;         /* amber-500 */
+    --danger: 244 63 94;        /* rose-500 */
+  }
+
+  .dark {
+    /* Dark theme — refined midnight, no full-black so OLED bloom
+     * doesn't smear the gradient brand mark. */
+    --bg: 9 9 13;               /* near-zinc-950 with a touch warmer */
+    --surface: 19 19 24;        /* card surface */
+    --elevated: 26 26 33;       /* slightly raised */
+    --muted: 31 31 39;
+    --line: 38 38 47;
+    --ink: 245 245 248;
+    --subtle: 168 168 178;
+    --faint: 102 102 115;
+
+    --brand: 167 139 250;       /* violet-400 — pops on dark (text, icons, rails) */
+    --brand-strong: 124 58 237; /* violet-600 — button fills; AA white text */
+    --brand-soft: 49 35 92;     /* deep violet, low-saturation */
+    --brand-edge: 196 181 253;  /* violet-300 — gradient edge */
+
+    --accent: 34 211 238;       /* cyan-400 */
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+  }
+
+  html {
+    background-color: rgb(var(--bg));
+    color: rgb(var(--ink));
+    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply min-h-screen;
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+  }
+
+  /* Focus ring — visible but quiet. Default browser outline is ugly;
+   * the predecessor's heavier shadow looked like the focused input
+   * had a permanent purple border. This thinner 2-px brand ring
+   * reads as "active" without dominating the form. */
+  :focus-visible {
+    outline: 2px solid rgb(var(--brand) / 0.55);
+    outline-offset: 1px;
+    border-radius: 0.6rem;
+  }
+  /* Buttons own their pressed/hover styles already; skip the offset
+   * outline so it doesn't double up with bg/shadow changes. */
+  button:focus-visible,
+  a:focus-visible {
+    outline-offset: 2px;
+  }
+
+  /* Selection */
+  ::selection {
+    background-color: rgb(var(--brand) / 0.30);
+    color: rgb(var(--ink));
+  }
+
+  /* Tabular numbers for any column-aligned numeric content */
+  .num,
+  td.num,
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Strip the native browser spinner arrows from number inputs.
+   * They clash with the form's neutral chrome and the inline
+   * placeholders look cleaner without them. */
+  input[type='number'] {
+    -moz-appearance: textfield;
+  }
+  input[type='number']::-webkit-outer-spin-button,
+  input[type='number']::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  /* Scrollbar tuning — slim, subtle */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--line));
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--subtle) / 0.50);
+    background-clip: padding-box;
+    border: 2px solid transparent;
+  }
+}
+
+@layer components {
+  /* The signature brand gradient. Reused on hero text, the login glow,
+   * and the brand mark inside the sidebar. */
+  .brand-gradient {
+    background: linear-gradient(
+      135deg,
+      rgb(var(--brand-edge)) 0%,
+      rgb(var(--brand)) 45%,
+      rgb(var(--accent)) 100%
+    );
+    background-size: 200% 200%;
+    @apply animate-sheen;
+  }
+
+  .brand-text {
+    @apply brand-gradient bg-clip-text text-transparent;
+  }
+
+  /* Soft glow used behind the login card. Stronger on dark (where the
+   * brand reads as a real spotlight) and toned down on light (where
+   * the same opacity becomes muddy). */
+  .login-glow {
+    background:
+      radial-gradient(70% 60% at 50% -10%, rgb(var(--brand) / 0.34) 0%, transparent 70%),
+      radial-gradient(55% 55% at 110% 110%, rgb(var(--accent) / 0.28) 0%, transparent 65%),
+      radial-gradient(45% 45% at -10% 80%, rgb(var(--brand-edge) / 0.30) 0%, transparent 70%);
+  }
+  .dark .login-glow {
+    background:
+      radial-gradient(75% 65% at 50% -5%, rgb(var(--brand) / 0.45) 0%, transparent 70%),
+      radial-gradient(55% 55% at 110% 110%, rgb(var(--accent) / 0.38) 0%, transparent 65%),
+      radial-gradient(50% 50% at -10% 80%, rgb(var(--brand-edge) / 0.40) 0%, transparent 70%);
+  }
+
+  /* Card surface — used by AppCard. Repeated as a class for places we
+   * want a card-looking shell without the AppCard component. */
+  .surface-card {
+    @apply rounded-2xl border border-line bg-surface shadow-soft;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,75 @@
+# cargo-deny configuration for the Rust data plane.
+#
+# Run locally: `cargo deny check` (from data-plane/).
+# CI runs it inside the `rust` job in .github/workflows/ci.yml.
+#
+# The four sections below correspond to cargo-deny's four checks:
+#   - advisories: RustSec advisory database
+#   - licenses:   declared license must be in the allow list
+#   - bans:       deny specific crates / multiple versions
+#   - sources:    only allow crates from crates.io (plus an empty
+#                 git allow-list to make additions explicit)
+
+[graph]
+# Only the platform we actually ship to.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+version = 2
+# CI is meant to fail on a new advisory landing in our dep tree. The
+# `cargo audit` step in ci.yml is the primary gate; deny duplicates it
+# so a `cargo deny` run locally also catches it.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Standard permissive set + the more obscure-but-fine ones our deps
+# happen to use (ring -> ISC, Unicode-DFS for unicode-ident, etc.).
+# Adding a new license should be a conscious decision, not a silent
+# allow.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OpenSSL",
+]
+# Crates that don't declare a license cleanly trigger a manual review.
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Crates we never want to pick up by accident. `openssl-sys` would
+# pull in an OS-level OpenSSL dep we don't have on musl targets;
+# the `ring`/`rustls` stack is what we'd want instead if TLS ever
+# entered the data plane (it currently doesn't — HMAC + raw sockets).
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]
+# Explicitly allow a controlled set of crates to appear in multiple
+# versions during the dep graph transition (none today).
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io. Adding a git source must be explicit so we don't
+# accidentally pull from an unverified mirror or fork.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

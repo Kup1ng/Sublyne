@@ -1,0 +1,374 @@
+package tunnels
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+)
+
+// ValidationError carries a flat list of per-field problems so the API
+// layer can ship them straight back to the form. The message text is
+// user-facing and surfaces in the panel exactly as written.
+type ValidationError struct {
+	Fields map[string]string
+}
+
+// Error implements the error interface. The output is debug-grade; the
+// API handler formats Fields for the response body.
+func (e *ValidationError) Error() string {
+	if len(e.Fields) == 0 {
+		return "validation failed"
+	}
+	parts := make([]string, 0, len(e.Fields))
+	for k, v := range e.Fields {
+		parts = append(parts, fmt.Sprintf("%s: %s", k, v))
+	}
+	return "validation failed: " + strings.Join(parts, "; ")
+}
+
+// HasErrors reports whether Fields is non-empty.
+func (e *ValidationError) HasErrors() bool { return len(e.Fields) > 0 }
+
+func newValidationError() *ValidationError {
+	return &ValidationError{Fields: map[string]string{}}
+}
+
+// Validate enforces all field-level rules from PRD §3.1 / §3.2 plus the
+// port-conflict rule from §3.5. `serverRole` is the role of the server
+// running this code; the tunnel's own role must match it, since the
+// PRD pins one role per server.
+//
+// `existingID` is the row id being updated (0 for create); rows with
+// that id are excluded from the port-conflict scan so a no-op save
+// doesn't false-positive against itself.
+//
+// The supplied Repo is used to read the current port-set across all
+// other tunnels. Pass a real Repo backed by the live DB; tests use a
+// minimal in-memory implementation.
+func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, existingID int64) error {
+	ve := newValidationError()
+
+	// Name is the only globally unique handle the operator sees.
+	t.Name = strings.TrimSpace(t.Name)
+	switch {
+	case t.Name == "":
+		ve.Fields["name"] = "Name is required."
+	case len(t.Name) > 64:
+		ve.Fields["name"] = "Name must be 64 characters or fewer."
+	}
+
+	// Role must match the server's role. This is the "one role per
+	// server" PRD invariant — a Client server can only own Client
+	// tunnels and vice versa.
+	if !t.Role.IsValid() {
+		ve.Fields["role"] = "Role must be either client or remote."
+	} else if t.Role != serverRole {
+		ve.Fields["role"] = fmt.Sprintf("This server is configured as %q; it can only host %q tunnels.", serverRole, serverRole)
+	}
+
+	// Shared fields.
+	if t.PSK == "" {
+		ve.Fields["psk"] = "PSK is required. Must match the paired tunnel on the other server exactly."
+	} else if len(t.PSK) < 8 {
+		ve.Fields["psk"] = "PSK must be at least 8 characters."
+	}
+	if !t.DownloadTransport.IsValid() {
+		ve.Fields["download_transport"] = "Transport must be one of udp, tcp_syn, icmp, or icmpv6."
+	}
+	// icmp_echo_mode applies only to ICMP / ICMPv6 transports; we still
+	// CHECK the column against the same enum on every save so a stale
+	// value can't sneak in via import/restore.
+	if t.IcmpEchoMode == "" {
+		t.IcmpEchoMode = IcmpEchoModeReply
+	}
+	if !t.IcmpEchoMode.IsValid() {
+		ve.Fields["icmp_echo_mode"] = "ICMP echo mode must be either 'reply' or 'request'."
+	}
+	if err := checkIP(t.DownloadSpoofSourceIP); err != nil {
+		ve.Fields["download_spoof_source_ip"] = "Spoof source IP " + err.Error()
+	}
+	if t.DownloadSpoofSourcePort < 1 || t.DownloadSpoofSourcePort > 65535 {
+		ve.Fields["download_spoof_source_port"] = "Spoof source port must be between 1 and 65535."
+	}
+	if t.MTU < 576 || t.MTU > 9000 {
+		ve.Fields["mtu"] = "MTU must be between 576 and 9000."
+	}
+	if t.MaxConnections <= 0 {
+		ve.Fields["max_connections"] = "Max connections must be greater than zero."
+	}
+	if t.IdleTimeout <= 0 {
+		ve.Fields["idle_timeout"] = "Idle timeout must be greater than zero seconds."
+	}
+
+	// Default the Remote-side upload-listen mode to 'udp' so every
+	// pre-R9 Client and Remote row keeps its existing listener with no
+	// operator action; validateRemoteFields enforces IsValid() once a
+	// Remote tunnel reaches its branch.
+	if t.UploadListenMode == "" {
+		t.UploadListenMode = UploadListenModeUDP
+	}
+
+	switch t.Role {
+	case RoleClient:
+		validateClientFields(t, ve)
+	case RoleRemote:
+		validateRemoteFields(t, ve)
+	}
+
+	// Port-conflict scan. This is best-effort even when the field-level
+	// validation above flagged the IP:port — if local_listen_addr is
+	// malformed the conflict scan simply skips it.
+	if ve.HasErrors() {
+		return ve
+	}
+	if err := checkPortConflicts(ctx, repo, t, existingID, ve); err != nil {
+		return err
+	}
+	if ve.HasErrors() {
+		return ve
+	}
+	return nil
+}
+
+func validateClientFields(t *Tunnel, ve *ValidationError) {
+	// local_listen_addr — required, host:port; host is the bind
+	// interface (0.0.0.0 means "all"), port is what the end-user
+	// device connects to.
+	if !t.LocalListenAddr.Valid || strings.TrimSpace(t.LocalListenAddr.String) == "" {
+		ve.Fields["local_listen_addr"] = "Local listen address is required for client tunnels (e.g. 0.0.0.0:443)."
+	} else if _, _, err := splitHostPort(t.LocalListenAddr.String); err != nil {
+		ve.Fields["local_listen_addr"] = "Local listen address must be host:port, e.g. 0.0.0.0:443."
+	}
+
+	if !t.DownloadReceivePort.Valid {
+		ve.Fields["download_receive_port"] = "Download receive port is required for client tunnels."
+	} else if p := t.DownloadReceivePort.Int64; p < 1 || p > 65535 {
+		ve.Fields["download_receive_port"] = "Download receive port must be between 1 and 65535."
+	}
+
+	if !t.UploadTargetAddr.Valid || strings.TrimSpace(t.UploadTargetAddr.String) == "" {
+		ve.Fields["upload_target_addr"] = "Upload target address is required for client tunnels (the Remote server's host:port)."
+	} else if _, _, err := splitHostPort(t.UploadTargetAddr.String); err != nil {
+		ve.Fields["upload_target_addr"] = "Upload target address must be host:port, e.g. 198.51.100.10:55555."
+	}
+
+	// Upload-mode mutual exclusion (Phase R8). A Client tunnel uploads
+	// through exactly one of two paths:
+	//
+	//   - upload_mode='wireguard' (default): needs wg_config_id set
+	//     (Phase 7+) OR the legacy pasted text in wireguard_config
+	//     (Phase 6); socks5_proxy_id must be NULL.
+	//   - upload_mode='socks5' (Phase R8): needs socks5_proxy_id set;
+	//     wg_config_id and wireguard_config must both be empty so a
+	//     misclick on the picker can't double-link the tunnel.
+	//
+	// The Start handler returns NOT_IMPLEMENTED for socks5-mode tunnels
+	// in R8; R9 adds the dataplane client.
+	if t.UploadMode == "" {
+		t.UploadMode = UploadModeWireguard
+	}
+	if !t.UploadMode.IsValid() {
+		ve.Fields["upload_mode"] = "Upload mode must be either 'wireguard' or 'socks5'."
+	} else {
+		hasWGRef := t.WGConfigID.Valid && t.WGConfigID.Int64 > 0
+		hasLegacyText := t.WireguardConfig.Valid && strings.TrimSpace(t.WireguardConfig.String) != ""
+		hasSocks5 := t.Socks5ProxyID.Valid && t.Socks5ProxyID.Int64 > 0
+		switch t.UploadMode {
+		case UploadModeWireguard:
+			if !hasWGRef && !hasLegacyText {
+				ve.Fields["wg_config_id"] = "Select a WireGuard config — paste one on the WireGuard page first if none exists yet."
+			}
+			if hasSocks5 {
+				ve.Fields["socks5_proxy_id"] = "Clear the SOCKS5 proxy or switch upload mode to 'socks5'."
+			}
+		case UploadModeSocks5:
+			if !hasSocks5 {
+				ve.Fields["socks5_proxy_id"] = "Pick a SOCKS5 proxy — add one on the SOCKS5 page first if none exists yet."
+			}
+			if hasWGRef {
+				ve.Fields["wg_config_id"] = "Clear the WireGuard config or switch upload mode to 'wireguard'."
+			}
+			if hasLegacyText {
+				ve.Fields["wireguard_config"] = "Clear the legacy WireGuard text or switch upload mode to 'wireguard'."
+			}
+		}
+	}
+
+	// The ping_smoothing_target_ms / pacing_target_ms fields only
+	// matter when their toggle is on, but we still cap them so a
+	// nonsense value can't slip in via the API.
+	if t.PingSmoothingTargetMS < 0 || t.PingSmoothingTargetMS > 60_000 {
+		ve.Fields["ping_smoothing_target_ms"] = "Ping smoothing target must be between 0 and 60000 ms."
+	}
+	if t.PacingTargetMS < 0 || t.PacingTargetMS > 60_000 {
+		ve.Fields["pacing_target_ms"] = "Pacing target must be between 0 and 60000 ms."
+	}
+}
+
+func validateRemoteFields(t *Tunnel, ve *ValidationError) {
+	if !t.UploadListenAddr.Valid || strings.TrimSpace(t.UploadListenAddr.String) == "" {
+		ve.Fields["upload_listen_addr"] = "Upload listen address is required for remote tunnels (e.g. 0.0.0.0:55555)."
+	} else if _, _, err := splitHostPort(t.UploadListenAddr.String); err != nil {
+		ve.Fields["upload_listen_addr"] = "Upload listen address must be host:port, e.g. 0.0.0.0:55555."
+	}
+
+	if !t.ForwardTarget.Valid || strings.TrimSpace(t.ForwardTarget.String) == "" {
+		ve.Fields["forward_target"] = "Forward target is required for remote tunnels (the proxy panel's host:port)."
+	} else if _, _, err := splitHostPort(t.ForwardTarget.String); err != nil {
+		ve.Fields["forward_target"] = "Forward target must be host:port, e.g. 127.0.0.1:5201."
+	}
+
+	if !t.DownloadSendPort.Valid {
+		ve.Fields["download_send_port"] = "Download send port is required for remote tunnels and must equal the client's download_receive_port."
+	} else if p := t.DownloadSendPort.Int64; p < 1 || p > 65535 {
+		ve.Fields["download_send_port"] = "Download send port must be between 1 and 65535."
+	}
+
+	if !t.ClientRealIP.Valid || strings.TrimSpace(t.ClientRealIP.String) == "" {
+		ve.Fields["client_real_ip"] = "Client real IP is required (the public IP of the Iran-side Client server)."
+	} else if err := checkIP(t.ClientRealIP.String); err != nil {
+		ve.Fields["client_real_ip"] = "Client real IP " + err.Error()
+	}
+
+	// Upload-listen mode (Phase R9a). 'udp' is the historical default
+	// for every pre-R9 tunnel. 'socks5_tcp' is required when the paired
+	// Client uses upload_mode='socks5' — the Remote then binds a TCP
+	// listener that decodes [u16][bytes] frames instead of UDP. We can't
+	// cross-check against the Client (no inter-server channel, PRD §2.3)
+	// but we still enforce the closed enum so an unrecognised value
+	// can't reach the dataplane via import/restore.
+	if t.UploadListenMode == "" {
+		t.UploadListenMode = UploadListenModeUDP
+	}
+	if !t.UploadListenMode.IsValid() {
+		ve.Fields["upload_listen_mode"] = "Upload listen mode must be either 'udp' or 'socks5_tcp'."
+	}
+}
+
+func checkPortConflicts(ctx context.Context, repo *Repo, t *Tunnel, existingID int64, ve *ValidationError) error {
+	occupied, err := collectOccupiedPorts(ctx, repo, existingID)
+	if err != nil {
+		return err
+	}
+
+	switch t.Role {
+	case RoleClient:
+		if port, ok := portFromAddr(t.LocalListenAddr.String); ok {
+			if owner, taken := occupied[port]; taken {
+				ve.Fields["local_listen_addr"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
+			}
+		}
+		if t.DownloadReceivePort.Valid {
+			port := int(t.DownloadReceivePort.Int64)
+			if owner, taken := occupied[port]; taken {
+				ve.Fields["download_receive_port"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
+			}
+			// Also catch the case where the new tunnel itself reuses
+			// local_listen_addr's port as download_receive_port.
+			if localPort, ok := portFromAddr(t.LocalListenAddr.String); ok && localPort == port {
+				ve.Fields["download_receive_port"] = "Download receive port must differ from local listen port."
+			}
+		}
+	case RoleRemote:
+		if port, ok := portFromAddr(t.UploadListenAddr.String); ok {
+			if owner, taken := occupied[port]; taken {
+				ve.Fields["upload_listen_addr"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
+			}
+		}
+	}
+	return nil
+}
+
+type occupiedPort struct {
+	name  string
+	field string
+}
+
+// collectOccupiedPorts builds a map of every UDP port already claimed
+// by a tunnel on this server, keyed by port number, to which tunnel
+// (and on which field) it belongs. `excludeID` is the tunnel being
+// updated; its own ports are not considered conflicts with itself.
+func collectOccupiedPorts(ctx context.Context, repo *Repo, excludeID int64) (map[int]occupiedPort, error) {
+	rows, err := repo.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("tunnels: list for port-conflict scan: %w", err)
+	}
+	occupied := make(map[int]occupiedPort, len(rows)*2)
+	for _, row := range rows {
+		if row.ID == excludeID {
+			continue
+		}
+		if row.LocalListenAddr.Valid {
+			if p, ok := portFromAddr(row.LocalListenAddr.String); ok {
+				if _, exists := occupied[p]; !exists {
+					occupied[p] = occupiedPort{name: row.Name, field: "local listen port"}
+				}
+			}
+		}
+		if row.DownloadReceivePort.Valid {
+			p := int(row.DownloadReceivePort.Int64)
+			if _, exists := occupied[p]; !exists {
+				occupied[p] = occupiedPort{name: row.Name, field: "download receive port"}
+			}
+		}
+		if row.UploadListenAddr.Valid {
+			if p, ok := portFromAddr(row.UploadListenAddr.String); ok {
+				if _, exists := occupied[p]; !exists {
+					occupied[p] = occupiedPort{name: row.Name, field: "upload listen port"}
+				}
+			}
+		}
+	}
+	return occupied, nil
+}
+
+func checkIP(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return errors.New("is required.")
+	}
+	if _, err := netip.ParseAddr(s); err != nil {
+		return errors.New("must be a valid IPv4 or IPv6 address.")
+	}
+	return nil
+}
+
+// splitHostPort accepts either bracketed IPv6 (`[::1]:443`) or
+// host:port for IPv4/hostnames. We use net.SplitHostPort because it
+// handles both shapes; the host is then validated as either an IP or
+// the wildcard "0.0.0.0" / "::". Hostname-style hosts are accepted (we
+// don't resolve here — DNS is a runtime concern handled in Phase 7+).
+func splitHostPort(s string) (host string, port int, err error) {
+	s = strings.TrimSpace(s)
+	host, portStr, err := net.SplitHostPort(s)
+	if err != nil {
+		return "", 0, fmt.Errorf("malformed host:port: %w", err)
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("port is not a number: %w", err)
+	}
+	if p < 1 || p > 65535 {
+		return "", 0, fmt.Errorf("port must be between 1 and 65535")
+	}
+	return host, p, nil
+}
+
+// portFromAddr extracts the port from a host:port string, returning
+// ok=false if the input is empty or malformed. Used by the conflict
+// scan, which deliberately ignores invalid addresses (the field
+// validator will already have flagged them).
+func portFromAddr(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	_, port, err := splitHostPort(s)
+	if err != nil {
+		return 0, false
+	}
+	return port, true
+}

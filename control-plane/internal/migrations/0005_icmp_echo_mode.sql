@@ -1,0 +1,33 @@
+-- 0005_icmp_echo_mode: per-tunnel ICMP echo direction selector.
+-- Created in Phase R4.
+--
+-- Phase 8b shipped ICMP / ICMPv6 spoof transports that always send ICMP
+-- type 0 (echo-REPLY for v4) and type 129 (echo-REPLY for v6). On the
+-- real Iran ↔ foreign link those unsolicited echo-replies are dropped
+-- upstream of the Iran host (proven in tests/perf/icmp-on-real-path.md:
+-- Remote eth0 OUT shows 9,812 spoofed type-0 packets; Iran eth0 IN shows
+-- zero). The reference project github.com/ParsaKSH/spoof-tunnel does NOT
+-- have this problem because it sends echo-REQUESTs (type 8 / 128).
+--
+-- This migration adds icmp_echo_mode so an operator can pick between:
+--   'reply'   — current behaviour, kept as the default for back-compat
+--               (works on loopback and on links where unsolicited
+--               type-0 traffic is not filtered).
+--   'request' — send type 8 / 128 instead. The dataplane also suppresses
+--               the kernel's automatic echo-reply for the lifetime of the
+--               tunnel via net.ipv4.icmp_echo_ignore_all=1 (or the v6
+--               equivalent). Paired Client + Remote must agree on the
+--               mode; the panel hides the field unless transport is
+--               icmp or icmpv6.
+--
+-- Tunnels with download_transport in (udp, tcp_syn) ignore this field
+-- entirely; it's tracked at the row level so it survives a transport
+-- switch and edits don't lose the operator's choice.
+--
+-- Both client and remote rows carry this column because both sides must
+-- agree on the wire ICMP type: the Remote builds it on send and the
+-- Client parses it on receive. The dataplane's IPC StartTunnel payload
+-- forwards the value verbatim.
+
+ALTER TABLE tunnels ADD COLUMN icmp_echo_mode TEXT NOT NULL DEFAULT 'reply'
+    CHECK (icmp_echo_mode IN ('reply', 'request'));

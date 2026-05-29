@@ -1,0 +1,75 @@
+# --- Rust (data-plane) -------------------------------------------------------
+data-plane/target/
+**/*.rs.bk
+*.pdb
+
+# --- Go (control-plane) ------------------------------------------------------
+# Compiled binaries
+/sublyne
+/sublyne.exe
+/sublyne-linux-amd64
+/sublyne-linux-amd64.exe
+control-plane/cmd/sublyne/sublyne
+control-plane/cmd/sublyne/sublyne.exe
+
+# Go workspace files (we don't use workspaces; ignore if dropped in)
+go.work
+go.work.sum
+
+# Coverage
+*.out
+*.cover
+
+# --- Embed staging (build outputs, never committed) --------------------------
+control-plane/internal/webassets/frontend_dist/
+control-plane/internal/webassets/dataplane/
+# Phase 8a stages the Rust dataplane binary into the dataplaneasset
+# package right before `go build -tags=embed`. The file is reproduced
+# from the Rust crate on every release build; we never commit it.
+control-plane/internal/dataplaneasset/sublyne-dataplane
+
+# --- Node / Nuxt 3 frontend --------------------------------------------------
+frontend/node_modules/
+frontend/.nuxt/
+frontend/.output/
+frontend/.data/
+frontend/dist/
+
+# Vite / Vitest caches
+frontend/.vite/
+frontend/.vitest/
+
+# pnpm
+frontend/.pnpm-store/
+
+# Playwright MCP scratch
+**/.playwright-mcp/
+
+# --- Logs and runtime --------------------------------------------------------
+*.log
+logs/
+
+# --- Environment files -------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- IDE / editor ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.history/
+
+# --- OS files ----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Claude harness scratch --------------------------------------------------
+.claude/scheduled_tasks.lock
+
+# --- Misc --------------------------------------------------------------------
+*.tmp
+*.bak

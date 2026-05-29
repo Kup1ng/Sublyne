@@ -1,0 +1,51 @@
+# golangci-lint config for the Sublyne control plane.
+# Baseline taken from .claude/skills/linting-and-testing/SKILL.md.
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - revive
+    - gocritic
+    - bodyclose
+    - gosec
+    - sqlclosecheck
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/Kup1ng/Sublyne/control-plane
+  revive:
+    rules:
+      - name: var-naming
+      - name: package-comments
+      - name: exported
+        arguments:
+          - "checkPrivateReceivers"
+          - "disableStutteringCheck"
+  gosec:
+    excludes:
+      # G304 (file path provided as taint input) — we accept user-controlled
+      # paths in the config loader and audit them at a higher layer.
+      - G304
+
+issues:
+  exclude-rules:
+    # Test files can use long lines, _test fixtures, etc.
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+        - revive
+  max-issues-per-linter: 0
+  max-same-issues: 0
