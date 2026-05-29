@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -66,6 +67,25 @@ const validRemoteBody = `{
   "client_real_ip": "198.51.100.20",
   "enabled": false
 }`
+
+// socks5ClientBody builds the JSON body for a SOCKS5-upload client
+// tunnel that is VALID under the v2 upload×download matrix: SOCKS5
+// upload pairs only with the tcp_syn (or icmp/icmpv6) download
+// transport, never udp. It starts from validClientBody, flips the
+// download transport to tcp_syn, and swaps the legacy wireguard_config
+// blob for `upload_mode=socks5 + socks5_proxy_id`. Extra JSON fragments
+// (e.g. a stray wg_config_id for the mutual-exclusion test) can be
+// appended via `extra`.
+func socks5ClientBody(proxyID int64, extra string) string {
+	b := strings.Replace(validClientBody,
+		`"download_transport": "udp"`,
+		`"download_transport": "tcp_syn"`, 1)
+	repl := `"upload_mode": "socks5", "socks5_proxy_id": ` +
+		strconv.FormatInt(proxyID, 10) + extra
+	return strings.Replace(b,
+		`"wireguard_config": "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0"`,
+		repl, 1)
+}
 
 func TestTunnels_RequiresAuth(t *testing.T) {
 	f := newTestFixture(t)

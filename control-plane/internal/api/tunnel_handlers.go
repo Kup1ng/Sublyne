@@ -297,11 +297,17 @@ func (in *tunnelInput) applyDefaults() {
 	if in.IcmpEchoMode == "" {
 		in.IcmpEchoMode = string(tunnels.IcmpEchoModeReply)
 	}
+	// v2 matrix-aware defaults: when the caller omits the upload mode /
+	// listen mode, pick the sensible default FOR THE CHOSEN DOWNLOAD
+	// TRANSPORT (tcp_syn → socks5 / socks5_tcp; everything else →
+	// wireguard / udp) rather than a blanket wireguard/udp. Keeps a
+	// minimal create body (or an import) landing on a matrix-valid row.
+	dt := tunnels.Transport(in.DownloadTransport)
 	if in.UploadMode == "" {
-		in.UploadMode = string(tunnels.UploadModeWireguard)
+		in.UploadMode = string(tunnels.DefaultUploadMode(dt))
 	}
 	if in.UploadListenMode == "" {
-		in.UploadListenMode = string(tunnels.UploadListenModeUDP)
+		in.UploadListenMode = string(tunnels.DefaultListenMode(dt))
 	}
 }
 
