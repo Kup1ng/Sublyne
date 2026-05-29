@@ -21,7 +21,7 @@ const props = withDefaults(
   },
 )
 const emit = defineEmits<{
-  (e: 'update:modelValue', v: string | number | null): void
+  (e: 'update:modelValue', v: string | number | null | undefined): void
   (e: 'enter'): void
 }>()
 
@@ -43,7 +43,13 @@ function onInput(e: Event) {
   // "cannot unmarshal string into Go struct field …".
   if (props.type === 'number') {
     if (t.value === '') {
-      emit('update:modelValue', null)
+      // Cleared field: emit `undefined` (not null) so the form's
+      // pickAllowed + JSON.stringify drop the key entirely. Posting JSON
+      // `null` into a non-pointer Go int (mtu / port /
+      // parallel_connections / min_ready_slots / …) fails the strict
+      // decoder with a 400; an omitted field falls back to the backend
+      // default instead.
+      emit('update:modelValue', undefined)
       return
     }
     const n = Number(t.value)

@@ -72,11 +72,15 @@ export interface WireguardConfig {
   id: number
   name: string
   raw_text?: string
-  public_key?: string
+  // Field names mirror the Go wgConfigDTO exactly (wg_handlers.go):
+  // interface_address / public_key_self / peer_count, NOT the older
+  // address / public_key / reference_count the panel used to assume.
+  interface_address?: string
   endpoint?: string
-  address?: string
-  notes?: string
-  reference_count?: number
+  public_key_self?: string
+  mtu?: number | null
+  listen_port?: number | null
+  peer_count?: number
   created_at?: string
   updated_at?: string
 }
@@ -153,7 +157,7 @@ export interface LiveTunnel {
   transport: string
   enabled: boolean
   runtime_state: string
-  health_badge: 'healthy' | 'idle' | 'down'
+  health_badge: 'healthy' | 'idle' | 'down' | 'stopped'
   bytes_in: number
   bytes_out: number
   packets_in: number
@@ -173,7 +177,7 @@ export interface TunnelRate {
   bps_up: number
   bps_down: number
   sessions: number
-  status: 'healthy' | 'idle' | 'down'
+  status: 'healthy' | 'idle' | 'down' | 'stopped'
 }
 
 export interface HandshakeRow {

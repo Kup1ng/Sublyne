@@ -7,11 +7,13 @@ const toneMap: Record<string, 'ok' | 'warn' | 'danger' | 'neutral'> = {
   healthy: 'ok',
   idle: 'warn',
   down: 'danger',
+  stopped: 'neutral',
 }
 const labelMap: Record<string, string> = {
   healthy: 'Healthy',
   idle: 'Idle',
   down: 'Down',
+  stopped: 'Stopped',
 }
 </script>
 

@@ -54,8 +54,8 @@ onMounted(() => wg.refresh())
             <p class="truncate text-[14.5px] font-semibold tracking-[-0.005em] text-ink">
               {{ c.name }}
             </p>
-            <AppBadge tone="brand" v-if="(c.reference_count ?? 0) > 0">
-              {{ c.reference_count }} in use
+            <AppBadge tone="brand" v-if="(c.peer_count ?? 0) > 0">
+              {{ c.peer_count }} {{ c.peer_count === 1 ? 'peer' : 'peers' }}
             </AppBadge>
           </div>
           <p class="mt-0.5 truncate font-mono text-[12px] text-subtle">
