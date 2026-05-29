@@ -84,7 +84,7 @@ use tracing::{info, warn};
 
 use crate::spec::Socks5Target;
 
-use super::{SessionKey, UploadTransport};
+use super::{SessionKey, Socks5Profile, UploadTransport, WriteStrategy};
 
 // ---- Sublyne tuning constants ------------------------------------------
 
@@ -120,6 +120,16 @@ const BACKOFF_CAP: Duration = Duration::from_secs(8);
 /// replaces the old recv-loop freeze.
 const SLOT_QUEUE_CAP: usize = 512;
 
+/// Soft cap on how many bytes the [`WriteStrategy::Coalesce`] drain
+/// accumulates into a single `write_all`. The whole point of coalescing
+/// is to fill TCP segments for the bulk **TCP-SOCKS5** mechanism, but an
+/// unbounded drain on a saturated queue would build a multi-MiB buffer
+/// and add latency. 64 KiB is ~45 MTU-sized frames per syscall — plenty
+/// to amortize the write while bounding the buffer. The cap is a soft
+/// limit: we stop pulling more frames once the buffer crosses it, but a
+/// single oversized frame is still written whole.
+const COALESCE_SOFT_CAP: usize = 64 * 1024;
+
 /// Backstop write timeout. Primary dead-peer detection is the kernel's
 /// `TCP_USER_TIMEOUT` (10 s) + keepalive layered in
 /// `perf::tune_socks5_tcp_socket`; this only guards the pathological
@@ -148,6 +158,11 @@ pub struct Socks5Upload {
     tunnel_id: i64,
     target: Socks5Target,
     upload_target: SocketAddr,
+    /// Tuning derived from the download transport (v2 matrix): the write
+    /// strategy (coalesce for TCP-SOCKS5, per-frame for ICMP-SOCKS5) and
+    /// the kernel keepalive profile. Copied into every slot driver so a
+    /// `resize_pool` grow uses the same regime as the initial pool.
+    profile: Socks5Profile,
     /// The pool. Reads clone the inner `Vec<Arc<Slot>>` and release the
     /// lock immediately so the hot path never holds it across an await.
     /// Writes happen only on `resize_pool` / `shutdown`.
@@ -196,6 +211,7 @@ impl Socks5Upload {
         tunnel_id: i64,
         target: Socks5Target,
         upload_target: SocketAddr,
+        profile: Socks5Profile,
         stop_rx: watch::Receiver<bool>,
     ) -> io::Result<Self> {
         let n = target.parallel_connections.max(1) as usize;
@@ -208,6 +224,7 @@ impl Socks5Upload {
                 target.clone(),
                 upload_target,
                 idx,
+                profile,
                 stop_rx.clone(),
             ));
         }
@@ -216,6 +233,7 @@ impl Socks5Upload {
             tunnel_id,
             target,
             upload_target,
+            profile,
             slots: Arc::new(RwLock::new(slots)),
             stop_rx,
             drops: Arc::new(AtomicU64::new(0)),
@@ -302,6 +320,7 @@ impl Socks5Upload {
                     self.target.clone(),
                     self.upload_target,
                     idx,
+                    self.profile,
                     self.stop_rx.clone(),
                 ));
             }
@@ -357,6 +376,7 @@ fn make_slot(
     target: Socks5Target,
     upload_target: SocketAddr,
     index: usize,
+    profile: Socks5Profile,
     stop_rx: watch::Receiver<bool>,
 ) -> Arc<Slot> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(SLOT_QUEUE_CAP);
@@ -367,6 +387,7 @@ fn make_slot(
         target,
         upload_target,
         index,
+        profile,
         rx,
         healthy.clone(),
         stop_rx,
@@ -388,6 +409,7 @@ async fn slot_driver(
     target: Socks5Target,
     upload_target: SocketAddr,
     index: usize,
+    profile: Socks5Profile,
     mut rx: mpsc::Receiver<Vec<u8>>,
     healthy: Arc<AtomicBool>,
     mut stop_rx: watch::Receiver<bool>,
@@ -421,7 +443,7 @@ async fn slot_driver(
         // Connect + SOCKS5 handshake.
         let connect_fut = timeout(
             CONNECT_TIMEOUT,
-            open_socks5_connection(tunnel_id, &target, upload_target, index),
+            open_socks5_connection(tunnel_id, &target, upload_target, index, profile),
         );
         let mut stream = tokio::select! {
             biased;
@@ -473,7 +495,7 @@ async fn slot_driver(
                     return;
                 }
                 maybe = rx.recv() => {
-                    let frame = match maybe {
+                    let first = match maybe {
                         Some(f) => f,
                         None => {
                             // Slot removed (pool shrunk / shutdown): no
@@ -482,7 +504,32 @@ async fn slot_driver(
                             return;
                         }
                     };
-                    match timeout(WRITE_BACKSTOP, stream.write_all(&frame)).await {
+                    // Build the write buffer. For the bulk TCP-SOCKS5
+                    // mechanism (Coalesce) we greedily drain whatever else
+                    // is already queued and write it all in ONE `write_all`
+                    // so TCP segments fill — real byte-stream semantics
+                    // over the SOCKS5 hop. The frames are already
+                    // `[u16 len][payload]`, so concatenating them is the
+                    // exact wire the Remote's `read_exact` decoder expects.
+                    // For the latency mechanisms (PerFrame) we write the
+                    // single frame straight through so a trickle isn't held
+                    // back. `try_recv` never blocks, so coalescing only
+                    // pulls frames that are ALREADY waiting — it adds no
+                    // latency of its own.
+                    let writebuf = match profile.write {
+                        WriteStrategy::PerFrame => first,
+                        WriteStrategy::Coalesce => {
+                            let mut buf = first;
+                            while buf.len() < COALESCE_SOFT_CAP {
+                                match rx.try_recv() {
+                                    Ok(more) => buf.extend_from_slice(&more),
+                                    Err(_) => break,
+                                }
+                            }
+                            buf
+                        }
+                    };
+                    match timeout(WRITE_BACKSTOP, stream.write_all(&writebuf)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             healthy.store(false, Ordering::Release);
@@ -611,6 +658,7 @@ async fn open_socks5_connection(
     target: &Socks5Target,
     upload_target: SocketAddr,
     slot_index: usize,
+    profile: Socks5Profile,
 ) -> io::Result<TcpStream> {
     let proxy_addr = format!("{}:{}", target.host, target.port);
     let mut stream = TcpStream::connect(&proxy_addr).await.map_err(|e| {
@@ -619,19 +667,27 @@ async fn open_socks5_connection(
             format!("connect to SOCKS5 proxy {proxy_addr}: {e}"),
         )
     })?;
-    // Disable Nagle so each frame goes on the wire promptly. The proxy
-    // passthrough preserves bytes either way, but on a real Starlink link
-    // the 40 ms TCP coalescing delay would add visible latency to small
-    // UDP payloads.
-    if let Err(e) = stream.set_nodelay(true) {
-        warn!(tunnel_id, slot = slot_index, err = %e, "client: SOCKS5 set_nodelay failed (continuing)");
+    // Nagle policy follows the mechanism's write strategy (v2 matrix):
+    //
+    // - PerFrame (ICMP/ICMPv6-SOCKS5): disable Nagle so each small UDP
+    //   payload goes on the wire promptly — on a real Starlink link the
+    //   ~40 ms TCP coalescing delay would add visible latency to a trickle.
+    // - Coalesce (TCP-SOCKS5): leave Nagle ON. The driver already batches
+    //   queued frames into one `write_all`, and Nagle then lets the kernel
+    //   pack the bulk stream into full segments instead of emitting a
+    //   small segment per wake-up — real TCP byte-stream behaviour.
+    let want_nodelay = matches!(profile.write, WriteStrategy::PerFrame);
+    if let Err(e) = stream.set_nodelay(want_nodelay) {
+        warn!(tunnel_id, slot = slot_index, err = %e,
+            "client: SOCKS5 set_nodelay failed (continuing)");
     }
-    // Layer aggressive TCP keepalive + USER_TIMEOUT on the socket so a
-    // stale proxy / NAT binding is noticed within seconds instead of
-    // hanging on the kernel default RTO (~120 s). This is the PRIMARY
-    // dead-peer detector now that the application no longer tears down a
-    // connection on a short write timeout — see `perf::tune_socks5_tcp_socket`.
-    crate::perf::tune_socks5_tcp_socket(&stream, "socks5/client-out");
+    // Layer TCP keepalive + USER_TIMEOUT on the socket (timers from the
+    // mechanism's keepalive profile) so a stale proxy / NAT binding is
+    // noticed within seconds instead of hanging on the kernel default RTO
+    // (~120 s). This is the PRIMARY dead-peer detector now that the
+    // application no longer tears down a connection on a short write
+    // timeout — see `perf::tune_socks5_tcp_socket`.
+    crate::perf::tune_socks5_tcp_socket(&stream, "socks5/client-out", profile.keepalive);
     let has_auth = target.username.as_deref().is_some_and(|s| !s.is_empty())
         && target.password.as_deref().is_some_and(|s| !s.is_empty());
     handshake_greeting(&mut stream, has_auth).await?;
@@ -940,6 +996,24 @@ mod tests {
         SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 5201)
     }
 
+    /// The latency regime (per-frame flush + short keepalive) — the
+    /// historical pre-matrix behaviour and the default most tests want.
+    fn latency_profile() -> Socks5Profile {
+        Socks5Profile {
+            write: WriteStrategy::PerFrame,
+            keepalive: crate::perf::Socks5KeepaliveProfile::Latency,
+        }
+    }
+
+    /// The bulk regime (coalesced writes + long keepalive) — the
+    /// TCP-SOCKS5 mechanism.
+    fn bulk_profile() -> Socks5Profile {
+        Socks5Profile {
+            write: WriteStrategy::Coalesce,
+            keepalive: crate::perf::Socks5KeepaliveProfile::Bulk,
+        }
+    }
+
     fn key(client: SocketAddr) -> SessionKey {
         SessionKey {
             client_addr: client,
@@ -1018,7 +1092,7 @@ mod tests {
         let (_stop_tx, stop_rx) = watch::channel(false);
         let mut tgt = make_target(port, 2);
         tgt.min_ready_slots = 2;
-        let res = Socks5Upload::connect(99, tgt, dummy_target(), stop_rx).await;
+        let res = Socks5Upload::connect(99, tgt, dummy_target(), latency_profile(), stop_rx).await;
         assert!(res.is_err(), "expected dead proxy to fail connect()");
     }
 
@@ -1064,9 +1138,15 @@ mod tests {
         });
 
         let (_stop_tx, stop_rx) = watch::channel(false);
-        let upload = Socks5Upload::connect(1, make_target(proxy_port, 4), dummy_target(), stop_rx)
-            .await
-            .expect("connect pool");
+        let upload = Socks5Upload::connect(
+            1,
+            make_target(proxy_port, 4),
+            dummy_target(),
+            latency_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect pool");
 
         await_healthy(&upload, 4).await;
         assert_eq!(upload.pool_len(), 4);
@@ -1103,9 +1183,15 @@ mod tests {
         });
 
         let (_stop_tx, stop_rx) = watch::channel(false);
-        let upload = Socks5Upload::connect(7, make_target(proxy_port, 4), dummy_target(), stop_rx)
-            .await
-            .expect("connect");
+        let upload = Socks5Upload::connect(
+            7,
+            make_target(proxy_port, 4),
+            dummy_target(),
+            latency_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect");
         await_healthy(&upload, 4).await;
         assert_eq!(upload.pool_len(), 4);
 
@@ -1170,9 +1256,15 @@ mod tests {
         });
 
         let (_stop_tx, stop_rx) = watch::channel(false);
-        let upload = Socks5Upload::connect(3, make_target(proxy_port, 4), dummy_target(), stop_rx)
-            .await
-            .expect("connect");
+        let upload = Socks5Upload::connect(
+            3,
+            make_target(proxy_port, 4),
+            dummy_target(),
+            latency_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect");
         await_healthy(&upload, 4).await;
         let session = key("10.2.2.2:50002".parse().unwrap());
 
@@ -1212,9 +1304,15 @@ mod tests {
         });
 
         let (_stop_tx, stop_rx) = watch::channel(false);
-        let upload = Socks5Upload::connect(8, make_target(proxy_port, 3), dummy_target(), stop_rx)
-            .await
-            .expect("connect");
+        let upload = Socks5Upload::connect(
+            8,
+            make_target(proxy_port, 3),
+            dummy_target(),
+            latency_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect");
         await_healthy(&upload, 3).await;
 
         // Force every slot unhealthy.
@@ -1243,9 +1341,15 @@ mod tests {
         });
 
         let (_stop_tx, stop_rx) = watch::channel(false);
-        let upload = Socks5Upload::connect(11, make_target(proxy_port, 2), dummy_target(), stop_rx)
-            .await
-            .expect("connect");
+        let upload = Socks5Upload::connect(
+            11,
+            make_target(proxy_port, 2),
+            dummy_target(),
+            latency_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect");
         await_healthy(&upload, 2).await;
         assert_eq!(upload.pool_len(), 2);
 
@@ -1278,9 +1382,15 @@ mod tests {
         });
 
         let (_stop_tx, stop_rx) = watch::channel(false);
-        let upload = Socks5Upload::connect(12, make_target(proxy_port, 4), dummy_target(), stop_rx)
-            .await
-            .expect("connect");
+        let upload = Socks5Upload::connect(
+            12,
+            make_target(proxy_port, 4),
+            dummy_target(),
+            latency_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect");
         await_healthy(&upload, 4).await;
         assert_eq!(upload.pool_len(), 4);
 
@@ -1318,6 +1428,7 @@ mod tests {
             13,
             make_target_with_auth(proxy_port, 3, "alice", "s3cret"),
             dummy_target(),
+            latency_profile(),
             stop_rx,
         )
         .await
@@ -1356,9 +1467,15 @@ mod tests {
         });
 
         let (_stop_tx, stop_rx) = watch::channel(false);
-        let upload = Socks5Upload::connect(14, make_target(proxy_port, 4), dummy_target(), stop_rx)
-            .await
-            .expect("connect");
+        let upload = Socks5Upload::connect(
+            14,
+            make_target(proxy_port, 4),
+            dummy_target(),
+            latency_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect");
         await_healthy(&upload, 4).await;
 
         // Send many distinct payloads with distinct keys so they spread
@@ -1384,6 +1501,83 @@ mod tests {
         firsts.sort_unstable();
         firsts.dedup();
         assert_eq!(firsts.len(), 32, "got duplicates or missing payloads");
+        upload.shutdown().await;
+    }
+
+    /// Coalesced (bulk / TCP-SOCKS5) writes must preserve framing. A
+    /// single-slot pool on the Coalesce profile concatenates queued
+    /// `[u16 len][payload]` frames into one `write_all`; the Remote-style
+    /// capture stub decodes them back frame-by-frame, so every payload
+    /// must reappear intact and in order regardless of how many were
+    /// batched into a syscall. This is the test that proves the
+    /// TCP-SOCKS5 "real byte stream" optimisation doesn't corrupt the
+    /// length-delimited wire.
+    #[tokio::test]
+    async fn coalesced_writes_preserve_framing() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy_port = proxy.local_addr().unwrap().port();
+
+        let frames_per_conn: FramesPerConn = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let frames_for_stub = frames_per_conn.clone();
+        tokio::spawn(async move {
+            loop {
+                let (client, _) = match proxy.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let bag: ConnFrameBag = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+                {
+                    let mut outer = frames_for_stub.lock().await;
+                    outer.push(bag.clone());
+                }
+                tokio::spawn(serve_one_socks5_and_capture(client, None, bag));
+            }
+        });
+
+        // Single slot + the bulk (Coalesce) profile so every frame from
+        // the one sticky session funnels through the same driver and is
+        // eligible to be batched into a shared write_all.
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let upload = Socks5Upload::connect(
+            20,
+            make_target(proxy_port, 1),
+            dummy_target(),
+            bulk_profile(),
+            stop_rx,
+        )
+        .await
+        .expect("connect");
+        await_healthy(&upload, 1).await;
+
+        // Fire 64 distinct payloads on ONE session key as fast as the
+        // try_send accepts them; many will be queued and coalesced.
+        let session = key("10.7.7.7:50007".parse().unwrap());
+        for i in 0..64u16 {
+            let payload = i.to_be_bytes().to_vec(); // 2 distinct bytes each
+            upload.send(session, &payload).await.expect("send");
+        }
+        assert_eq!(upload.drop_count(), 0, "coalesced sends must not drop");
+        await_total_frames(&frames_per_conn, 64).await;
+
+        let conns = frames_per_conn.lock().await;
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        for conn in conns.iter() {
+            all.extend(conn.lock().await.iter().cloned());
+        }
+        assert_eq!(all.len(), 64, "expected exactly 64 decoded frames");
+        // Every frame must be a clean 2-byte value, and the full set
+        // 0..64 must be present — proves no frame was split, merged, or
+        // dropped by the coalescing drain.
+        let mut seen: Vec<u16> = all
+            .iter()
+            .map(|p| {
+                assert_eq!(p.len(), 2, "coalescing corrupted a frame boundary: {p:?}");
+                u16::from_be_bytes([p[0], p[1]])
+            })
+            .collect();
+        seen.sort_unstable();
+        let want: Vec<u16> = (0..64).collect();
+        assert_eq!(seen, want, "missing or duplicated frames after coalescing");
         upload.shutdown().await;
     }
 

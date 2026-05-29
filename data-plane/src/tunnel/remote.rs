@@ -52,8 +52,11 @@ use crate::time_util::now_unix;
 use crate::transport::udp::MAX_UDP_DATAGRAM;
 use crate::transport::{icmp, icmpv6, tcp_syn, udp};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
+
+use crate::perf::Socks5KeepaliveProfile;
+use crate::upload::Socks5Profile;
 
 use super::{sleep_or_stopped, MutableConfigSlot, ReasonSlot, StateSlot};
 
@@ -236,9 +239,16 @@ pub(super) async fn spawn(
             let tcp_listener = TcpListener::bind(upload_listen)
                 .await
                 .map_err(SpawnError::Io)?;
+            // Pick the inbound SOCKS5 keepalive regime from the download
+            // transport so the Remote's accepted sockets mirror the
+            // Client's outbound mechanism (v2 matrix): tcp_syn → Bulk
+            // timers, icmp/icmpv6 → Latency timers. Single source of truth
+            // is `Socks5Profile::for_download`.
+            let keepalive = Socks5Profile::for_download(spec.download_transport).keepalive;
             info!(tunnel_id = id, addr = %upload_listen,
                 family = address_family_label(upload_listen),
-                "remote: upload_listen bound (SOCKS5/TCP, R9a)");
+                keepalive = ?keepalive,
+                "remote: upload_listen bound (SOCKS5/TCP)");
             spawn_socks5_upload_listener(
                 tasks,
                 id,
@@ -249,6 +259,7 @@ pub(super) async fn spawn(
                 mutable_config.clone(),
                 metrics.clone(),
                 forward_target,
+                keepalive,
                 stop_rx.clone(),
             );
         }
@@ -471,6 +482,7 @@ fn spawn_socks5_upload_listener(
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
     forward_target: SocketAddr,
+    keepalive: Socks5KeepaliveProfile,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     tasks.spawn(async move {
@@ -488,11 +500,12 @@ fn spawn_socks5_upload_listener(
                             continue;
                         }
                     };
-                    // Same SOCKS5 TCP keepalive / USER_TIMEOUT as the
-                    // Client outbound side so an upstream NAT timeout
-                    // (proxy egress NAT, transit middlebox) is detected
-                    // here in seconds rather than ~120 s.
-                    crate::perf::tune_socks5_tcp_socket(&stream, "socks5/remote-in");
+                    // Same SOCKS5 TCP keepalive / USER_TIMEOUT regime as
+                    // the Client outbound side (chosen from the download
+                    // transport) so an upstream NAT timeout (proxy egress
+                    // NAT, transit middlebox) is detected here in seconds
+                    // rather than ~120 s.
+                    crate::perf::tune_socks5_tcp_socket(&stream, "socks5/remote-in", keepalive);
                     info!(tunnel_id = id, %peer, "remote: socks5 upload connection accepted");
                     let forward_sock = forward_sock.clone();
                     let session_table = session_table.clone();
@@ -534,7 +547,7 @@ fn spawn_socks5_upload_listener(
 async fn drive_socks5_upload_connection(
     id: i64,
     name: Arc<String>,
-    mut stream: tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
     peer: SocketAddr,
     forward_sock: Arc<UdpSocket>,
     session_table: Arc<SessionTable>,
@@ -543,6 +556,15 @@ async fn drive_socks5_upload_connection(
     forward_target: SocketAddr,
     mut stop_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
+    // Wrap the read side in a BufReader so one kernel `read()` can fill a
+    // buffer that serves many framed payloads. This complements the
+    // Client's TCP-SOCKS5 coalescing: when the Client batches N frames
+    // into one TCP segment, the naked `read_exact(2)`+`read_exact(n)` per
+    // frame would still cost two syscalls each; the BufReader amortizes
+    // those to roughly one `read()` per segment. Correctness is unchanged
+    // for the per-frame (latency) mechanisms — `read_exact` reassembles
+    // frames across reads either way.
+    let mut stream = BufReader::with_capacity(MAX_UDP_DATAGRAM, stream);
     let mut len_buf = [0u8; 2];
     let mut payload = vec![0u8; MAX_UDP_DATAGRAM];
     loop {
