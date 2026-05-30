@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tokio::sync::{broadcast, Mutex};
+use tracing::{debug, info, warn};
 use tracing_subscriber::reload::Handle;
 use tracing_subscriber::EnvFilter;
 
@@ -122,12 +122,30 @@ impl StopError {
     }
 }
 
+/// Broadcast payload carried over the state-change channel. We send the
+/// three owned fields as a tuple rather than `TunnelStateChanged` itself
+/// so the broadcast value only needs `Clone` on primitives we already
+/// have (`i64`/`TunnelState` are `Copy`, the reason is an
+/// `Option<String>`); `recv()` reassembles the public
+/// `TunnelStateChanged`. This keeps the broadcast independent of any
+/// derive on the protocol type.
+pub(crate) type StateBroadcast = (i64, TunnelState, Option<String>);
+
+/// Capacity of the broadcast ring buffer. State changes are low-rate
+/// (start / stop / error per tunnel), so 256 absorbs a burst of every
+/// tunnel changing at once with room to spare before a slow subscriber
+/// would lag.
+const STATE_BROADCAST_CAP: usize = 256;
+
 /// Top-level orchestrator owned by `main.rs` and shared with the IPC
 /// server.
 pub struct TunnelManager {
     tunnels: Mutex<HashMap<i64, TunnelHandle>>,
-    state_tx: mpsc::Sender<TunnelStateChanged>,
-    state_rx: Mutex<Option<mpsc::Receiver<TunnelStateChanged>>>,
+    /// Broadcast sender for tunnel state changes. Every call to
+    /// `subscribe_state` (each IPC connection, including reconnects)
+    /// gets a fresh live receiver, so a dataplane IPC reconnect no
+    /// longer leaves the panel blind to state changes.
+    state_tx: broadcast::Sender<StateBroadcast>,
     log_reload: Option<Arc<dyn ReloadFilter>>,
     shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -154,48 +172,58 @@ impl TunnelManager {
         shutdown_tx: tokio::sync::oneshot::Sender<()>,
         log_reload: Option<Arc<dyn ReloadFilter>>,
     ) -> Self {
-        let (state_tx, state_rx) = mpsc::channel(64);
+        let (state_tx, _state_rx) = broadcast::channel(STATE_BROADCAST_CAP);
         Self {
             tunnels: Mutex::new(HashMap::new()),
             state_tx,
-            state_rx: Mutex::new(Some(state_rx)),
             log_reload,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         }
     }
 
-    /// Take the receiver side of the state-change channel. The IPC
-    /// server calls this exactly once per connection; subsequent
-    /// connections after an Rx reset get a fresh channel on the next
-    /// state push.
+    /// Subscribe to the state-change stream. Every call returns a fresh
+    /// live receiver, so each IPC connection — including the ones that
+    /// open after a dataplane IPC reconnect — sees all future state
+    /// changes. (Previously the single mpsc receiver was taken by the
+    /// first subscriber and every later subscriber got a dead channel,
+    /// so the panel stopped seeing state changes after any reconnect.)
     pub fn subscribe_state(&self) -> StateRx {
-        let mut guard = self
-            .state_rx
-            .try_lock()
-            .expect("subscribe_state contention");
-        if let Some(rx) = guard.take() {
-            return StateRx { rx };
+        StateRx {
+            rx: self.state_tx.subscribe(),
         }
-        // Already consumed once. Create a placeholder receiver that
-        // will yield nothing — Phase 11 will broaden this to a real
-        // broadcast channel.
-        let (_tx, rx) = mpsc::channel(1);
-        StateRx { rx }
     }
 
-    /// Start a tunnel; returns an error if the id is already running.
+    /// Start a tunnel.
+    ///
+    /// Idempotent for an identical spec: if the id is already running
+    /// with a byte-for-byte equal spec, this returns `Ok(())` without
+    /// touching the live tunnel. The Go side's startup Sync and a
+    /// dataplane-respawn replay both re-issue `StartTunnel` for tunnels
+    /// that are already up; treating an identical replay as an error
+    /// (mapped to `INVALID_TUNNEL_SPEC`) would make those flows fail
+    /// spuriously. A running id with a *different* spec is still an
+    /// `AlreadyRunning` error — the caller uses `UpdateTunnel` for
+    /// changes.
     pub async fn start_tunnel(&self, spec: TunnelSpec) -> Result<(), SpawnError> {
         let id = spec.id;
         let name = spec.name.clone();
         {
             let guard = self.tunnels.lock().await;
-            if guard.contains_key(&id) {
+            if let Some(existing) = guard.get(&id) {
+                if existing.spec_snapshot.matches_spec(&spec) {
+                    info!(
+                        tunnel_id = id,
+                        %name,
+                        "manager: start for already-running tunnel with identical spec — no-op"
+                    );
+                    return Ok(());
+                }
                 return Err(SpawnError::AlreadyRunning(id));
             }
         }
-        let handle = spawn_tunnel(spec).await?;
+        let handle = spawn_tunnel(spec, self.state_tx.clone()).await?;
         let (state, reason) = handle.state();
-        self.notify_state(id, state, reason).await;
+        self.notify_state(id, state, reason);
         info!(tunnel_id = id, %name, "manager: tunnel started");
         let mut guard = self.tunnels.lock().await;
         guard.insert(id, handle);
@@ -236,18 +264,50 @@ impl TunnelManager {
             Classification::RestartRequired => Err(UpdateError::RestartRequired),
             Classification::InternalRestart => {
                 info!(tunnel_id = id, "manager: update needs internal stop+start (transport / target / fwmark changed)");
+                // Capture the currently-running spec so we can roll back
+                // if the new spec fails to start — a bad edit must never
+                // leave a previously-healthy tunnel permanently stopped.
+                let prev_spec = {
+                    let guard = self.tunnels.lock().await;
+                    guard
+                        .get(&id)
+                        .ok_or(UpdateError::NotFound(id))?
+                        .spec
+                        .clone()
+                };
                 // Stop the running tunnel — drop the handle so its
                 // raw socket releases and the iptables guard cleans
                 // up — then start fresh with the new spec.
                 self.stop_tunnel(id).await.map_err(|e| match e {
                     StopError::NotFound(id) => UpdateError::NotFound(id),
                 })?;
-                self.start_tunnel(spec).await.map_err(|e| match e {
-                    SpawnError::InvalidSpec(s) => UpdateError::InvalidSpec(s),
-                    SpawnError::AlreadyRunning(id) => UpdateError::NotFound(id),
-                    SpawnError::Io(e) => UpdateError::Io(e),
-                })?;
-                Ok(vec!["restarted"])
+                match self.start_tunnel(spec).await {
+                    Ok(()) => Ok(vec!["restarted"]),
+                    Err(start_err) => {
+                        // The new spec didn't come up. Restore the
+                        // previous, known-good spec so the tunnel keeps
+                        // running, then surface the original error to the
+                        // caller regardless.
+                        let orig = match start_err {
+                            SpawnError::InvalidSpec(s) => UpdateError::InvalidSpec(s),
+                            SpawnError::AlreadyRunning(id) => UpdateError::NotFound(id),
+                            SpawnError::Io(e) => UpdateError::Io(e),
+                        };
+                        match self.start_tunnel(prev_spec).await {
+                            Ok(()) => warn!(
+                                tunnel_id = id,
+                                "manager: new spec failed to start; rolled back to previous spec"
+                            ),
+                            Err(rollback_err) => warn!(
+                                tunnel_id = id,
+                                err = %rollback_err,
+                                "manager: new spec failed AND rollback to previous spec failed; \
+                                 tunnel left stopped"
+                            ),
+                        }
+                        Err(orig)
+                    }
+                }
             }
             Classification::HotReload => {
                 // Take the lock briefly: apply the sync hot-reload
@@ -304,7 +364,7 @@ impl TunnelManager {
             guard.remove(&id).ok_or(StopError::NotFound(id))?
         };
         handle.shutdown().await;
-        self.notify_state(id, TunnelState::Stopped, None).await;
+        self.notify_state(id, TunnelState::Stopped, None);
         info!(tunnel_id = id, "manager: tunnel stopped");
         Ok(())
     }
@@ -317,7 +377,7 @@ impl TunnelManager {
         };
         for (id, handle) in drained {
             handle.shutdown().await;
-            self.notify_state(id, TunnelState::Stopped, None).await;
+            self.notify_state(id, TunnelState::Stopped, None);
         }
     }
 
@@ -384,31 +444,46 @@ impl TunnelManager {
         }
     }
 
-    async fn notify_state(&self, tunnel_id: i64, state: TunnelState, reason: Option<String>) {
-        if self
-            .state_tx
-            .send(TunnelStateChanged {
-                tunnel_id,
-                state,
-                reason,
-            })
-            .await
-            .is_err()
-        {
-            // The receiver was dropped — IPC subscriber is gone. Not
-            // fatal; the next Reply from the manager will still land.
-        }
+    fn notify_state(&self, tunnel_id: i64, state: TunnelState, reason: Option<String>) {
+        // `broadcast::Sender::send` only errors when there are zero live
+        // receivers — i.e. no IPC subscriber is currently attached. That
+        // is not fatal: the next subscriber gets the current state via
+        // `ListTunnels`, and every later change streams normally.
+        let _ = self.state_tx.send((tunnel_id, state, reason));
     }
 }
 
 /// Receiver wrapper returned by `TunnelManager::subscribe_state`.
 pub struct StateRx {
-    rx: mpsc::Receiver<TunnelStateChanged>,
+    rx: broadcast::Receiver<StateBroadcast>,
 }
 
 impl StateRx {
     pub async fn recv(&mut self) -> Option<TunnelStateChanged> {
-        self.rx.recv().await
+        loop {
+            match self.rx.recv().await {
+                Ok((tunnel_id, state, reason)) => {
+                    return Some(TunnelStateChanged {
+                        tunnel_id,
+                        state,
+                        reason,
+                    });
+                }
+                // A slow subscriber fell behind and the ring buffer
+                // dropped `n` events. Don't tear the subscription down —
+                // log and keep receiving newer events. The next
+                // `ListTunnels` reconciles any missed transition.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    debug!(
+                        skipped = n,
+                        "state subscriber lagged; dropping missed events"
+                    );
+                    continue;
+                }
+                // The sender was dropped (manager gone) — signal EOF.
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 }
 

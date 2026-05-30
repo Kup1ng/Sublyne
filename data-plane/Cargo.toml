@@ -81,7 +81,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# `panic = "unwind"` (the default) is REQUIRED, not optional: the tunnel
+# supervisor catches a panicking per-tunnel task via `JoinError::is_panic`
+# and flips just that tunnel to `Error`. With `panic = "abort"` a single
+# task panic aborts the whole process, taking every other tunnel down and
+# defeating the per-tunnel crash isolation. Keep this `unwind`.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 0

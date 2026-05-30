@@ -208,13 +208,26 @@ async fn handle_connection(stream: UnixStream, manager: Arc<TunnelManager>) -> a
         }
         let writer = writer.clone();
         let manager = manager.clone();
-        // Dispatch each command on the same task — they're rare
-        // (user-driven). Running them concurrently would complicate
-        // ordering (e.g., StartTunnel then StopTunnel for the same id
-        // must serialise).
-        if let Err(e) = dispatch(env, manager, writer).await {
-            error!(err = %e, "ipc: dispatch error");
-        }
+        // Dispatch each command on its own task so a slow handler (e.g.
+        // a SOCKS5 `StartTunnel` that blocks up to the warm-up deadline
+        // waiting for proxy slots to connect) never blocks the read
+        // loop or other commands (Ping, ListTunnels, StopTunnel). The
+        // read loop keeps consuming frames immediately.
+        //
+        // Replies may therefore complete out of order, but each Reply
+        // is tagged with the originating request `id` and the Go client
+        // correlates by id (pending-by-id map), so ordering on the wire
+        // does not matter. Writes are serialised by the `Mutex` around
+        // the write half (see `write_frame`), so length-prefixed frames
+        // never interleave even with many handlers running concurrently.
+        //
+        // `Shutdown` is handled inline above (before this spawn) so an
+        // in-flight slow `StartTunnel` can never starve it.
+        tokio::spawn(async move {
+            if let Err(e) = dispatch(env, manager, writer).await {
+                error!(err = %e, "ipc: dispatch error");
+            }
+        });
     }
 }
 

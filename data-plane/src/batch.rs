@@ -244,6 +244,49 @@ impl SendBatch {
             slot.len = 0;
         }
     }
+
+    /// Compact the un-sent tail `[accepted..count]` to the front of the
+    /// batch, preserving its relative order, and return the new pending
+    /// count (`count - accepted`).
+    ///
+    /// Used by a single send worker to requeue the part of a partial
+    /// `sendmmsg` the kernel did not accept. Because the tail keeps its
+    /// order and is moved to slots `0..(count-accepted)`, the next
+    /// `sendmmsg` re-emits exactly those packets FIRST — wire FIFO is
+    /// preserved across the partial send. Slots beyond the new pending
+    /// prefix are marked inactive so a later stage can refill them.
+    ///
+    /// The move is a `Vec::swap` of whole [`SendSlot`] values, so each
+    /// slot's owned buffer and sockaddr travel with it — no per-packet
+    /// heap allocation, no re-copy of payload bytes.
+    ///
+    /// `accepted` and `count` are clamped to the batch length; if
+    /// `accepted >= count` nothing is pending and the batch is reset.
+    pub fn shift_unsent_to_front(&mut self, accepted: usize, count: usize) -> usize {
+        let cap = self.slots.len();
+        let count = count.min(cap);
+        let accepted = accepted.min(count);
+        let pending = count - accepted;
+        if pending == 0 {
+            self.reset();
+            return 0;
+        }
+        if accepted > 0 {
+            // Move slots[accepted..count] down to slots[0..pending],
+            // keeping their order. `swap` exchanges whole slot values
+            // (buf + sockaddr + flags) so private fields move too.
+            for i in 0..pending {
+                self.slots.swap(i, accepted + i);
+            }
+        }
+        // Anything past the requeued prefix is stale — deactivate it so
+        // a future `reset`-free stage can't accidentally resend it.
+        for slot in self.slots.iter_mut().skip(pending) {
+            slot.active = false;
+            slot.len = 0;
+        }
+        pending
+    }
 }
 
 /// Send up to `count` active prefix slots from `batch`. Returns the
@@ -437,6 +480,47 @@ mod tests {
             slot.len = 32;
         }
         b.reset();
+        for slot in &b.slots {
+            assert!(!slot.active);
+            assert_eq!(slot.len, 0);
+        }
+    }
+
+    #[test]
+    fn shift_unsent_to_front_requeues_tail_in_order() {
+        let mut b = SendBatch::new(8, 64);
+        // Stage 6 packets with distinguishable payloads.
+        for i in 0..6 {
+            b.slots[i].buf[0] = i as u8;
+            b.slots[i].len = 1;
+            b.slots[i].active = true;
+        }
+        // Kernel accepted the first 4 of 6 — requeue [4..6].
+        let pending = b.shift_unsent_to_front(4, 6);
+        assert_eq!(pending, 2);
+        // The two un-sent packets moved to the front, in order.
+        assert_eq!(b.slots[0].buf[0], 4);
+        assert_eq!(b.slots[1].buf[0], 5);
+        assert!(b.slots[0].active && b.slots[1].active);
+        assert_eq!(b.slots[0].len, 1);
+        assert_eq!(b.slots[1].len, 1);
+        // Everything past the requeued prefix is deactivated.
+        for slot in &b.slots[2..] {
+            assert!(!slot.active);
+            assert_eq!(slot.len, 0);
+        }
+    }
+
+    #[test]
+    fn shift_unsent_to_front_full_accept_resets() {
+        let mut b = SendBatch::new(4, 64);
+        for slot in &mut b.slots {
+            slot.active = true;
+            slot.len = 8;
+        }
+        // accepted == count: nothing pending, whole batch reset.
+        let pending = b.shift_unsent_to_front(4, 4);
+        assert_eq!(pending, 0);
         for slot in &b.slots {
             assert!(!slot.active);
             assert_eq!(slot.len, 0);
