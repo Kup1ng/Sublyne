@@ -27,8 +27,8 @@
 //! comparable wall-clock time.
 
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
