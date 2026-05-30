@@ -660,7 +660,37 @@ fn spawn_download_pipeline(
         Transport::Icmpv6 => "icmpv6",
     };
     let send_batch_size = crate::perf::send_batch();
-    let n_workers = crate::perf::per_core_sockets().max(1);
+    // Seal fan-out reorder budget. Each seal worker can fall at most
+    // `SEAL_WORKER_CHANNEL_CAP` jobs of its own seq-subset behind its
+    // peers, so the worst-case wire reorder when its sealed output
+    // reaches the single send worker is `SEAL_WORKER_CHANNEL_CAP *
+    // n_workers` seqs. Iran's anti-replay `SeqWindow` is exactly
+    // `hmac::SEQ_WINDOW_SIZE` (1024) slots wide; a sealed packet that
+    // lands more than that many seqs late is dropped there as
+    // replay/too-old — silent legit-traffic loss. We therefore cap the
+    // seal-worker count so `SEAL_WORKER_CHANNEL_CAP * n_workers <=
+    // hmac::SEQ_WINDOW_SIZE`. Referencing `hmac::SEQ_WINDOW_SIZE`
+    // directly keeps the two constants from silently drifting apart.
+    //
+    // This clamps ONLY the Remote's seal fan-out. The Client's verify
+    // workers (client.rs) each own a full independent 1024-slot window,
+    // so they scale freely and are unaffected.
+    let requested_workers = crate::perf::per_core_sockets().max(1);
+    let max_seal_workers = (hmac::SEQ_WINDOW_SIZE as usize / SEAL_WORKER_CHANNEL_CAP).max(1);
+    let n_workers = requested_workers.min(max_seal_workers);
+    if n_workers < requested_workers {
+        info!(
+            tunnel_id = id,
+            transport = label,
+            requested = requested_workers,
+            seal_workers = n_workers,
+            seal_channel_cap = SEAL_WORKER_CHANNEL_CAP,
+            seq_window = hmac::SEQ_WINDOW_SIZE,
+            "remote: seal pool capped below SUBLYNE_PER_CORE_SOCKETS to keep the \
+             seal fan-out reorder budget (SEAL_WORKER_CHANNEL_CAP * workers) \
+             within Iran's SeqWindow"
+        );
+    }
 
     // Pipeline shape: recv → N seal workers → 1 send worker → wire.
     //
@@ -1008,36 +1038,74 @@ async fn download_send_worker(
                         Err(_) => break,
                     }
                 }
-                // Single sendmmsg attempt. On partial accept (kernel
-                // returns n < count), the unsent tail is dropped —
-                // UDP semantics, application layer retransmits.
-                let result = match raw_send.writable().await {
-                    Ok(mut guard) => guard.try_io(|fd| {
-                        batch::sendmmsg(fd.get_ref().as_raw_fd(), &mut send_batch, count)
-                    }),
-                    Err(e) => {
-                        warn!(tunnel_id = id, err = %e, transport = label,
-                            "remote: raw writable awaiter failed");
-                        continue;
-                    }
-                };
-                match result {
-                    Ok(Ok(n)) => {
-                        if n < count {
-                            warn!(tunnel_id = id, sent = n, count, transport = label,
-                                "remote: sendmmsg partial accept, dropped tail");
+                // Drain the staged prefix `[0..count]` to the wire,
+                // treating transient back-pressure as BOUNDED back-
+                // pressure rather than loss — without ever reordering.
+                //
+                //  * Partial accept (kernel took n < count): keep the
+                //    un-sent tail [n..count], compact it to the front
+                //    via `shift_unsent_to_front`, and re-send THOSE
+                //    first on the next attempt. Wire FIFO is preserved
+                //    because the tail keeps its order and goes out
+                //    ahead of any newly-drained packet.
+                //  * WouldBlock: await socket writability and retry the
+                //    SAME un-sent prefix; we never drain new packets
+                //    until the current prefix is fully on the wire.
+                //  * Hard send error: that prefix is genuinely lost —
+                //    count it and warn! (visible at INFO), then move on.
+                //
+                // Upstream `SEND_QUEUE_CAP` bounds memory: while this
+                // loop spins on a stalled socket, `sealed_rx` simply
+                // fills and seal workers apply natural back-pressure.
+                // `MAX_WOULD_BLOCK_RETRIES` caps a truly dead socket so
+                // a single batch can't wedge the worker forever.
+                const MAX_WOULD_BLOCK_RETRIES: u32 = 64;
+                let mut would_block_retries: u32 = 0;
+                while count > 0 {
+                    let result = match raw_send.writable().await {
+                        Ok(mut guard) => guard.try_io(|fd| {
+                            batch::sendmmsg(fd.get_ref().as_raw_fd(), &mut send_batch, count)
+                        }),
+                        Err(e) => {
+                            warn!(tunnel_id = id, err = %e, transport = label, dropped = count,
+                                "remote: raw writable awaiter failed, dropping batch");
+                            break;
                         }
-                        for _ in 0..n {
-                            metrics.record_transport_packet(label);
+                    };
+                    match result {
+                        Ok(Ok(n)) => {
+                            for _ in 0..n {
+                                metrics.record_transport_packet(label);
+                            }
+                            would_block_retries = 0;
+                            if n >= count {
+                                // Whole prefix accepted — done.
+                                break;
+                            }
+                            // Partial accept: requeue the unsent tail to
+                            // the front and re-send it first next round.
+                            count = send_batch.shift_unsent_to_front(n, count);
                         }
-                    }
-                    Ok(Err(e)) => {
-                        warn!(tunnel_id = id, err = %e, transport = label,
-                            "remote: sendmmsg failed");
-                    }
-                    Err(_would_block) => {
-                        debug!(tunnel_id = id, transport = label,
-                            "remote: sendmmsg would block, dropping batch");
+                        Ok(Err(e)) => {
+                            warn!(tunnel_id = id, err = %e, transport = label, dropped = count,
+                                "remote: sendmmsg failed, dropping batch");
+                            break;
+                        }
+                        Err(_would_block) => {
+                            // The AsyncFd readiness guard said writable
+                            // but the syscall still returned EAGAIN
+                            // (kernel send queue full). Loop: the next
+                            // `writable().await` parks until the kernel
+                            // drains, so this is bounded back-pressure,
+                            // not a busy spin.
+                            would_block_retries += 1;
+                            if would_block_retries >= MAX_WOULD_BLOCK_RETRIES {
+                                warn!(tunnel_id = id, transport = label, dropped = count,
+                                    retries = would_block_retries,
+                                    "remote: sendmmsg persistently blocked, dropping batch");
+                                break;
+                            }
+                        }
                     }
                 }
             }
