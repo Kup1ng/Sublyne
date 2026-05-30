@@ -63,6 +63,15 @@ pub const ENV_PER_CORE_SOCKETS: &str = "SUBLYNE_PER_CORE_SOCKETS";
 /// (TCP-SOCKS5) write strategy reads it, so the latency mechanisms are
 /// unaffected.
 pub const ENV_SOCKS5_COALESCE_BYTES: &str = "SUBLYNE_SOCKS5_COALESCE_BYTES";
+/// Env knob: spread a SINGLE bulk (TCP-SOCKS5) flow across ALL N proxy
+/// connections (round-robin) instead of pinning it to one. `1`/on (the
+/// default) lets one heavy flow use every Starlink uplink behind the proxy
+/// — the fix for the single-connection upload cap. `0`/off reverts to the
+/// historical per-flow sticky routing (one flow → one connection), useful
+/// if a path's uplinks differ enough in latency that the added reorder
+/// hurts the inner protocol. Only the Coalesce (bulk) mechanism reads it;
+/// the latency ICMP-SOCKS5 mechanisms always stay sticky.
+pub const ENV_SOCKS5_STRIPE: &str = "SUBLYNE_SOCKS5_STRIPE";
 
 const DEFAULT_BATCH: usize = 16;
 const MIN_BATCH: usize = 1;
@@ -86,6 +95,7 @@ static CACHED_RECV_BATCH: OnceLock<usize> = OnceLock::new();
 static CACHED_SEND_BATCH: OnceLock<usize> = OnceLock::new();
 static CACHED_PER_CORE_SOCKETS: OnceLock<usize> = OnceLock::new();
 static CACHED_COALESCE_BYTES: OnceLock<usize> = OnceLock::new();
+static CACHED_SOCKS5_STRIPE: OnceLock<bool> = OnceLock::new();
 
 /// Resolve the configured per-socket buffer size. Reads
 /// `$SUBLYNE_SOCKET_BUF_BYTES` once per process; subsequent calls
@@ -143,6 +153,24 @@ fn resolve_coalesce_bytes() -> usize {
             }
         },
         Err(_) => DEFAULT_COALESCE_BYTES,
+    }
+}
+
+/// Whether to stripe a single bulk (TCP-SOCKS5) flow across all N proxy
+/// connections (default `true`). Read once per process. `0`/`false`/`off`/
+/// `no` disable it (revert to per-flow sticky routing); anything else —
+/// including an unset env — enables it.
+pub fn socks5_stripe() -> bool {
+    *CACHED_SOCKS5_STRIPE.get_or_init(resolve_socks5_stripe)
+}
+
+fn resolve_socks5_stripe() -> bool {
+    match env::var(ENV_SOCKS5_STRIPE) {
+        Ok(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
     }
 }
 
@@ -222,6 +250,7 @@ pub fn log_startup_settings() {
         send_batch = send_batch(),
         per_core_sockets = per_core_sockets(),
         socks5_coalesce_bytes = socks5_coalesce_bytes(),
+        socks5_stripe = socks5_stripe(),
         "perf: data-plane runtime tuning resolved"
     );
 }
@@ -589,6 +618,26 @@ mod tests {
             std::env::set_var(ENV_SOCKS5_COALESCE_BYTES, p);
         } else {
             std::env::remove_var(ENV_SOCKS5_COALESCE_BYTES);
+        }
+    }
+
+    #[test]
+    fn resolve_socks5_stripe_defaults_on_and_honors_off() {
+        let prev = std::env::var(ENV_SOCKS5_STRIPE).ok();
+        std::env::remove_var(ENV_SOCKS5_STRIPE);
+        assert!(resolve_socks5_stripe(), "default must be ON");
+        for off in ["0", "false", "OFF", "No", " off "] {
+            std::env::set_var(ENV_SOCKS5_STRIPE, off);
+            assert!(!resolve_socks5_stripe(), "{off:?} must disable striping");
+        }
+        for on in ["1", "true", "yes", "anything"] {
+            std::env::set_var(ENV_SOCKS5_STRIPE, on);
+            assert!(resolve_socks5_stripe(), "{on:?} must enable striping");
+        }
+        if let Some(p) = prev {
+            std::env::set_var(ENV_SOCKS5_STRIPE, p);
+        } else {
+            std::env::remove_var(ENV_SOCKS5_STRIPE);
         }
     }
 }

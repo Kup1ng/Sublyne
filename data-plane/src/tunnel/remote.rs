@@ -478,9 +478,15 @@ fn spawn_upload_task(
 /// this listener already scales to N inbound connections — no
 /// per-connection capacity bound — and the per-task `forward_sock`
 /// is a clone of the shared `Arc<UdpSocket>` so the merged payloads
-/// arrive at `forward_target` as a single in-order UDP stream
-/// (subject to the per-flow ordering the Client's sticky routing
-/// guarantees).
+/// arrive at `forward_target` from one consistent UDP source.
+///
+/// As of the striping change, a single bulk flow is spread round-robin
+/// across all N connections (so one flow uses every uplink), so the
+/// merged stream is no longer per-flow in-order — frames from one flow
+/// interleave across connections. That is intentional and safe: the
+/// forwarded payload is UDP, whose inner protocol (WireGuard, etc.)
+/// tolerates reordering. No reassembly is performed or needed here; each
+/// `[u16 len][payload]` frame is whole and is forwarded as one datagram.
 #[allow(clippy::too_many_arguments)]
 fn spawn_socks5_upload_listener(
     tasks: &mut JoinSet<()>,

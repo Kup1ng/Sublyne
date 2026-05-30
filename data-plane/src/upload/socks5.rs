@@ -71,7 +71,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -218,6 +218,17 @@ pub struct Socks5Upload {
     /// Count of frames dropped because the whole pool was saturated /
     /// unhealthy. Sampled into the log to avoid per-packet spam.
     drops: Arc<AtomicU64>,
+    /// When true, a single flow is spread (round-robin) across ALL N
+    /// connections so one heavy flow uses every Starlink uplink behind the
+    /// proxy — the fix for the single-connection upload cap. Set only for
+    /// the bulk `Coalesce` mechanism AND when `SUBLYNE_SOCKS5_STRIPE` is
+    /// enabled (the default). When false the historical per-flow sticky
+    /// hash is used (one flow → one connection). The latency ICMP-SOCKS5
+    /// mechanisms always resolve this to false.
+    stripe: bool,
+    /// Round-robin cursor used only when `stripe` is true. A plain atomic
+    /// counter advanced once per `send`; `% pool_len` picks the slot.
+    rr: AtomicUsize,
 }
 
 /// One slot in the pool. The hot path only ever touches `tx` (a
@@ -274,6 +285,14 @@ impl Socks5Upload {
             ));
         }
 
+        // Stripe a single flow across all connections only for the bulk
+        // (Coalesce) mechanism and only when the operator hasn't disabled
+        // it. The latency ICMP-SOCKS5 (PerFrame) mechanisms stay sticky so
+        // a low-rate trickle isn't split across uplinks of differing
+        // latency.
+        let stripe =
+            profile.write == WriteStrategy::Coalesce && crate::perf::socks5_stripe();
+
         let upload = Self {
             tunnel_id,
             target,
@@ -282,6 +301,8 @@ impl Socks5Upload {
             slots: Arc::new(RwLock::new(slots)),
             stop_rx,
             drops: Arc::new(AtomicU64::new(0)),
+            stripe,
+            rr: AtomicUsize::new(0),
         };
 
         // ---- Warm-up gate ------------------------------------------
@@ -674,6 +695,20 @@ fn primary_slot(session: SessionKey, n: usize) -> usize {
     (h.finish() as usize) % n
 }
 
+/// Choose the starting slot for a frame. With `stripe` true the cursor
+/// `rr` round-robins across ALL `n` slots (so a single flow uses every
+/// connection); otherwise the per-flow sticky hash pins the session to one
+/// slot. Pure (given `rr`) so the round-robin-vs-sticky behaviour is
+/// unit-testable without the process-global stripe tunable.
+fn select_primary(stripe: bool, rr: &AtomicUsize, session: SessionKey, n: usize) -> usize {
+    debug_assert!(n > 0, "select_primary called with empty pool");
+    if stripe {
+        rr.fetch_add(1, Ordering::Relaxed) % n
+    } else {
+        primary_slot(session, n)
+    }
+}
+
 #[async_trait]
 impl UploadTransport for Socks5Upload {
     async fn send(&self, session: SessionKey, payload: &[u8]) -> io::Result<()> {
@@ -700,9 +735,17 @@ impl UploadTransport for Socks5Upload {
                 "socks5 pool is empty",
             ));
         }
-        let primary = primary_slot(session, n);
+        // Pick the starting slot: round-robin across ALL connections when
+        // striping (so a single bulk flow uses every uplink behind the
+        // proxy — the fix for the single-connection upload cap), else the
+        // per-flow sticky hash (one flow → one connection — the latency
+        // mechanisms and the stripe-disabled case). Frames are whole
+        // `[u16 len][payload]` units, never split, so per-connection
+        // framing stays intact; cross-connection reorder is fine because
+        // the forwarded payload is UDP (the inner protocol tolerates it).
+        let primary = select_primary(self.stripe, &self.rr, session, n);
 
-        // Try the sticky primary, then linear-probe healthy siblings.
+        // Probe from `primary`, then linear-probe healthy siblings.
         // `try_send` never blocks — the recv loop keeps reading no matter
         // how congested any single link is. On a full queue the frame is
         // handed back to us so we can try the next slot without a realloc.
@@ -1300,6 +1343,23 @@ mod tests {
         let k = key("10.0.0.1:60000".parse().unwrap());
         for _ in 0..32 {
             assert_eq!(primary_slot(k, 8), primary_slot(k, 8));
+        }
+    }
+
+    #[test]
+    fn select_primary_stripes_round_robin_vs_sticky() {
+        let k = key("10.0.0.1:60000".parse().unwrap());
+        // Striping ON: the cursor cycles through ALL slots regardless of
+        // the session, so a single flow spreads across every connection —
+        // the fix for the single-connection upload cap.
+        let rr = AtomicUsize::new(0);
+        let seq: Vec<usize> = (0..8).map(|_| select_primary(true, &rr, k, 4)).collect();
+        assert_eq!(seq, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        // Striping OFF: one session always maps to the same slot (sticky).
+        let rr2 = AtomicUsize::new(0);
+        let sticky = select_primary(false, &rr2, k, 4);
+        for _ in 0..8 {
+            assert_eq!(select_primary(false, &rr2, k, 4), sticky);
         }
     }
 
