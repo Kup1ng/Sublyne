@@ -149,6 +149,52 @@ jobs:
         if: always()
         run: sudo tc qdisc del dev lo root || true
 
+  upload-diag-bench:
+    name: upload stream diagnosis (netem RTT+loss)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: data-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85.0'
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: data-plane
+
+      - name: Inject ~87 ms RTT + 0.5% loss, load BBR
+        # ASK 2 diagnostic harness: reproduce a high-RTT lossy upload path
+        # (like the live Iran<->foreign Starlink link) so the test can show
+        # that a SINGLE TCP stream collapses while PARALLEL streams (and
+        # BBR) sustain throughput — the dynamics behind the udp-wg
+        # Speedtest-vs-LibreSpeed gap and the tcp-socks5 single-connection
+        # cap. netem needs NET_ADMIN (runner has passwordless sudo); BBR is
+        # an in-tree module on Ubuntu runners.
+        run: |
+          sudo modprobe tcp_bbr || echo "tcp_bbr modprobe failed (test self-skips bbr)"
+          sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 || true
+          sudo tc qdisc add dev lo root netem delay 43ms loss 0.5%
+          echo "loopback qdisc now:"; tc qdisc show dev lo
+          echo "available cc:"; sysctl net.ipv4.tcp_available_congestion_control || true
+
+      - name: Run upload stream-count + congestion-control diagnosis
+        # Prints "1-stream/cubic=… 4-stream/cubic=… 1-stream/bbr=…" and,
+        # while the harness is active, asserts 4 parallel streams beat 1
+        # stream >=2x — the evidence for ASK 2.
+        env:
+          SUBLYNE_BENCH_RTT: '1'
+        run: cargo test --test upload_stream_diag -- --nocapture
+
+      - name: Remove loopback RTT
+        if: always()
+        run: sudo tc qdisc del dev lo root || true
+
   go:
     name: go (control-plane)
     runs-on: ubuntu-24.04
@@ -374,19 +420,21 @@ jobs:
   ci-pass:
     name: ci-pass
     if: always()
-    needs: [rust, socks5-bench, go, frontend, release-validate]
+    needs: [rust, socks5-bench, upload-diag-bench, go, frontend, release-validate]
     runs-on: ubuntu-24.04
     steps:
       - name: Aggregate result
         run: |
           if [ "${{ needs.rust.result }}" != "success" ] \
             || [ "${{ needs.socks5-bench.result }}" != "success" ] \
+            || [ "${{ needs.upload-diag-bench.result }}" != "success" ] \
             || [ "${{ needs.go.result }}" != "success" ] \
             || [ "${{ needs.frontend.result }}" != "success" ] \
             || [ "${{ needs.release-validate.result }}" != "success" ]; then
             echo "One or more required jobs failed."
             echo "rust=${{ needs.rust.result }}"
             echo "socks5-bench=${{ needs.socks5-bench.result }}"
+            echo "upload-diag-bench=${{ needs.upload-diag-bench.result }}"
             echo "go=${{ needs.go.result }}"
             echo "frontend=${{ needs.frontend.result }}"
             echo "release-validate=${{ needs.release-validate.result }}"
