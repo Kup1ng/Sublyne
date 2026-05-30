@@ -239,6 +239,16 @@ pub(super) async fn spawn(
             let tcp_listener = TcpListener::bind(upload_listen)
                 .await
                 .map_err(SpawnError::Io)?;
+            // v2.2.0: force-size the LISTENER's buffers BEFORE it accepts.
+            // On Linux an accepted socket inherits the listener's
+            // SO_RCVBUF/SO_SNDBUF, and — critically — the receive window
+            // scale advertised in the SYN-ACK is derived from the receive
+            // buffer at accept time. Tuning each accepted socket *after*
+            // the handshake (as the keepalive tuning does) is too late to
+            // widen the window scale. Sizing the listener here is what lets
+            // the Remote advertise a large receive window so the SOCKS5
+            // upload's in-flight data isn't capped on a high-RTT path.
+            crate::perf::tune_socket(&tcp_listener, "socks5/remote-listen");
             // Pick the inbound SOCKS5 keepalive regime from the download
             // transport so the Remote's accepted sockets mirror the
             // Client's outbound mechanism (v2 matrix): tcp_syn → Bulk
@@ -564,7 +574,13 @@ async fn drive_socks5_upload_connection(
     // those to roughly one `read()` per segment. Correctness is unchanged
     // for the per-frame (latency) mechanisms — `read_exact` reassembles
     // frames across reads either way.
-    let mut stream = BufReader::with_capacity(MAX_UDP_DATAGRAM, stream);
+    //
+    // v2.2.0: sized to 4× MAX_UDP_DATAGRAM (256 KiB) to match the Client's
+    // raised 256 KiB coalesce cap, so one `read()` can absorb a whole
+    // coalesced bulk burst instead of ~4 — fewer read syscalls per MB on
+    // the bulk TCP-SOCKS5 path. Bounded per connection, so memory stays
+    // modest even at high pool sizes.
+    let mut stream = BufReader::with_capacity(4 * MAX_UDP_DATAGRAM, stream);
     let mut len_buf = [0u8; 2];
     let mut payload = vec![0u8; MAX_UDP_DATAGRAM];
     loop {

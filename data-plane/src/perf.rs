@@ -55,6 +55,14 @@ pub const ENV_SEND_BATCH: &str = "SUBLYNE_SEND_BATCH";
 /// Env knob overriding the per-tunnel worker count (defaults to
 /// `available_parallelism()`). Clamped 1..=64.
 pub const ENV_PER_CORE_SOCKETS: &str = "SUBLYNE_PER_CORE_SOCKETS";
+/// Env knob for the SOCKS5 bulk-coalesce soft cap, in bytes. The
+/// TCP-SOCKS5 bulk mechanism drains its per-slot queue into a single
+/// `write_all` up to this many bytes so TCP segments fill — bigger means
+/// fewer `write()` syscalls per MB under burst, at the cost of a larger
+/// transient per-slot buffer. Default 256 KiB; only the Coalesce
+/// (TCP-SOCKS5) write strategy reads it, so the latency mechanisms are
+/// unaffected.
+pub const ENV_SOCKS5_COALESCE_BYTES: &str = "SUBLYNE_SOCKS5_COALESCE_BYTES";
 
 const DEFAULT_BATCH: usize = 16;
 const MIN_BATCH: usize = 1;
@@ -62,10 +70,22 @@ const MAX_BATCH: usize = 64;
 const MIN_WORKERS: usize = 1;
 const MAX_WORKERS: usize = 64;
 
+/// Default SOCKS5 bulk-coalesce soft cap: 256 KiB (~180 MTU-sized frames
+/// per write). Raised from the historical hard-coded 64 KiB so a bulk
+/// burst fills fewer, larger TCP writes — fewer syscalls per MB.
+const DEFAULT_COALESCE_BYTES: usize = 256 * 1024;
+/// Floor on the coalesce cap — below 16 KiB the coalescing barely beats
+/// per-frame writes; refuse smaller values as a likely typo.
+const MIN_COALESCE_BYTES: usize = 16 * 1024;
+/// Ceiling on the coalesce cap — a single drained write larger than a few
+/// MiB just builds latency/memory for no extra segment-filling benefit.
+const MAX_COALESCE_BYTES: usize = 4 * 1024 * 1024;
+
 static CACHED: OnceLock<usize> = OnceLock::new();
 static CACHED_RECV_BATCH: OnceLock<usize> = OnceLock::new();
 static CACHED_SEND_BATCH: OnceLock<usize> = OnceLock::new();
 static CACHED_PER_CORE_SOCKETS: OnceLock<usize> = OnceLock::new();
+static CACHED_COALESCE_BYTES: OnceLock<usize> = OnceLock::new();
 
 /// Resolve the configured per-socket buffer size. Reads
 /// `$SUBLYNE_SOCKET_BUF_BYTES` once per process; subsequent calls
@@ -91,6 +111,39 @@ pub fn send_batch() -> usize {
 /// env knob to leave a core free for the control plane.
 pub fn per_core_sockets() -> usize {
     *CACHED_PER_CORE_SOCKETS.get_or_init(resolve_per_core_sockets)
+}
+
+/// SOCKS5 bulk-coalesce soft cap in bytes, clamped to
+/// `[16 KiB, 4 MiB]`. Default 256 KiB. Read once per process; only the
+/// `WriteStrategy::Coalesce` (TCP-SOCKS5) drain loop consults it.
+pub fn socks5_coalesce_bytes() -> usize {
+    *CACHED_COALESCE_BYTES.get_or_init(resolve_coalesce_bytes)
+}
+
+fn resolve_coalesce_bytes() -> usize {
+    match env::var(ENV_SOCKS5_COALESCE_BYTES) {
+        Ok(s) => match s.parse::<usize>() {
+            Ok(n) => {
+                let clamped = n.clamp(MIN_COALESCE_BYTES, MAX_COALESCE_BYTES);
+                if clamped != n {
+                    warn!(
+                        value = n,
+                        min = MIN_COALESCE_BYTES,
+                        max = MAX_COALESCE_BYTES,
+                        env = ENV_SOCKS5_COALESCE_BYTES,
+                        "perf: socks5 coalesce cap out of range, clamped"
+                    );
+                }
+                clamped
+            }
+            Err(e) => {
+                warn!(value = %s, err = %e, env = ENV_SOCKS5_COALESCE_BYTES,
+                    "perf: socks5 coalesce env unparseable, using default 256 KiB");
+                DEFAULT_COALESCE_BYTES
+            }
+        },
+        Err(_) => DEFAULT_COALESCE_BYTES,
+    }
 }
 
 fn resolve_batch(env_name: &str) -> usize {
@@ -168,6 +221,7 @@ pub fn log_startup_settings() {
         recv_batch = recv_batch(),
         send_batch = send_batch(),
         per_core_sockets = per_core_sockets(),
+        socks5_coalesce_bytes = socks5_coalesce_bytes(),
         "perf: data-plane runtime tuning resolved"
     );
 }
@@ -496,5 +550,45 @@ mod tests {
         let (r, s) = effective_sizes(sock.as_raw_fd());
         assert!(r >= 128 * 1024, "effective recv buf too small: {r}");
         assert!(s >= 128 * 1024, "effective send buf too small: {s}");
+    }
+
+    #[test]
+    fn tune_loopback_tcp_socket_grows_kernel_buffer() {
+        // v2.2.0: the SOCKS5 substrate sockets are TCP and are now tuned
+        // with the same forced-buffer path as every other data-path
+        // socket (previously they were the ONLY data-path sockets left on
+        // kernel defaults, which capped the SOCKS5 upload's TCP window).
+        // Unprivileged here, so *BUFFORCE is refused and we exercise the
+        // non-forced fallback; assert the effective buffer still grew
+        // well past the ~64 KiB Ubuntu default.
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        tune_socket(&l, "test/loopback-tcp");
+        let (r, s) = effective_sizes(l.as_raw_fd());
+        assert!(r >= 128 * 1024, "effective recv buf too small: {r}");
+        assert!(s >= 128 * 1024, "effective send buf too small: {s}");
+    }
+
+    #[test]
+    fn resolve_coalesce_bytes_default_clamps_and_parses() {
+        let prev = std::env::var(ENV_SOCKS5_COALESCE_BYTES).ok();
+        std::env::remove_var(ENV_SOCKS5_COALESCE_BYTES);
+        assert_eq!(resolve_coalesce_bytes(), DEFAULT_COALESCE_BYTES);
+        std::env::set_var(ENV_SOCKS5_COALESCE_BYTES, "1048576"); // 1 MiB
+        assert_eq!(resolve_coalesce_bytes(), 1024 * 1024);
+        // Below floor → clamped up to the floor.
+        std::env::set_var(ENV_SOCKS5_COALESCE_BYTES, "1024");
+        assert_eq!(resolve_coalesce_bytes(), MIN_COALESCE_BYTES);
+        // Above ceiling → clamped down to the cap.
+        std::env::set_var(ENV_SOCKS5_COALESCE_BYTES, "999999999");
+        assert_eq!(resolve_coalesce_bytes(), MAX_COALESCE_BYTES);
+        // Garbage → default.
+        std::env::set_var(ENV_SOCKS5_COALESCE_BYTES, "not-a-number");
+        assert_eq!(resolve_coalesce_bytes(), DEFAULT_COALESCE_BYTES);
+        if let Some(p) = prev {
+            std::env::set_var(ENV_SOCKS5_COALESCE_BYTES, p);
+        } else {
+            std::env::remove_var(ENV_SOCKS5_COALESCE_BYTES);
+        }
     }
 }

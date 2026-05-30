@@ -83,6 +83,17 @@ var tunableRegistry = []tunable{
 		Help:       "How many packets the Remote sends per system call. Higher uses less CPU at high throughput. Default 16. Wire ordering is preserved regardless, so this does not affect the anti-replay window.",
 	},
 	{
+		Name:       "socks5_coalesce_bytes",
+		Env:        "SUBLYNE_SOCKS5_COALESCE_BYTES",
+		Default:    262144,
+		HasDefault: true,
+		Min:        16384,
+		Max:        4194304,
+		Unit:       "bytes",
+		Label:      "SOCKS5 bulk write size",
+		Help:       "On the TCP-SOCKS5 (bulk) upload, how many bytes the client batches into a single TCP write before sending. Bigger fills fuller TCP segments and uses fewer system calls per megabyte at high speed, at a little more memory; smaller trims latency for tiny bursts. Default 256 KiB. Only the bulk TCP-SOCKS5 mechanism reads this — the low-rate ICMP/ICMPv6 mechanisms are unaffected.",
+	},
+	{
 		Name: "per_core_sockets",
 		Env:  "SUBLYNE_PER_CORE_SOCKETS",
 		// HasDefault false → "auto": default serializes as null and an
