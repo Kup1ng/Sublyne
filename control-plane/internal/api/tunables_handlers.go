@@ -94,6 +94,17 @@ var tunableRegistry = []tunable{
 		Help:       "On the TCP-SOCKS5 (bulk) upload, how many bytes the client batches into a single TCP write before sending. Bigger fills fuller TCP segments and uses fewer system calls per megabyte at high speed, at a little more memory; smaller trims latency for tiny bursts. Default 256 KiB. Only the bulk TCP-SOCKS5 mechanism reads this — the low-rate ICMP/ICMPv6 mechanisms are unaffected.",
 	},
 	{
+		Name:       "socks5_stripe",
+		Env:        "SUBLYNE_SOCKS5_STRIPE",
+		Default:    1,
+		HasDefault: true,
+		Min:        0,
+		Max:        1,
+		Unit:       "0/1",
+		Label:      "SOCKS5 single-flow striping",
+		Help:       "On the TCP-SOCKS5 (bulk) upload, spread ONE connection's traffic across ALL the proxy's connections (1, default) so a single tunnel can use every Starlink uplink at once — the fix for upload speed being stuck at one uplink. Set to 0 to keep each tunnel on a single connection (the old behaviour); try that only if your uplinks differ enough in latency that striping adds harmful reordering. Only the bulk TCP-SOCKS5 mechanism reads this.",
+	},
+	{
 		Name: "per_core_sockets",
 		Env:  "SUBLYNE_PER_CORE_SOCKETS",
 		// HasDefault false → "auto": default serializes as null and an

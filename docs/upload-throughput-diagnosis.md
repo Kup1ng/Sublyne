@@ -1,10 +1,10 @@
-# Upload-throughput diagnosis (ASK 2) — evidence before fixes
+# Upload-throughput diagnosis (ASK 2) + fixes
 
-> Status: **diagnosis only.** No fix is implemented here. This documents
-> the evidence-backed root causes so the operator can choose which fix to
-> ship (see [§5 Fix options](#5-fix-options-decision-pending)). Backed by
-> the CI benchmark `data-plane/tests/upload_stream_diag.rs`
-> (job: *upload stream diagnosis (netem RTT+loss)*).
+> Status: diagnosis below; **both fixes are now implemented** (operator
+> chose "do both") — see [§6](#6-fixes--both-implemented-operator-chose-do-both).
+> Backed by the CI benchmark `data-plane/tests/upload_stream_diag.rs`
+> (job: *upload stream diagnosis (netem RTT+loss)*) and the deterministic
+> `select_primary_stripes_round_robin_vs_sticky` unit test.
 
 ## 1. The two anomalies (measured on the live pair)
 
@@ -107,22 +107,27 @@ underlying Starlink seller-WG uplink:
 dynamic, not a prediction of live throughput, which depends on the real
 uplink and proxy.)
 
-## 6. Fix options (DECISION PENDING — pick before implementation)
+## 6. Fixes — BOTH IMPLEMENTED (operator chose "do both")
 
 ### tcp-socks5
-1. **BBR + fq in `setup.sh` (quick win, low risk).** Two sysctl lines
-   (`net.ipv4.tcp_congestion_control=bbr`, `net.core.default_qdisc=fq`).
-   Helps every SOCKS5/TCP upload on the lossy high-RTT path immediately;
-   no code, no invariant impact; ~0 effect on udp-wg. **Recommended first
-   step regardless of #2.**
-2. **Per-flow multi-connection striping (big win, higher risk).** Spread a
-   single inner flow across N SOCKS5 connections (round-robin per packet)
-   so one heavy flow uses N uplinks → approach the aggregate ~80 Mbit/s.
-   This **breaks the current per-flow in-order guarantee** the Remote
-   relies on, so it needs a small reorder-tolerant reassembly on the
-   Remote (UDP/WireGuard already tolerates reorder, so the inner protocol
-   is fine — the framing/Remote side is the work). Medium-high effort,
-   higher risk; must preserve the v2.1.0 SOCKS5 stability invariants.
+1. **BBR + fq in `setup.sh` — DONE.** The installer's sysctl conf now sets
+   `net.ipv4.tcp_congestion_control = bbr` and `net.core.default_qdisc = fq`
+   (and `modprobe tcp_bbr`). BBR takes effect on new SOCKS5 connections
+   immediately; it is far less loss-sensitive than CUBIC on the high-RTT
+   path. No code/invariant impact; ~0 effect on udp-wg.
+2. **Per-flow multi-connection striping — DONE.** For the bulk (Coalesce)
+   mechanism, a single flow is now spread **round-robin across all N SOCKS5
+   connections** (`socks5.rs::select_primary`), so one heavy flow uses
+   every uplink → approaches the aggregate ~80 Mbit/s. The Remote needed
+   **no change and no reassembly**: each `[u16 len][payload]` frame is
+   whole and forwarded as one UDP datagram, and the forwarded payload is
+   UDP, whose inner protocol (WireGuard) tolerates the cross-connection
+   reorder. The latency ICMP-SOCKS5 mechanisms stay sticky. Gated by the
+   `SUBLYNE_SOCKS5_STRIPE` panel tunable (default ON); flip it OFF if a
+   path's uplinks differ enough in latency that the reorder hurts the inner
+   TCP. All v2.1.0 SOCKS5 stability invariants are preserved (the per-slot
+   driver / bounded queue / warm-up / health-rehash / keepalive machinery
+   is untouched — only the *starting slot* selection changed).
 
 ### udp-wg
 3. There is **no Sublyne-side structural fix** — the cap is the real
