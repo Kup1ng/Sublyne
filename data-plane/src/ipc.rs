@@ -145,10 +145,16 @@ async fn handle_connection(stream: UnixStream, manager: Arc<TunnelManager>) -> a
             // interface "previous" map, primes the CPU EWMA) and discard
             // it — the first real report happens after the first tick.
             let _ = snapshotter.snapshot();
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            // 1 s cadence so the dashboard reads like a live speedometer
+            // (per-second Up/Down/CPU/RAM) rather than a 5 s-smeared chart.
+            // The payload is tiny (per-tunnel counters + one system block)
+            // and there is a SINGLE reporter on the one Go<->Rust IPC
+            // socket — Go fans each report out to the browsers — so 1 s is
+            // negligible CPU even on the constrained Iran client.
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
             // Skip the immediate burst — we already produced one
             // snapshot above, and we want subsequent fires spaced by
-            // the full 5 s.
+            // the full interval.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await; // immediate first tick — discard.
             loop {

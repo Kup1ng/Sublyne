@@ -48,6 +48,19 @@ pub fn last_rss_bytes() -> u64 {
     LAST_RSS_BYTES.load(Ordering::Relaxed)
 }
 
+/// Freshly-read process RSS in bytes for the live dashboard RAM tile.
+///
+/// Unlike [`last_rss_bytes`] (which returns the value cached by the 5 s
+/// pressure sampler), this reads `/proc/self/status` on the spot so the
+/// panel's RAM tile tracks the 1 s stats cadence instead of stepping once
+/// every 5 s. The read is one small `/proc` file per second — negligible.
+/// Falls back to the sampler's cached value if the on-the-spot read fails
+/// (non-Linux dev box / transient), so it is never spuriously zero once
+/// the sampler has run at least once.
+pub fn current_rss_bytes() -> u64 {
+    read_proc_self_rss_bytes().unwrap_or_else(last_rss_bytes)
+}
+
 /// Most recent system MemTotal observed by the sampler, in bytes.
 pub fn last_total_bytes() -> u64 {
     LAST_TOTAL_BYTES.load(Ordering::Relaxed)

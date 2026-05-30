@@ -417,7 +417,7 @@ impl SystemSnapshotter {
             disk_total_bytes: disk_total,
             net_interfaces: interfaces,
             load_avg_1min: load_avg,
-            proc_rss_bytes: crate::memory::last_rss_bytes(),
+            proc_rss_bytes: crate::memory::current_rss_bytes(),
             memory_pressure: crate::memory::pressure_active(),
         }
     }

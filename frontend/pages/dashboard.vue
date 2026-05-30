@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Cpu, ArrowDown, ArrowUp, Activity, Sparkles } from 'lucide-vue-next'
+import { Cpu, ArrowDown, ArrowUp, MemoryStick, Sparkles } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted } from 'vue'
 import { useAuth } from '~/composables/useAuth'
 import { useDrawer } from '~/composables/useDrawer'
@@ -39,14 +39,11 @@ const totalDown = computed(() => {
   for (const r of rates.value.values()) s += r.bps_down
   return s
 })
-const totalSessions = computed(() => {
-  let s = 0
-  for (const r of rates.value.values()) s += r.sessions
-  return s
-})
 const cpu = computed(() => snapshot.value?.system.cpu_percent ?? 0)
 const memUsed = computed(() => snapshot.value?.system.mem_used_bytes ?? 0)
 const memTotal = computed(() => snapshot.value?.system.mem_total_bytes ?? 0)
+// Resident memory of the sublyne process itself (RSS) — the RAM tile.
+const procRss = computed(() => snapshot.value?.system.proc_rss_bytes ?? 0)
 </script>
 
 <template>
@@ -72,16 +69,20 @@ const memTotal = computed(() => snapshot.value?.system.mem_total_bytes ?? 0)
       :icon="ArrowDown"
     />
     <StatCard
-      label="Sessions"
-      :value="totalSessions.toString()"
-      hint="UDP flows currently tracked"
+      label="RAM"
+      :value="formatBytes(procRss)"
+      :hint="
+        memTotal
+          ? `${formatPercent((procRss / memTotal) * 100, 1)} of ${formatBytes(memTotal)}`
+          : 'sublyne process'
+      "
       tone="ok"
-      :icon="Activity"
+      :icon="MemoryStick"
     />
     <StatCard
       label="CPU"
       :value="formatPercent(cpu, 1)"
-      :hint="memTotal ? `RAM ${formatBytes(memUsed)} / ${formatBytes(memTotal)}` : undefined"
+      :hint="memTotal ? `System memory ${formatPercent((memUsed / memTotal) * 100, 0)}` : undefined"
       tone="warn"
       :icon="Cpu"
     />
@@ -96,15 +97,31 @@ const memTotal = computed(() => snapshot.value?.system.mem_total_bytes ?? 0)
     <AppCard
       :class="auth.role.value === 'remote' ? '' : 'lg:col-span-2'"
       title="Bandwidth"
-      description="Aggregate upload + download, sampled every 5 seconds."
+      description="Live upload + download — last 30 seconds."
     >
-      <LineChart
-        :labels="history.ts"
-        :datasets="[
-          { label: 'Upload', data: history.bps_up, tone: 'brand' },
-          { label: 'Download', data: history.bps_down, tone: 'accent' },
+      <div class="mb-3 flex flex-wrap items-center gap-x-6 gap-y-1.5">
+        <div class="flex items-center gap-2">
+          <span class="inline-block size-2 rounded-full bg-brand" />
+          <span class="text-[12px] text-subtle">Upload</span>
+          <span class="tabular text-[13px] font-semibold text-ink">{{
+            formatBitsPerSecond(totalUp)
+          }}</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="inline-block size-2 rounded-full bg-accent" />
+          <span class="text-[12px] text-subtle">Download</span>
+          <span class="tabular text-[13px] font-semibold text-ink">{{
+            formatBitsPerSecond(totalDown)
+          }}</span>
+        </div>
+      </div>
+      <Sparkline
+        :series="[
+          { data: history.bps_up, tone: 'brand' },
+          { data: history.bps_down, tone: 'accent' },
         ]"
-        :y-formatter="formatBitsPerSecond"
+        :window="30"
+        :height="140"
       />
     </AppCard>
 
