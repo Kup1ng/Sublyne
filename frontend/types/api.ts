@@ -20,6 +20,38 @@ export interface SettingsView {
   version: string
 }
 
+// A single performance tunable as the Go control plane reports it on
+// GET /settings/tunables. `value` is the operator's override, or null
+// when nothing is set (the dataplane falls back to `default` — and for
+// per_core_sockets a null default means "auto: one worker per CPU
+// core"). The bounds are inclusive; the panel validates against them
+// before save and the Go validator re-checks on PUT.
+export interface Tunable {
+  key: string
+  // The matching environment variable, surfaced for operators who
+  // prefer to set it via systemd. Not present on every tunable.
+  env?: string
+  value: number | null
+  default: number | null
+  min: number
+  max: number
+  unit: string
+  label: string
+  help: string
+}
+
+// GET /settings/tunables response. `applies_on_restart` is always true
+// today (these knobs are read once at dataplane start) — the panel uses
+// it to render the "changes apply on next restart" notice.
+export interface TunablesView {
+  applies_on_restart: boolean
+  tunables: Tunable[]
+}
+
+// PUT /settings/tunables body: a number sets an override, null clears it
+// back to the default, an omitted key is left unchanged.
+export type TunablesUpdate = Record<string, number | null>
+
 export type DownloadTransport = 'udp' | 'tcp_syn' | 'icmp' | 'icmpv6'
 export type IcmpEchoMode = 'reply' | 'request'
 export type UploadMode = 'wireguard' | 'socks5'

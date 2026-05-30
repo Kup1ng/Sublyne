@@ -90,6 +90,8 @@ func MountLogsRoutes(r chi.Router, deps LogsDeps, auditDeps AuditDeps) {
 	r.Get("/crash-reports", ListCrashReportsHandler(deps))
 	r.Get("/crash-reports/{filename}", GetCrashReportHandler(deps))
 	r.Put("/settings/log-level", SetLogLevelHandler(deps))
+	r.Get("/settings/tunables", GetTunablesHandler(deps))
+	r.Put("/settings/tunables", SetTunablesHandler(deps))
 	r.Get("/audit", ListAuditHandler(auditDeps))
 }
 

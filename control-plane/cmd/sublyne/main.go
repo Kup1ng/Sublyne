@@ -268,6 +268,10 @@ func run(args []string) int {
 		supCfg.SocketPath = "/run/sublyne/dataplane.sock"
 		supCfg.BinaryPath = "/var/lib/sublyne/dataplane"
 		supCfg.Logger = slog.Default()
+		// Export operator-set performance tunables as SUBLYNE_* env vars
+		// before the supervisor spawns the child; the child inherits this
+		// process's environment.
+		api.ApplyTunableEnv(ctx, database, slog.Default())
 		supervisor = ipc.NewSupervisor(supCfg)
 		go func() {
 			if err := supervisor.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
