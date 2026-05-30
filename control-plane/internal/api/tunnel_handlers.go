@@ -785,6 +785,94 @@ func bringUpClientTunnel(ctx context.Context, deps TunnelDeps, t tunnels.Tunnel)
 	return nil
 }
 
+// ReconcileClientWireGuard re-materialises the kernel WireGuard
+// interface for every enabled Client tunnel that uploads over
+// WireGuard (not SOCKS5) and has a linked wireguard_configs row.
+//
+// Why this exists: a kernel WG link, its per-tunnel ip rule, and its
+// route table survive a Sublyne *process* restart (the kernel keeps
+// them) but NOT a host *reboot* — the kernel drops every link, rule,
+// and route. The startup dataplane Sync only replays the StartTunnel
+// IPC to the Rust child; it never touches the kernel WG state. So
+// after a reboot an enabled wireguard-mode Client tunnel would get
+// its dataplane forwarder started but have no egress interface to
+// send through — a silent upload-path outage until the operator
+// manually Stops and Starts the tunnel. This call closes that gap by
+// bringing each interface back up before the Sync runs.
+//
+// wg.Manager.Up is idempotent: it ensures the link/addr/route/rule,
+// skipping whatever already exists, so calling this on a plain
+// process restart (interface still present) is a cheap no-op rather
+// than a teardown/rebuild.
+//
+// Robustness: a per-tunnel failure is logged and skipped, never
+// fatal — one broken config must not block the rest of the fleet or
+// the dataplane Sync that follows. wg.ErrManagerUnsupported (non-
+// Linux dev builds) is treated as a clean skip. Nil wgRepo / wgManager
+// (manager unavailable this session) makes the whole call a no-op.
+//
+// Secret hygiene: only non-secret identifiers are logged (tunnel id,
+// name, interface name, fwmark, table). The pasted config raw_text
+// and any WG keys never reach the log.
+func ReconcileClientWireGuard(ctx context.Context, wgRepo *wg.Repo, wgManager wg.Manager, all []tunnels.Tunnel, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if wgRepo == nil || wgManager == nil {
+		return
+	}
+	reconciled := 0
+	for _, t := range all {
+		if !t.Enabled {
+			continue
+		}
+		if t.Role != tunnels.RoleClient {
+			continue
+		}
+		if t.UploadMode != tunnels.UploadModeWireguard {
+			continue
+		}
+		if !t.WGConfigID.Valid || t.WGConfigID.Int64 == 0 {
+			continue
+		}
+		cfg, err := wgRepo.Get(ctx, t.WGConfigID.Int64)
+		if errors.Is(err, wg.ErrConfigNotFound) {
+			logger.Warn("wg: reboot reconcile skipped; linked config no longer exists",
+				"tunnel_id", t.ID, "name", t.Name, "wg_config_id", t.WGConfigID.Int64)
+			continue
+		}
+		if err != nil {
+			logger.Warn("wg: reboot reconcile load config failed (continuing)",
+				"tunnel_id", t.ID, "name", t.Name, "err", err)
+			continue
+		}
+		parsed, err := wg.ParseConfig(cfg.RawText)
+		if err != nil {
+			logger.Warn("wg: reboot reconcile parse failed (continuing); stored config is malformed",
+				"tunnel_id", t.ID, "name", t.Name, "err", err)
+			continue
+		}
+		res, err := wgManager.Up(ctx, t.ID, parsed)
+		if errors.Is(err, wg.ErrManagerUnsupported) {
+			logger.Info("wg: reboot reconcile skipped; manager unsupported on this platform",
+				"tunnel_id", t.ID, "name", t.Name)
+			continue
+		}
+		if err != nil {
+			logger.Warn("wg: reboot reconcile bring-up failed (continuing)",
+				"tunnel_id", t.ID, "name", t.Name, "err", err)
+			continue
+		}
+		reconciled++
+		logger.Info("wg: reboot reconcile brought interface up",
+			"tunnel_id", t.ID, "name", t.Name, "iface", res.InterfaceName,
+			"fwmark", res.Fwmark, "table", res.Table)
+	}
+	if reconciled > 0 {
+		logger.Info("wg: reboot reconcile complete", "interfaces_up", reconciled)
+	}
+}
+
 // ensureWGConfigExists verifies the supplied id (when set) points at a
 // real wireguard_configs row. Returns a per-field validation error
 // formatted the same way the rest of the validator does so the panel

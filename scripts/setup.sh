@@ -398,6 +398,12 @@ write_systemd_unit() {
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Sublyne control plane
+# Both Wants= and After= are required to actually wait for the network:
+# After= only orders us *if* the target is pulled in, and Wants= is what
+# pulls it in. Without Wants= the ordering is a no-op on boots where
+# nothing else requests network-online.target, and sublyne can start
+# before the network is fully up.
+Wants=network-online.target
 After=network-online.target
 
 [Service]
@@ -450,6 +456,16 @@ net.core.wmem_max = ${SYSCTL_WMEM_MAX}
 net.core.rmem_default = ${SYSCTL_RMEM_DEFAULT}
 net.core.wmem_default = ${SYSCTL_WMEM_DEFAULT}
 net.core.netdev_max_backlog = ${SYSCTL_NETDEV_MAX_BACKLOG}
+# Loose reverse-path filtering (mode 2), NOT strict (1) and NOT off (0).
+# Sublyne's data path is asymmetric: the spoofed download packets arrive
+# on one interface with a source IP that the host has no route back out
+# of, while the WireGuard / SOCKS5 upload leaves on another path. With
+# strict RPF (rp_filter=1) the kernel silently DROPS those inbound
+# spoofed download packets, killing the download direction entirely.
+# Loose mode (2) still drops obviously-bogus packets (no route to the
+# source at all) but permits the asymmetric routing we depend on.
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
 EOF
   chmod 0644 "$SYSCTL_FILE"
   if [ -n "$SUBLYNE_TEST_SKIP_SYSCTL" ]; then
@@ -821,9 +837,19 @@ uninstall() {
 
   echo "==> Removing sysctl tunables at ${SYSCTL_FILE}"
   rm -f "$SYSCTL_FILE"
-  # No `sysctl --system` re-apply: the file we removed only raised
-  # defaults; the next reboot resets them. The kernel doesn't accept
-  # "revert to default" on a running system without explicit values.
+  # Re-apply the remaining sysctl files so the host's own defaults take
+  # effect again without waiting for a reboot. This matters because our
+  # file set net.ipv4.conf.{all,default}.rp_filter = 2 (loose), which is
+  # behaviour-changing: leaving it at our value after uninstall would
+  # silently alter reverse-path filtering on a box that no longer runs
+  # sublyne. `sysctl --system` replays whatever the distro ships in
+  # /etc/sysctl.d, /usr/lib/sysctl.d, etc., restoring rp_filter (and the
+  # socket-buffer ceilings) to the host's configured defaults. Note this
+  # cannot revert a value that no file specifies; for those the next
+  # reboot resets them. Best-effort: never fail uninstall over a reload.
+  if [ -z "$SUBLYNE_TEST_SKIP_SYSCTL" ]; then
+    sysctl --system >/dev/null 2>&1 || true
+  fi
 
   if prompt_yes_no "Delete all data including tunnels and credentials?"; then
     echo "==> Removing ${ETC_DIR}"

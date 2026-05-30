@@ -67,19 +67,35 @@ func NewClient(conn net.Conn, logger *slog.Logger) *Client {
 	return c
 }
 
-// Close shuts down both loops and closes the underlying connection.
-// Pending Send callers receive context.Canceled (if the supplied ctx
-// fires) or an "ipc: closed" error.
-func (c *Client) Close() error {
+// closeOnce performs idempotent teardown: record the first error, mark
+// closed, close stopCh once, and close the conn so the peer loop and any
+// blocked Send callers wake immediately. Safe to call repeatedly.
+func (c *Client) closeOnce(err error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil
+		return
+	}
+	if c.closeErr == nil {
+		c.closeErr = err
 	}
 	c.closed = true
 	close(c.stopCh)
 	c.mu.Unlock()
 	_ = c.conn.Close()
+}
+
+// Closed returns a channel that is closed when the Client is torn down
+// (socket EOF/error or Close()). Receivers unblock once the client is dead.
+func (c *Client) Closed() <-chan struct{} {
+	return c.stopCh
+}
+
+// Close shuts down both loops and closes the underlying connection.
+// Pending Send callers receive context.Canceled (if the supplied ctx
+// fires) or an "ipc: closed" error.
+func (c *Client) Close() error {
+	c.closeOnce(nil)
 	c.wg.Wait()
 	// Drain any still-pending replies with a synthetic error so
 	// blocked Send callers wake up.
@@ -210,6 +226,7 @@ func (c *Client) writeLoop() {
 			}
 			if _, err := WriteFrame(c.conn, env); err != nil {
 				c.logger.Warn("ipc: write frame", "err", err)
+				c.closeOnce(err)
 				return
 			}
 		case <-c.stopCh:
@@ -226,17 +243,7 @@ func (c *Client) readLoop() {
 			if !errors.Is(err, io.EOF) {
 				c.logger.Debug("ipc: read frame", "err", err)
 			}
-			c.mu.Lock()
-			c.closeErr = err
-			c.mu.Unlock()
-			// Signal close so Send waiters wake up.
-			c.mu.Lock()
-			if !c.closed {
-				c.closed = true
-				close(c.stopCh)
-			}
-			c.mu.Unlock()
-			_ = c.conn.Close()
+			c.closeOnce(err)
 			return
 		}
 		c.dispatch(env)
@@ -248,9 +255,16 @@ func (c *Client) dispatch(env Envelope) {
 	case "Reply":
 		c.mu.Lock()
 		ch, ok := c.pending[env.ID]
+		if ok {
+			delete(c.pending, env.ID)
+		}
 		c.mu.Unlock()
 		if ok {
-			ch <- env
+			select {
+			case ch <- env:
+			default:
+				c.logger.Debug("ipc: duplicate/unconsumed reply dropped", "id", env.ID)
+			}
 			return
 		}
 		c.logger.Debug("ipc: orphan reply", "id", env.ID)
