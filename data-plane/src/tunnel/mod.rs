@@ -36,10 +36,12 @@ mod remote;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
-use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::sync::{broadcast, watch};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tracing::{info, warn};
 
 use crate::icmp_sysctl::EchoIgnoreGuard;
+use crate::manager::StateBroadcast;
 use crate::metrics::TunnelMetrics;
 use crate::protocol::TunnelState;
 use crate::rst_suppress::RstSuppressGuard;
@@ -199,6 +201,35 @@ impl SpecSnapshot {
             || self.client_real_ip != spec.client_real_ip
             || self.wireguard_fwmark != spec.wireguard_fwmark
     }
+
+    /// True iff `spec` is identical to the snapshot across every field
+    /// the snapshot tracks AND every hot-reloadable field. Used by the
+    /// manager to make `StartTunnel` for an already-running tunnel an
+    /// idempotent no-op when the spec hasn't changed (Go startup Sync /
+    /// dataplane-respawn replay), while still erroring on a genuine
+    /// spec conflict. Built from the existing differ helpers so the
+    /// "what counts as a change" rules stay in one place.
+    pub fn matches_spec(&self, spec: &TunnelSpec) -> bool {
+        !self.listen_addr_differs(spec)
+            && !self.socks5_credentials_differ(spec)
+            && !self.internal_restart_field_differs(spec)
+            && self.socks5_parallel_connections() == spec_socks5_parallel(spec)
+    }
+
+    /// The snapshot's SOCKS5 `parallel_connections`, or `None` when this
+    /// tunnel has no SOCKS5 target. Lets `matches_spec` treat a pure
+    /// `parallel_connections` edit (otherwise a hot-reload) as a spec
+    /// change so an identical-spec start stays a true no-op.
+    fn socks5_parallel_connections(&self) -> Option<u32> {
+        self.socks5_target.as_ref().map(|t| t.parallel_connections)
+    }
+}
+
+/// The spec's SOCKS5 `parallel_connections`, or `None` when no SOCKS5
+/// target is set. Mirror of [`SpecSnapshot::socks5_parallel_connections`]
+/// for the incoming spec side of [`SpecSnapshot::matches_spec`].
+fn spec_socks5_parallel(spec: &TunnelSpec) -> Option<u32> {
+    spec.socks5_target.as_ref().map(|t| t.parallel_connections)
 }
 
 /// Live handle for a running tunnel. Drop this to stop the tunnel —
@@ -210,6 +241,11 @@ pub struct TunnelHandle {
     pub role: Role,
     pub(crate) transport: Transport,
     pub(crate) spec_snapshot: SpecSnapshot,
+    /// The full spec this tunnel was started with. Kept so the manager
+    /// can roll an internal-restart back to the previous known-good spec
+    /// if the new spec fails to start, and so an identical-spec
+    /// `StartTunnel` replay can be matched without reconstructing it.
+    pub(crate) spec: TunnelSpec,
     /// Hot-reloadable knobs shared with every spawned task.
     pub(crate) mutable_config: MutableConfigSlot,
     /// Session table — shared with tasks so live edits land in the same
@@ -231,7 +267,14 @@ pub struct TunnelHandle {
     stop_tx: watch::Sender<bool>,
     /// Kept just so the receiver outlives the sender; not used.
     _stop_rx: watch::Receiver<bool>,
-    tasks: JoinSet<()>,
+    /// Supervisor task. It owns the `JoinSet` of every per-tunnel task
+    /// and awaits them: if any task exits early with an error or panics
+    /// while the tunnel was NOT deliberately shut down, it flips the
+    /// tunnel to `TunnelState::Error` (updating the stored state AND
+    /// pushing a `TunnelStateChanged` so the panel agrees). On
+    /// deliberate `shutdown()` the stop flag is set first, so the
+    /// monitor drains the tasks without raising a spurious error.
+    monitor: JoinHandle<()>,
     /// iptables DROP rule (TCP-SYN, Client role only). Dropping this on
     /// shutdown removes the rule. `None` for other transports / roles.
     _rst_suppress: Option<RstSuppressGuard>,
@@ -331,9 +374,14 @@ impl TunnelHandle {
 
     /// Trigger shutdown and await every task. Called by the manager
     /// on `StopTunnel`.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) {
+        // Set the stop flag FIRST so the monitor treats the tasks'
+        // exits as a deliberate teardown and does NOT raise a spurious
+        // `Error`. The monitor then drains the `JoinSet` (which it owns)
+        // and returns; awaiting it here gives the same "every task has
+        // finished" guarantee the old inline drain did.
         let _ = self.stop_tx.send(true);
-        while self.tasks.join_next().await.is_some() {}
+        let _ = self.monitor.await;
         // `_rst_suppress` drops here, undoing any iptables rule.
     }
 }
@@ -341,7 +389,15 @@ impl TunnelHandle {
 /// Spawn a tunnel for `spec`. Returns a handle that owns every
 /// background task. The handle's `state` starts at `Starting` and
 /// transitions to `Running` once the sockets are bound.
-pub async fn spawn_tunnel(spec: TunnelSpec) -> Result<TunnelHandle, crate::manager::SpawnError> {
+///
+/// `state_tx` is the manager's broadcast sender. The supervisor task
+/// uses it to push a `TunnelState::Error` event if any per-tunnel task
+/// dies unexpectedly (a fatal Remote/Client error or a panic) so the
+/// failure surfaces on the panel instead of dying silently.
+pub async fn spawn_tunnel(
+    spec: TunnelSpec,
+    state_tx: broadcast::Sender<StateBroadcast>,
+) -> Result<TunnelHandle, crate::manager::SpawnError> {
     let resolved = spec
         .validate()
         .map_err(crate::manager::SpawnError::InvalidSpec)?;
@@ -443,12 +499,27 @@ pub async fn spawn_tunnel(spec: TunnelSpec) -> Result<TunnelHandle, crate::manag
     };
 
     *state.lock().expect("state mutex") = TunnelState::Running;
+
+    // Spawn the supervisor. It takes ownership of the `JoinSet` and
+    // watches every per-tunnel task; on an unexpected exit (fatal error
+    // via early return, or a panic) while the tunnel was not deliberately
+    // shut down, it flips the tunnel to `Error` and pushes the event.
+    let monitor = spawn_monitor(
+        spec.id,
+        tasks,
+        state.clone(),
+        error_reason.clone(),
+        stop_rx.clone(),
+        state_tx,
+    );
+
     Ok(TunnelHandle {
         id: spec.id,
         name: spec.name.clone(),
         role: spec.role,
         transport: spec.download_transport,
         spec_snapshot: SpecSnapshot::from_spec(&spec),
+        spec,
         mutable_config,
         session_table,
         metrics,
@@ -457,10 +528,84 @@ pub async fn spawn_tunnel(spec: TunnelSpec) -> Result<TunnelHandle, crate::manag
         error_reason,
         stop_tx,
         _stop_rx: stop_rx,
-        tasks,
+        monitor,
         _rst_suppress: rst_guard,
         _echo_ignore_guard: echo_guard,
     })
+}
+
+/// Supervise every per-tunnel task in `tasks`. Returns the supervisor's
+/// own `JoinHandle`.
+///
+/// Behaviour:
+/// - On a deliberate teardown (the `stop_rx` watch holds `true`, set by
+///   [`TunnelHandle::shutdown`] before it awaits this task), the monitor
+///   drains the remaining tasks and returns without touching state.
+/// - On an UNEXPECTED exit — a task returns early because it hit a fatal
+///   error (Remote tasks, the Client upload loop) or a task PANICS
+///   (`JoinError::is_panic`) — while the stop flag is still `false`, the
+///   monitor flips the stored state to `Error` with a concise reason
+///   and broadcasts a matching `TunnelStateChanged` so `handle.state()`
+///   and the panel agree. It then keeps draining the rest so a single
+///   crash doesn't leak the other tasks.
+fn spawn_monitor(
+    id: i64,
+    mut tasks: JoinSet<()>,
+    state: StateSlot,
+    error_reason: ReasonSlot,
+    stop_rx: watch::Receiver<bool>,
+    state_tx: broadcast::Sender<StateBroadcast>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut reported_error = false;
+        while let Some(joined) = tasks.join_next().await {
+            // A deliberate shutdown sets the stop flag before any task
+            // is expected to exit. If it's set, every exit from here on
+            // is part of the teardown — drain quietly.
+            if *stop_rx.borrow() {
+                continue;
+            }
+
+            // Determine why this task ended. A panic is always a crash;
+            // a clean `Ok(())` return while we did NOT ask to stop means
+            // a hot-loop bailed on a fatal error (it logged + returned).
+            let reason = match joined {
+                Err(e) if e.is_panic() => {
+                    Some(format!("a tunnel task panicked: {}", panic_reason(&e)))
+                }
+                Err(_) => Some("a tunnel task was cancelled unexpectedly".to_string()),
+                Ok(()) => Some("a tunnel task exited unexpectedly".to_string()),
+            };
+
+            // Only the FIRST crash drives the visible state; later task
+            // exits (often cascading from the first) shouldn't overwrite
+            // the original reason.
+            if !reported_error {
+                reported_error = true;
+                if let Some(reason) = reason {
+                    warn!(tunnel_id = id, %reason, "tunnel: task died unexpectedly — marking Error");
+                    *state.lock().expect("state mutex") = TunnelState::Error;
+                    *error_reason.lock().expect("reason mutex") = Some(reason.clone());
+                    let _ = state_tx.send((id, TunnelState::Error, Some(reason)));
+                }
+            }
+        }
+        if !reported_error {
+            info!(
+                tunnel_id = id,
+                "tunnel: all tasks ended (deliberate shutdown)"
+            );
+        }
+    })
+}
+
+/// Best-effort human string for a panicked task's payload.
+fn panic_reason(err: &JoinError) -> String {
+    // `JoinError` doesn't expose the payload directly without consuming
+    // it; `try_into_panic` would consume `err`. We only have a shared
+    // ref here, so fall back to the Display form, which renders as
+    // "task <id> panicked".
+    err.to_string()
 }
 
 // Shared role-agnostic helpers ----------------------------------------------
