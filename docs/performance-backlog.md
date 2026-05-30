@@ -23,8 +23,7 @@ sharded session table; `setup.sh` tunes rmem/wmem/backlog/rp_filter.
   stream-count/uplink/CC, not pps). **Effort:** medium-low. **Risk:**
   low-medium (reuseport hashes by 4-tuple, so a flow stays on one shard →
   SOCKS5 sticky routing preserved). **Invariant:** none.
-- **A2 — BBR + fq in `setup.sh` (no `tcp_congestion_control`/`default_qdisc`
-  today, `setup.sh:454-468`).** Two sysctl lines. CUBIC collapses on the
+- **A2 — BBR + fq in `setup.sh` — ✅ DONE (v2.4.0).** Two sysctl lines. CUBIC collapses on the
   lossy high-RTT Iran↔foreign path; BBR sustains. **Gain:** significant on
   the tcp-socks5 upload; ~0 on udp-wg. **Effort:** trivial. **Risk:** low
   (BBR in-tree on Ubuntu 22/24; guard for module availability).
@@ -50,14 +49,17 @@ sharded session table; `setup.sh` tunes rmem/wmem/backlog/rp_filter.
   would cut allocator pressure at 17.8k+ pps/tunnel. **Gain:** moderate CPU
   on the download lane (helps aggregate Gbps, not upload). **Effort:**
   medium (lifetimes through the mpsc channels). **Risk:** medium.
-- **B2 — Per-flow multi-connection SOCKS5 striping.** The confirmed
-  tcp-socks5 root cause: one flow → one connection → one uplink
-  (`socks5.rs:670-726`). Round-robin a flow across N connections + a
-  reorder-tolerant Remote reassembly would let one heavy flow use N
-  uplinks (~80 Mbit/s). **Gain:** large for the single-flow upload case.
-  **Effort:** high. **Risk:** high — breaks the per-flow in-order contract
-  (`remote.rs:480-483`); needs a sequence/reassembly layer and must keep
-  the v2.1.0 SOCKS5 stability invariants. *(The big ASK 3 lever.)*
+- **B2 — Per-flow multi-connection SOCKS5 striping — ✅ DONE (v2.4.0).**
+  The confirmed tcp-socks5 root cause was one flow → one connection → one
+  uplink. Fixed by round-robining a single bulk flow across all N
+  connections (`socks5.rs::select_primary`, default-on
+  `SUBLYNE_SOCKS5_STRIPE`). It turned out **no reassembly layer was
+  needed**: each `[u16 len][payload]` frame is whole and forwarded as one
+  UDP datagram, and the forwarded payload is UDP (reorder-tolerant), so the
+  cross-connection reorder is safe. Effort ended up **low** (a routing
+  change, not a new subsystem); the v2.1.0 stability machinery is
+  untouched. The remaining (documented) risk is reorder hurting the inner
+  TCP on uplinks of very different latency — hence the off switch.
 - **B3 — Widen the anti-replay window to unclamp seal workers.**
   `SEQ_WINDOW_SIZE = 1024` (`hmac.rs:210`) hard-clamps Remote seal workers
   to `1024/256 = 4` (`remote.rs:695-696`); on the 8-vCPU Remote half the
