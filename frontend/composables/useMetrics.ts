@@ -17,19 +17,21 @@ interface WsFrame {
 // across all subscribers, and exposes:
 //
 //   - `snapshot`:  the most recent raw snapshot the server pushed (every
-//                  ~5 s in production).
+//                  ~1 s — the live cadence).
 //   - `rates`:     a Map<tunnel_id, TunnelRate> with per-tunnel bps
 //                  derived from successive snapshot deltas. UI components
 //                  bind here for the live "Mbps" numbers.
-//   - `history`:   60-entry rolling buffer for the dashboard chart of
-//                  total up/down bps + system CPU.
+//   - `history`:   ~32-entry rolling buffer (≈30 s at 1 s cadence) for the
+//                  dashboard Sparkline of total up/down bps + system CPU.
 //   - `logs`:      ring buffer of live log frames; the Logs page tails
 //                  this directly.
 //
 // The composable is a true singleton: only one WebSocket per page
 // session, even when several pages call useMetrics().
 
-const MAX_HISTORY = 60
+// ~30 samples ≈ a 30-second rolling window at the 1 s stats cadence —
+// the nload-style window the dashboard Sparkline draws.
+const MAX_HISTORY = 32
 const MAX_LOGS = 800
 
 let socket: WebSocket | null = null

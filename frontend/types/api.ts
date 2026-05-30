@@ -170,6 +170,10 @@ export interface SystemStats {
   mem_total_bytes: number
   disk_used_bytes: number
   disk_total_bytes: number
+  // Resident memory of the sublyne process itself (RSS), in bytes. The
+  // dashboard RAM tile reads this. `omitempty` on the Go side means a 0
+  // value is absent from the JSON, so it is optional and defaults to 0.
+  proc_rss_bytes?: number
   net_interfaces?: Record<string, NetInterfaceStats>
   memory_pressure?: boolean
 }
