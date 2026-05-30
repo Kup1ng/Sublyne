@@ -98,6 +98,57 @@ jobs:
           cargo deny --version
           cargo deny check bans licenses sources
 
+  socks5-bench:
+    name: socks5 throughput bench (netem)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: data-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85.0'
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: data-plane
+
+      - name: Inject loopback RTT + constrain TCP autotuning
+        # Make the TCP receive window the binding constraint so the
+        # v2.2.0 SOCKS5 buffer/window fix is observable as a throughput
+        # delta:
+        #  - netem adds 25 ms each way (50 ms RTT) on loopback.
+        #  - a small tcp_rmem/tcp_wmem caps the UNtuned (autotuned) path's
+        #    window at ~64 KiB, simulating a box left on conservative
+        #    kernel defaults.
+        #  - a large core.rmem_max/wmem_max lets the TUNED path's explicit
+        #    SO_RCVBUF/SO_SNDBUF reach 4 MiB even unprivileged: CI has no
+        #    CAP_NET_ADMIN, so *BUFFORCE is refused and the test exercises
+        #    the exact non-forced fallback a quirky kernel would take.
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 16384 65536"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 16384 65536"
+          sudo tc qdisc add dev lo root netem delay 25ms
+          echo "loopback qdisc now:"; tc qdisc show dev lo
+
+      - name: Run SOCKS5 window throughput benchmark
+        # Prints "default(autotuned)=… tuned(forced buffers)=… ratio=…x"
+        # and asserts the tuned path is >=3x faster while the harness is
+        # demonstrably active (untuned path window-limited). This is the
+        # CI-runnable "TCP/SOCKS5 measurably faster" number.
+        env:
+          SUBLYNE_BENCH_RTT: '1'
+        run: cargo test --test socks5_window_throughput -- --nocapture
+
+      - name: Remove loopback RTT
+        if: always()
+        run: sudo tc qdisc del dev lo root || true
+
   go:
     name: go (control-plane)
     runs-on: ubuntu-24.04
@@ -323,17 +374,19 @@ jobs:
   ci-pass:
     name: ci-pass
     if: always()
-    needs: [rust, go, frontend, release-validate]
+    needs: [rust, socks5-bench, go, frontend, release-validate]
     runs-on: ubuntu-24.04
     steps:
       - name: Aggregate result
         run: |
           if [ "${{ needs.rust.result }}" != "success" ] \
+            || [ "${{ needs.socks5-bench.result }}" != "success" ] \
             || [ "${{ needs.go.result }}" != "success" ] \
             || [ "${{ needs.frontend.result }}" != "success" ] \
             || [ "${{ needs.release-validate.result }}" != "success" ]; then
             echo "One or more required jobs failed."
             echo "rust=${{ needs.rust.result }}"
+            echo "socks5-bench=${{ needs.socks5-bench.result }}"
             echo "go=${{ needs.go.result }}"
             echo "frontend=${{ needs.frontend.result }}"
             echo "release-validate=${{ needs.release-validate.result }}"
