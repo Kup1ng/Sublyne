@@ -276,31 +276,73 @@ func run(args []string) int {
 		}()
 		dpManager = dataplane.NewManager(supervisor, slog.Default())
 		go dpManager.ListenStateChanges(ctx)
-		// Replay every enabled tunnel into the dataplane so the
-		// service restart is transparent to in-flight users.
+		// Reconcile the dataplane to the DB's intent every time the child
+		// becomes ready — at startup AND after each respawn. The Rust
+		// dataplane keeps all tunnel state in memory with no persistence,
+		// so a crash + supervisor respawn yields an EMPTY child; without
+		// this re-sync every tunnel would stay down until a manual Start.
+		// WireGuard interfaces are reconciled first (a host reboot wipes
+		// the kernel links) so upload egress is ready before forwarding
+		// resumes.
 		go func() {
-			waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if err := supervisor.WaitReady(waitCtx); err != nil {
-				slog.Warn("dataplane: not ready in time; skipping startup sync", "err", err)
-				return
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				err := supervisor.WaitReady(waitCtx)
+				cancel()
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					// Not ready yet (slow start / mid-respawn): pause and
+					// retry rather than giving up, so a slow or flapping
+					// dataplane still gets synced once it comes up.
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Second):
+					}
+					continue
+				}
+				client := supervisor.Client()
+				if client == nil {
+					// Ready latched but the new child isn't connected yet;
+					// poll briefly for it.
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(500 * time.Millisecond):
+					}
+					continue
+				}
+				all, err := tunnelRepo.List(ctx)
+				if err != nil {
+					slog.Warn("dataplane: list tunnels for sync failed", "err", err)
+				} else {
+					// Reboot recovery: a host reboot drops every kernel
+					// WireGuard link, ip rule, and route. The dataplane
+					// Sync below only replays the StartTunnel IPC — it
+					// never recreates the kernel WG egress. So before we
+					// tell the dataplane to start forwarding, bring each
+					// enabled wireguard-mode Client tunnel's interface
+					// back up. Up is idempotent, so on a plain process
+					// restart (interfaces still present) this is a cheap
+					// no-op. Failures are logged per-tunnel and never
+					// block the Sync that follows.
+					api.ReconcileClientWireGuard(ctx, wgRepo, wgManager, all, slog.Default())
+					dpManager.Sync(ctx, all, socks5Repo)
+				}
+				// Block until THIS child's connection dies (crash/respawn)
+				// or shutdown, then loop to re-sync the fresh child.
+				select {
+				case <-ctx.Done():
+					return
+				case <-client.Closed():
+					slog.Info("dataplane: child connection closed; will re-sync when it returns")
+				}
 			}
-			all, err := tunnelRepo.List(ctx)
-			if err != nil {
-				slog.Warn("dataplane: list tunnels for sync failed", "err", err)
-				return
-			}
-			// Reboot recovery: a host reboot drops every kernel
-			// WireGuard link, ip rule, and route. The dataplane Sync
-			// below only replays the StartTunnel IPC — it never
-			// recreates the kernel WG egress. So before we tell the
-			// dataplane to start forwarding, bring each enabled
-			// wireguard-mode Client tunnel's interface back up. Up is
-			// idempotent, so on a plain process restart (interfaces
-			// still present) this is a cheap no-op. Failures are logged
-			// per-tunnel and never block the Sync that follows.
-			api.ReconcileClientWireGuard(ctx, wgRepo, wgManager, all, slog.Default())
-			dpManager.Sync(ctx, all, socks5Repo)
 		}()
 	} else {
 		slog.Warn("dataplane: binary not embedded in this build; tunnel start will return an error (rebuild with -tags=embed)")
