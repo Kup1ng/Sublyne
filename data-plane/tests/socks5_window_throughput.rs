@@ -27,6 +27,10 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// Floor on the overridable payload size — at least 1 MiB so a typo can't
+/// shrink the transfer to a meaningless few bytes.
+const MIN_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Bytes pushed per measurement. Overridable so the CI job can shrink it
 /// if the runner is slow (the untuned, window-limited run is the long
 /// pole under injected RTT). Default 8 MiB.
@@ -34,7 +38,7 @@ fn payload_bytes() -> usize {
     std::env::var("SUBLYNE_BENCH_BYTES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n >= 1 << 20)
+        .filter(|n| *n >= MIN_PAYLOAD_BYTES)
         .unwrap_or(8 * 1024 * 1024)
 }
 

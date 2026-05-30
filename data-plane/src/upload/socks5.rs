@@ -1210,11 +1210,13 @@ mod tests {
             }
             (writes, bytes)
         }
-        let frame = 1400; // ~MTU-sized framed payload
-        let n = 2000; // ~2.8 MB of bulk
-        let (small_writes, small_bytes) = writes_for(frame, n, 64 * 1024); // historical cap
-        let (big_writes, big_bytes) = writes_for(frame, n, 256 * 1024); // v2.2.0 default
-        // No frame is ever dropped — both move the full byte count.
+        // ~2.8 MB of MTU-sized bulk pushed through the historical 64 KiB
+        // cap vs the v2.2.0 256 KiB default. No frame is ever dropped
+        // either way — both runs move the full byte count.
+        let frame = 1400;
+        let n = 2000;
+        let (small_writes, small_bytes) = writes_for(frame, n, 64 * 1024);
+        let (big_writes, big_bytes) = writes_for(frame, n, 256 * 1024);
         assert_eq!(small_bytes, n * frame);
         assert_eq!(big_bytes, n * frame);
         // 4× the cap ⇒ ~4× fewer writes; assert a conservative ≥3×.
