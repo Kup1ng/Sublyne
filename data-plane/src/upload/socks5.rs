@@ -140,6 +140,51 @@ const COALESCE_SOFT_CAP: usize = 64 * 1024;
 /// and rotating onto a fresh proxy connection is the right move.
 const WRITE_BACKSTOP: Duration = Duration::from_secs(15);
 
+/// RAII guard that force-clears a slot's `healthy` flag on drop.
+///
+/// The driver task sets `healthy = true` only while it holds a live,
+/// handshaked stream and is actively draining it. If the driver ever
+/// leaves that state — a normal `break`/`return`, an early exit, OR a
+/// panic unwinding through the task — this guard's `Drop` runs and
+/// clears the flag. Without it, a driver that exited or panicked while
+/// `healthy == true` would strand the flag set forever, so the sticky
+/// hash would keep steering a session into a slot whose driver is gone
+/// and silently black-hole its traffic.
+///
+/// The driver flips the flag back on (via [`HealthGuard::set_healthy`])
+/// every time it re-establishes a connection, and off again the instant
+/// a write fails, so the steady-state cost is one relaxed atomic store
+/// per connect/teardown — the guard only matters on the exit/panic
+/// paths the explicit stores can't cover.
+struct HealthGuard {
+    healthy: Arc<AtomicBool>,
+}
+
+impl HealthGuard {
+    fn new(healthy: Arc<AtomicBool>) -> Self {
+        Self { healthy }
+    }
+
+    /// Mark the slot healthy (a fresh stream is live).
+    fn set_healthy(&self) {
+        self.healthy.store(true, Ordering::Release);
+    }
+
+    /// Mark the slot unhealthy (reconnecting / backing off).
+    fn set_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for HealthGuard {
+    fn drop(&mut self) {
+        // Belt-and-suspenders: whatever path the driver leaves by —
+        // return, break-then-loop-exit, or a panic — the slot ends up
+        // unhealthy so the hot path stops routing to a dead driver.
+        self.healthy.store(false, Ordering::Release);
+    }
+}
+
 /// Compute the reconnect backoff for `consecutive_failures`. Exposed as
 /// a free function so the curve is easy to unit-test.
 fn backoff_for_failures(consecutive_failures: u32) -> Duration {
@@ -420,6 +465,14 @@ async fn slot_driver(
     // poll. If the slot was already removed before the driver started,
     // the first `changed()` in a select returns `Err` and we exit.
     let _ = alive_rx.borrow_and_update();
+    // RAII guard owning the health flag. Its `Drop` force-clears
+    // `healthy` no matter how this task leaves — `return`, the loop
+    // ending, or a panic — so a dead/exited/panicked driver can never
+    // strand `healthy == true` and keep the hot path routing into a
+    // black hole. `consecutive_failures > 0` and every error path below
+    // call `health.set_unhealthy()` for promptness; the guard is the
+    // backstop the explicit stores can't reach.
+    let health = HealthGuard::new(healthy);
     let mut consecutive_failures: u32 = 0;
     loop {
         if *stop_rx.borrow() {
@@ -427,7 +480,7 @@ async fn slot_driver(
         }
         // Back off before a retry (not before the very first attempt).
         if consecutive_failures > 0 {
-            healthy.store(false, Ordering::Release);
+            health.set_unhealthy();
             let wait = backoff_for_failures(consecutive_failures);
             tokio::select! {
                 biased;
@@ -447,7 +500,19 @@ async fn slot_driver(
         );
         let mut stream = tokio::select! {
             biased;
-            _ = stop_rx.changed() => { if *stop_rx.borrow() { return; } continue; }
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                // Non-stop wakeup of the stop watch (it was marked
+                // changed but is still `false`): re-enter the connect
+                // loop, but count it as a failed attempt so backoff
+                // accounting still advances. A bare `continue` here
+                // would skip the backoff bookkeeping and let a flapping
+                // proxy / spurious wakeup drive a tight reconnect storm.
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                continue;
+            }
             _ = alive_rx.changed() => return,
             res = connect_fut => match res {
                 Ok(Ok(s)) => s,
@@ -472,7 +537,7 @@ async fn slot_driver(
         };
 
         consecutive_failures = 0;
-        healthy.store(true, Ordering::Release);
+        health.set_healthy();
         info!(
             tunnel_id,
             slot = index,
@@ -529,25 +594,42 @@ async fn slot_driver(
                             buf
                         }
                     };
+                    // A write error OR a backstop timeout is treated as a
+                    // FATAL stream error. `write_all` may have already put
+                    // PART of `writebuf` on the wire before failing or
+                    // being cancelled at the backstop, which leaves the
+                    // framed `[u16 len][payload]` byte stream misaligned —
+                    // the Remote's length-prefixed decoder would parse
+                    // garbage from there on. So we never write another
+                    // frame to this stream: mark unhealthy, abandon it,
+                    // and `break` to reconnect. A brand-new TCP stream
+                    // always starts frame-aligned, so a half-written frame
+                    // can never be followed by the next frame on the same
+                    // stream.
                     match timeout(WRITE_BACKSTOP, stream.write_all(&writebuf)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            healthy.store(false, Ordering::Release);
+                            health.set_unhealthy();
                             warn!(
                                 tunnel_id, slot = index, err = %e,
-                                "client: SOCKS5 slot write failed; reconnecting"
+                                "client: SOCKS5 slot write failed (stream desynced); reconnecting"
                             );
+                            // Abandon the possibly half-written stream;
+                            // ignore shutdown errors — it's being dropped.
                             let _ = stream.shutdown().await;
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             break;
                         }
                         Err(_elapsed) => {
-                            healthy.store(false, Ordering::Release);
+                            health.set_unhealthy();
                             warn!(
                                 tunnel_id, slot = index,
                                 backstop_s = WRITE_BACKSTOP.as_secs(),
-                                "client: SOCKS5 slot write backstop elapsed (link cannot drain); reconnecting"
+                                "client: SOCKS5 slot write backstop elapsed (link cannot drain, stream desynced); reconnecting"
                             );
+                            // The backstop cancelled `write_all` mid-frame:
+                            // this stream is desynced and must not carry
+                            // another frame. Drop it and reconnect fresh.
                             let _ = stream.shutdown().await;
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             break;
@@ -1077,6 +1159,57 @@ mod tests {
         // Cap holds for any larger failure count.
         assert_eq!(backoff_for_failures(5), Duration::from_millis(8000));
         assert_eq!(backoff_for_failures(99), Duration::from_millis(8000));
+    }
+
+    #[test]
+    fn health_guard_clears_healthy_on_drop() {
+        // The guard's whole job is finding [36]: whenever a slot driver
+        // leaves its connected state — including via an unwinding panic —
+        // the shared `healthy` flag must end up `false` so the hot path
+        // stops routing into a dead/exited driver.
+        let healthy = Arc::new(AtomicBool::new(false));
+        {
+            let guard = HealthGuard::new(healthy.clone());
+            guard.set_healthy();
+            assert!(
+                healthy.load(Ordering::Acquire),
+                "set_healthy should mark the slot live"
+            );
+            guard.set_unhealthy();
+            assert!(
+                !healthy.load(Ordering::Acquire),
+                "set_unhealthy should clear the flag"
+            );
+            // Re-arm to healthy, then let the guard drop while "live".
+            guard.set_healthy();
+            assert!(healthy.load(Ordering::Acquire));
+        }
+        // Guard dropped (the analogue of the driver task returning or
+        // panicking): the flag must be forced back to false.
+        assert!(
+            !healthy.load(Ordering::Acquire),
+            "dropping the guard must clear healthy even when it was true"
+        );
+    }
+
+    #[test]
+    fn health_guard_clears_healthy_on_panic_unwind() {
+        // A panic inside the driver must not strand `healthy == true`.
+        // Simulate it: hold the guard healthy, then unwind through its
+        // scope via `catch_unwind`. Drop still runs during unwind, so the
+        // flag must be observed false afterwards.
+        let healthy = Arc::new(AtomicBool::new(false));
+        let probe = healthy.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = HealthGuard::new(probe);
+            guard.set_healthy();
+            panic!("driver task blew up while healthy");
+        }));
+        assert!(result.is_err(), "the closure should have panicked");
+        assert!(
+            !healthy.load(Ordering::Acquire),
+            "panic unwind through HealthGuard must clear healthy"
+        );
     }
 
     #[tokio::test]
