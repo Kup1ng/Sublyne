@@ -125,7 +125,25 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 		if !s.recordRestartAndCheck() {
-			return errors.New("ipc: dataplane restart budget exhausted (5/min)")
+			// Restart budget exhausted: the child crash-looped faster than
+			// MaxRestartsPerMinute. Returning here would leave the dataplane
+			// DOWN forever — the supervisor goroutine exits but the Go
+			// process keeps running, so systemd never restarts us and the
+			// outage is silent. Instead, back off for a cooldown window
+			// (interruptible by ctx), reset the restart window, and keep
+			// retrying. Self-healing: a transient crash-loop recovers on
+			// its own once the underlying cause clears.
+			s.cfg.Logger.Warn("ipc: dataplane restart budget exhausted; backing off",
+				"max_per_minute", s.cfg.MaxRestartsPerMinute, "cooldown", "60s")
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(60 * time.Second):
+			}
+			s.mu.Lock()
+			s.restarts = nil
+			s.mu.Unlock()
+			continue
 		}
 		if err := s.startOnce(ctx); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -187,9 +205,16 @@ func (s *Supervisor) Client() *Client {
 
 // WaitReady blocks until the dataplane has emitted Ready or ctx fires.
 // Returns nil on success.
+//
+// startOnce reassigns s.readyCh under s.mu after a restart, so we snapshot
+// the current channel under the same lock before selecting on it. Reading
+// the field lock-free here races with that reassignment (go test -race).
 func (s *Supervisor) WaitReady(ctx context.Context) error {
+	s.mu.Lock()
+	ch := s.readyCh
+	s.mu.Unlock()
 	select {
-	case <-s.readyCh:
+	case <-ch:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -272,12 +297,30 @@ func (s *Supervisor) startOnce(ctx context.Context) error {
 	s.mu.Unlock()
 	s.cfg.Logger.Info("ipc: dataplane up", "pid", cmd.Process.Pid)
 
-	// Block until the child exits (or ctx is cancelled).
+	// Note when this child reached Ready. recordRestartAndCheck counts
+	// spawn ATTEMPTS, so a child that bound fine and ran for a long time
+	// would still burn budget on its eventual restart. We compensate
+	// below: if this child ran for a healthy duration before exiting, we
+	// clear the restart window so a slow, occasional restart never trips
+	// the per-minute cap — only genuine rapid crash-loops do.
+	readyAt := time.Now()
+	const healthyRunDuration = 30 * time.Second
+
+	// Block until the child exits, the IPC client/socket dies, or ctx is
+	// cancelled. The client.Closed() arm covers the case where the child
+	// process stays alive but its IPC socket drops (Client read loop
+	// returns / EOF): without it the supervisor would wait on a child
+	// that can no longer be reached and downstream calls fail forever.
 	select {
 	case err := <-exitCh:
 		s.mu.Lock()
 		s.client = nil
 		s.cmd = nil
+		if time.Since(readyAt) >= healthyRunDuration {
+			// Ran healthily before exiting — not a crash-loop. Reset the
+			// restart window so this restart doesn't count against the cap.
+			s.restarts = nil
+		}
 		s.mu.Unlock()
 		_ = client.Close()
 		if err != nil {
@@ -303,6 +346,24 @@ func (s *Supervisor) startOnce(ctx context.Context) error {
 			return fmt.Errorf("dataplane exited: %w", err)
 		}
 		return errors.New("dataplane exited cleanly; respawning")
+	case <-client.Closed():
+		// The child is still alive but its IPC socket died (Client read
+		// loop returned / EOF). The Client is now closed, so every
+		// downstream call would fail forever. Kill the child and return
+		// so the outer loop respawns a fresh child + socket. This counts
+		// as a normal restart (the loop's recordRestartAndCheck runs on
+		// the next iteration). Killing the child makes exitCh fire — we
+		// drain it so the reaper goroutine completes.
+		s.cfg.Logger.Warn("ipc: dataplane IPC socket died while child alive; respawning",
+			"pid", cmd.Process.Pid)
+		s.mu.Lock()
+		s.client = nil
+		s.cmd = nil
+		s.mu.Unlock()
+		_ = client.Close()
+		_ = cmd.Process.Kill()
+		<-exitCh
+		return errors.New("dataplane IPC client closed; respawning")
 	case <-ctx.Done():
 		_ = client.Close()
 		_ = cmd.Process.Kill()
