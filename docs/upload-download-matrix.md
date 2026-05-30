@@ -227,3 +227,69 @@ Policy lives in Go; the dataplane stays migration-tolerant.
 to one worker (`session_id % N` is constant). v2 fixes the offset (now
 accounting for the `proto_ver` prefix) so the fan-out actually parallelises
 across workers as its design comment always claimed.
+
+## 10. v2.2.0 — SOCKS5 upload window & coalescing (perf, no wire change)
+
+v2.2.0 makes the **bulk TCP-SOCKS5 upload faster** without changing the
+model, the matrix, or the wire format. It is a pure performance + tunables
+release: a v2.2.0 box interoperates with a v2.1.0 peer and the two servers
+can be upgraded independently.
+
+The forwarded payload is **still UDP** for every row (PRD invariant
+unchanged), the download still arrives as spoofed white-IP packets, and
+the SOCKS5 framing is byte-identical (`[u16 BE len][payload]`). What
+changed is purely *how fast the existing SOCKS5 upload moves bytes*:
+
+1. **Socket-buffer / TCP-window sizing (the headline).** The SOCKS5
+   substrate sockets were the **only** data-path sockets left on kernel
+   defaults — `tune_socks5_tcp_socket` set keepalive + `TCP_USER_TIMEOUT`
+   but never `SO_SNDBUF`/`SO_RCVBUF`, and the Remote upload **listener**
+   was never tuned at all. Because a TCP socket's advertised receive
+   window scale is fixed from its receive buffer **at SYN time**, an
+   un-tuned listener could not open a large window no matter the
+   bandwidth — the "TCP RWIN" ceiling. v2.2.0 applies the existing forced
+   buffer tuning (`perf::tune_socket`, 4 MiB, `SUBLYNE_SOCKET_BUF_BYTES`)
+   to the Remote listener **before it accepts** and to the Client's
+   outbound stream, so the bulk upload window is large and available from
+   the first byte. With `CAP_NET_ADMIN` the `*BUFFORCE` path pins it
+   immediately; otherwise it falls back to the `setup.sh`-raised ceiling.
+
+2. **Bulk coalescing is bigger and tunable.** The Coalesce drain's soft
+   cap moved from a hard-coded 64 KiB to `perf::socks5_coalesce_bytes()`
+   (default **256 KiB**, env `SUBLYNE_SOCKS5_COALESCE_BYTES`, also a panel
+   knob). A bursty bulk upload now drains ~4× more queued frames into each
+   `write_all`, cutting `write()` syscalls per MB (unit-tested,
+   deterministic). The Remote's per-connection `BufReader` grew to 256 KiB
+   to match. Only `WriteStrategy::Coalesce` (the TCP-SOCKS5 mechanism)
+   reads the cap; the per-frame ICMP/ICMPv6 latency mechanisms are
+   untouched.
+
+**Proof.** `data-plane/tests/socks5_window_throughput.rs` runs in a
+dedicated CI job under `tc netem` injected RTT with a constrained
+`tcp_rmem`: at 50 ms RTT a ~64 KiB autotuned window throttles the un-tuned
+path to ~10 Mbit/s while the tuned 4 MiB window sustains hundreds of
+Mbit/s. The coalescing win is a separate deterministic unit test
+(`coalesce_drain_cuts_writes_per_mb_with_a_bigger_cap`).
+
+**Honest caveat.** The window/buffer win scales with *bandwidth × RTT*:
+on a low-latency, well-configured box where TCP autotuning already reaches
+a large window, the gain is small. It matters most on high-latency
+(Starlink) paths and boxes left on conservative kernel TCP defaults —
+which is exactly where the SOCKS5 upload runs. The knobs are exposed so
+the operator can tune and measure on real hardware.
+
+### 10.1 Invariants preserved (checklist)
+
+- [x] UDP forwarded payload — every row still forwards UDP; no TCP
+      end-to-end forwarding was added.
+- [x] Download via white-IP spoof — unchanged on every row.
+- [x] SOCKS5 framing `[u16 BE len][payload]` — byte-identical; no wire
+      break; independent upgrade.
+- [x] SOCKS5 stability (per-slot queue, decoupled driver, warm-up gate,
+      sticky routing, `TCP_USER_TIMEOUT`/keepalive, fatal-on-partial-write
+      reconnect) — buffer tuning and the larger cap live inside the
+      existing driver; the framing-desync reconnect logic is unchanged.
+- [x] Anti-replay `SeqWindow`, HMAC, `session_id`, DF-clear, fwmark —
+      download path untouched.
+- [x] ICMP/ICMPv6-SOCKS5 latency regime (per-frame flush, Nagle off,
+      Latency keepalive) — untouched; only the bulk Coalesce path changed.
