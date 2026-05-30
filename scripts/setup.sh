@@ -466,11 +466,26 @@ net.core.netdev_max_backlog = ${SYSCTL_NETDEV_MAX_BACKLOG}
 # source at all) but permits the asymmetric routing we depend on.
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
+# BBR congestion control + fq qdisc for the SOCKS5/TCP upload substrate.
+# That hop is a real TCP byte stream over a high-RTT (trans-continental,
+# Starlink) path; the kernel default CUBIC collapses its window hard on the
+# loss such links exhibit, while BBR sustains throughput, and fq paces the
+# stream. Both are in-tree on Ubuntu 22.04/24.04. tcp_congestion_control
+# takes effect on new connections immediately (so the tunnel's SOCKS5
+# connections pick it up); default_qdisc applies to interfaces brought up
+# afterwards (a reboot, or already-fq on most clouds). If tcp_bbr is
+# somehow unavailable the kernel keeps the previous value — a harmless
+# no-op. This only affects local TCP; the UDP/WireGuard lane is unchanged.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 EOF
   chmod 0644 "$SYSCTL_FILE"
   if [ -n "$SUBLYNE_TEST_SKIP_SYSCTL" ]; then
     return 0
   fi
+  # Make sure the BBR module is present so the tcp_congestion_control line
+  # applies (modern kernels auto-load it on set, but be explicit + tolerant).
+  modprobe tcp_bbr 2>/dev/null || true
   # Apply immediately so the first dataplane start sees the new values.
   # --pattern restricts to our file so we don't replay every other
   # sysctl rule on the box (some of which may not be safe to re-apply).
