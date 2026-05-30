@@ -200,7 +200,10 @@ type restoreResult struct {
 //  5. Stop every running tunnel (dataplane Stop + WG Down). We do this
 //     BEFORE the swap so listeners release their ports and stale WG
 //     interfaces tear down cleanly; the post-swap Sync brings them back
-//     up against the restored tunnel rows.
+//     up against the restored tunnel rows. We capture the pre-restore
+//     tunnel set first so that, if the swap fails, we can restart the
+//     exact tunnels that were running and return the box to its prior
+//     working state (the transaction rolls back, so the DB is unchanged).
 //  6. ATTACH the temp DB and DELETE+INSERT every domain table from it.
 //  7. Re-write the preserved admin row.
 //  8. DETACH the temp DB.
@@ -335,8 +338,28 @@ func RestoreHandler(deps BackupRestoreDeps) http.HandlerFunc {
 
 		// Atomically copy every domain table from the temp file into
 		// the running DB and re-write the preserved admin row.
+		//
+		// On failure the transaction inside swapTablesFromBackup rolls
+		// back, so the running DB still holds the ORIGINAL config. But we
+		// already stopped every previously-running tunnel above, so the
+		// box is now fully dark even though its on-disk state is
+		// unchanged. Bring the original set back up from the unchanged DB
+		// so a mid-restore error returns the box to its prior working
+		// state instead of leaving a healthy install dead.
 		if err := swapTablesFromBackup(r.Context(), deps.DB, tmpPath, preserved); err != nil {
 			deps.logger().Error("restore: table swap", "err", err)
+			recovered := startEnabledTunnels(r.Context(), deps, runningBefore)
+			if recovered < countEnabled(runningBefore) {
+				// At least one tunnel that was running before the restore
+				// did not come back. The DB is still the original, so the
+				// operator can retry, but flag the degraded state. No
+				// secrets: only counts and IDs are logged by the helper.
+				deps.logger().Error("restore: swap failed and not all prior tunnels restarted",
+					"restarted", recovered, "were_running", countEnabled(runningBefore))
+			} else {
+				deps.logger().Warn("restore: swap failed; prior tunnels restarted from unchanged DB",
+					"restarted", recovered)
+			}
 			writeJSONError(w, http.StatusInternalServerError, "could not apply restore: "+err.Error())
 			return
 		}
@@ -439,11 +462,29 @@ func stopAllTunnels(ctx context.Context, deps BackupRestoreDeps, ts []tunnels.Tu
 	}
 }
 
+// countEnabled returns how many tunnels in the slice are enabled. The
+// restore failure path uses it to tell "all prior tunnels came back"
+// apart from "the box is degraded" without re-deriving the set.
+func countEnabled(ts []tunnels.Tunnel) int {
+	n := 0
+	for _, t := range ts {
+		if t.Enabled {
+			n++
+		}
+	}
+	return n
+}
+
 // startEnabledTunnels reproduces the per-row Start sequence (WG Up +
 // Dataplane Start) for every enabled tunnel in the restored DB. Returns
 // how many actually started successfully; failures are logged but not
 // counted, so the JSON response gives the operator an honest "how
 // many of these are forwarding right now" number.
+//
+// It is also reused on the restore FAILURE path to restart the
+// previously-running tunnels from the unchanged (original) DB. Because
+// it resolves WG / SOCKS5 config per row at call time, feeding it the
+// pre-restore tunnel slice brings the box back to its prior state.
 func startEnabledTunnels(ctx context.Context, deps BackupRestoreDeps, ts []tunnels.Tunnel) int {
 	active := 0
 	for _, t := range ts {
@@ -517,9 +558,17 @@ func startEnabledTunnels(ctx context.Context, deps BackupRestoreDeps, ts []tunne
 // children first on DELETE (we iterate in reverse). socks5_proxies
 // is a parent of tunnels (tunnels.socks5_proxy_id references it) so
 // it sits next to wireguard_configs ahead of tunnels.
+//
+// login_attempts is deliberately NOT in this list. It holds the live
+// brute-force lockout state (failed-login counters and IP lockouts).
+// Copying it from the backup would re-import whatever stale lockout
+// state the snapshot happened to capture and could lock the operator
+// out of the panel immediately after a restore. The swap iterates
+// this slice symmetrically (DELETE in reverse, INSERT forward), so
+// dropping the entry leaves the live login_attempts table untouched
+// rather than half-swapped.
 var restoreTables = []string{
 	"settings",
-	"login_attempts",
 	"wireguard_configs",
 	"socks5_proxies",
 	"tunnels",

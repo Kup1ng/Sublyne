@@ -18,6 +18,7 @@ import (
 	"github.com/Kup1ng/Sublyne/control-plane/internal/ipc"
 	"github.com/Kup1ng/Sublyne/control-plane/internal/socks5"
 	"github.com/Kup1ng/Sublyne/control-plane/internal/tunnels"
+	"github.com/Kup1ng/Sublyne/control-plane/internal/wg"
 )
 
 // Manager bridges the database-shaped Tunnel record to the
@@ -133,15 +134,22 @@ func (m *Manager) Update(ctx context.Context, t tunnels.Tunnel, proxy *socks5.Pr
 	}
 	reply, err := client.Send(ctx, "UpdateTunnel", spec)
 	if err != nil {
+		m.recordState(t.ID, "error", err.Error())
 		return UpdateOutcome{}, err
 	}
 	if !reply.OK {
 		if reply.Error != nil && reply.Error.Code == ipc.CodeRestartRequired {
+			// The dataplane keeps running the OLD config until the
+			// operator clicks Stop/Start, so the tunnel is still
+			// "running" — the handler surfaces the restart banner.
+			m.recordState(t.ID, "running", "")
 			return UpdateOutcome{RestartRequired: true, Reason: reply.Error.Message}, nil
 		}
 		if reply.Error != nil {
+			m.recordState(t.ID, "error", reply.Error.Error())
 			return UpdateOutcome{}, reply.Error
 		}
+		m.recordState(t.ID, "error", "dataplane: update failed")
 		return UpdateOutcome{}, errors.New("dataplane: update failed")
 	}
 	out := UpdateOutcome{Applied: true}
@@ -153,6 +161,7 @@ func (m *Manager) Update(ctx context.Context, t tunnels.Tunnel, proxy *socks5.Pr
 			out.Changed = body.Changed
 		}
 	}
+	m.recordState(t.ID, "running", "")
 	return out, nil
 }
 
@@ -327,7 +336,7 @@ func (m *Manager) ListenStateChanges(ctx context.Context) {
 			}
 			continue
 		}
-		ch := client.SubscribeStateChanges(16)
+		ch := client.SubscribeStateChanges(256)
 		// Consume events until the channel closes (dataplane
 		// restarted) or ctx fires.
 	inner:
@@ -434,17 +443,20 @@ func buildSpec(t tunnels.Tunnel, proxy *socks5.Proxy) (ipc.TunnelSpec, error) {
 			if proxy.ParallelConnections < 1 || proxy.ParallelConnections > 64 {
 				return spec, fmt.Errorf("socks5 proxy parallel_connections out of range: %d", proxy.ParallelConnections)
 			}
-			if proxy.MinReadySlots < 1 {
-				proxy.MinReadySlots = 1
+			// Clamp into a local — never mutate the caller's *proxy,
+			// which is a request-scoped row the handler may reuse.
+			minReadySlots := proxy.MinReadySlots
+			if minReadySlots < 1 {
+				minReadySlots = 1
 			}
-			if proxy.MinReadySlots > proxy.ParallelConnections {
-				proxy.MinReadySlots = proxy.ParallelConnections
+			if minReadySlots > proxy.ParallelConnections {
+				minReadySlots = proxy.ParallelConnections
 			}
 			target := &ipc.Socks5Target{
 				Host:                proxy.Host,
 				Port:                uint16(proxy.Port),                //nolint:gosec // bounded above
 				ParallelConnections: uint32(proxy.ParallelConnections), //nolint:gosec // bounded above
-				MinReadySlots:       uint32(proxy.MinReadySlots),       //nolint:gosec // bounded above
+				MinReadySlots:       uint32(minReadySlots),             //nolint:gosec // bounded above
 			}
 			if proxy.Username.Valid {
 				target.Username = proxy.Username.String
@@ -459,11 +471,11 @@ func buildSpec(t tunnels.Tunnel, proxy *socks5.Proxy) (ipc.TunnelSpec, error) {
 			// at zero, which the dataplane treats as "no SO_MARK" and
 			// is useful for loopback tests.
 			if t.WGConfigID.Valid {
-				// fwmark uses the same scheme as wg.FwmarkFor — but we
-				// don't import that package here to avoid a cycle.
-				// Phase 7 documented the formula in wg/policy.go. The
-				// 12-bit mask makes the int64 → uint32 narrowing safe.
-				spec.WireguardFwmark = 0x1000 | uint32(uint64(t.ID)&0x0fff) //nolint:gosec // mask keeps the value in 16 bits
+				// fwmark uses the canonical scheme from wg.FwmarkFor so
+				// the per-tunnel SO_MARK the dataplane sets matches the
+				// `ip rule fwmark X` the wg policy layer installs. The
+				// 12-bit mask in FwmarkFor keeps the value in 16 bits.
+				spec.WireguardFwmark = wg.FwmarkFor(t.ID)
 			}
 		}
 	case tunnels.RoleRemote:
