@@ -290,6 +290,16 @@ func run(args []string) int {
 				slog.Warn("dataplane: list tunnels for sync failed", "err", err)
 				return
 			}
+			// Reboot recovery: a host reboot drops every kernel
+			// WireGuard link, ip rule, and route. The dataplane Sync
+			// below only replays the StartTunnel IPC — it never
+			// recreates the kernel WG egress. So before we tell the
+			// dataplane to start forwarding, bring each enabled
+			// wireguard-mode Client tunnel's interface back up. Up is
+			// idempotent, so on a plain process restart (interfaces
+			// still present) this is a cheap no-op. Failures are logged
+			// per-tunnel and never block the Sync that follows.
+			api.ReconcileClientWireGuard(ctx, wgRepo, wgManager, all, slog.Default())
 			dpManager.Sync(ctx, all, socks5Repo)
 		}()
 	} else {
