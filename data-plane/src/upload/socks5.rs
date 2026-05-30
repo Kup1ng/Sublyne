@@ -120,15 +120,15 @@ const BACKOFF_CAP: Duration = Duration::from_secs(8);
 /// replaces the old recv-loop freeze.
 const SLOT_QUEUE_CAP: usize = 512;
 
-/// Soft cap on how many bytes the [`WriteStrategy::Coalesce`] drain
-/// accumulates into a single `write_all`. The whole point of coalescing
-/// is to fill TCP segments for the bulk **TCP-SOCKS5** mechanism, but an
-/// unbounded drain on a saturated queue would build a multi-MiB buffer
-/// and add latency. 64 KiB is ~45 MTU-sized frames per syscall — plenty
-/// to amortize the write while bounding the buffer. The cap is a soft
-/// limit: we stop pulling more frames once the buffer crosses it, but a
-/// single oversized frame is still written whole.
-const COALESCE_SOFT_CAP: usize = 64 * 1024;
+// The soft cap on how many bytes the `WriteStrategy::Coalesce` drain
+// accumulates into a single `write_all` is no longer a hard-coded
+// constant: it is the operator-tunable `crate::perf::socks5_coalesce_bytes()`
+// (default 256 KiB, raised from the historical 64 KiB; env
+// `SUBLYNE_SOCKS5_COALESCE_BYTES`). The whole point of coalescing is to
+// fill TCP segments for the bulk TCP-SOCKS5 mechanism; a bigger cap means
+// fewer `write()` syscalls per MB under burst, while the soft cap still
+// bounds the transient per-slot buffer (a single oversized frame is still
+// written whole). The cap is read once per slot driver below.
 
 /// Backstop write timeout. Primary dead-peer detection is the kernel's
 /// `TCP_USER_TIMEOUT` (10 s) + keepalive layered in
@@ -445,6 +445,30 @@ fn make_slot(
     })
 }
 
+/// Coalesce the just-received `first` frame with any frames ALREADY
+/// waiting in `rx`, concatenating their bytes into one buffer until it
+/// reaches `cap` (a soft cap — a frame that crosses the boundary is still
+/// appended whole) or the queue drains. `try_recv` never blocks, so this
+/// only pulls frames that are already queued and adds no latency of its
+/// own; it just lets a bulk burst go out in one `write_all` so TCP
+/// segments fill and the per-MB `write()` syscall count drops. The frames
+/// are already `[u16 len][payload]`, so concatenating them is exactly the
+/// byte stream the Remote's `read_exact` decoder expects.
+///
+/// Pulled out of `slot_driver` as a free function so the coalescing ratio
+/// (writes per MB as a function of `cap`) is unit-testable without a live
+/// TCP connection.
+fn coalesce_drain(first: Vec<u8>, rx: &mut mpsc::Receiver<Vec<u8>>, cap: usize) -> Vec<u8> {
+    let mut buf = first;
+    while buf.len() < cap {
+        match rx.try_recv() {
+            Ok(more) => buf.extend_from_slice(&more),
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 /// One slot's lifecycle: connect (with backoff on failure), drain framed
 /// payloads to the TCP stream, and reconnect on write error — forever,
 /// until the queue closes (slot removed) or the stop watch fires.
@@ -474,6 +498,9 @@ async fn slot_driver(
     // backstop the explicit stores can't reach.
     let health = HealthGuard::new(healthy);
     let mut consecutive_failures: u32 = 0;
+    // Operator-tunable bulk-coalesce soft cap (default 256 KiB), read once
+    // per driver. Only consulted on the `WriteStrategy::Coalesce` path.
+    let coalesce_cap = crate::perf::socks5_coalesce_bytes();
     loop {
         if *stop_rx.borrow() {
             return;
@@ -583,16 +610,7 @@ async fn slot_driver(
                     // latency of its own.
                     let writebuf = match profile.write {
                         WriteStrategy::PerFrame => first,
-                        WriteStrategy::Coalesce => {
-                            let mut buf = first;
-                            while buf.len() < COALESCE_SOFT_CAP {
-                                match rx.try_recv() {
-                                    Ok(more) => buf.extend_from_slice(&more),
-                                    Err(_) => break,
-                                }
-                            }
-                            buf
-                        }
+                        WriteStrategy::Coalesce => coalesce_drain(first, &mut rx, coalesce_cap),
                     };
                     // A write error OR a backstop timeout is treated as a
                     // FATAL stream error. `write_all` may have already put
@@ -770,6 +788,15 @@ async fn open_socks5_connection(
     // application no longer tears down a connection on a short write
     // timeout — see `perf::tune_socks5_tcp_socket`.
     crate::perf::tune_socks5_tcp_socket(&stream, "socks5/client-out", profile.keepalive);
+    // v2.2.0: force-size the send/receive buffers on the SOCKS5 upload
+    // socket exactly like every other data-path socket. Before this, the
+    // SOCKS5 TCP sockets were the only data-path sockets left on kernel
+    // defaults, so the upload's in-flight window could not open on a
+    // high-bandwidth × high-RTT path (the "TCP RWIN" ceiling). With
+    // CAP_NET_ADMIN the *BUFFORCE path pins the full size immediately so
+    // the bulk upload window is available from the first byte rather than
+    // waiting on TCP autotuning to ramp.
+    crate::perf::tune_socket(&stream, "socks5/client-out");
     let has_auth = target.username.as_deref().is_some_and(|s| !s.is_empty())
         && target.password.as_deref().is_some_and(|s| !s.is_empty());
     handshake_greeting(&mut stream, has_auth).await?;
@@ -1159,6 +1186,42 @@ mod tests {
         // Cap holds for any larger failure count.
         assert_eq!(backoff_for_failures(5), Duration::from_millis(8000));
         assert_eq!(backoff_for_failures(99), Duration::from_millis(8000));
+    }
+
+    #[test]
+    fn coalesce_drain_cuts_writes_per_mb_with_a_bigger_cap() {
+        // The point of the v2.2.0 coalesce-cap bump: under a bursty
+        // producer, a bigger cap drains more queued frames into each
+        // write_all, so the number of writes (≈ write() syscalls / TCP
+        // segments) per MB drops. This is the deterministic, runner-
+        // independent half of "measurably faster" — counted, not timed.
+        fn writes_for(frame_len: usize, n_frames: usize, cap: usize) -> (usize, usize) {
+            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(n_frames + 1);
+            for _ in 0..n_frames {
+                tx.try_send(vec![0u8; frame_len]).expect("prefill queue");
+            }
+            drop(tx);
+            let mut writes = 0usize;
+            let mut bytes = 0usize;
+            while let Ok(first) = rx.try_recv() {
+                let buf = coalesce_drain(first, &mut rx, cap);
+                bytes += buf.len();
+                writes += 1;
+            }
+            (writes, bytes)
+        }
+        let frame = 1400; // ~MTU-sized framed payload
+        let n = 2000; // ~2.8 MB of bulk
+        let (small_writes, small_bytes) = writes_for(frame, n, 64 * 1024); // historical cap
+        let (big_writes, big_bytes) = writes_for(frame, n, 256 * 1024); // v2.2.0 default
+        // No frame is ever dropped — both move the full byte count.
+        assert_eq!(small_bytes, n * frame);
+        assert_eq!(big_bytes, n * frame);
+        // 4× the cap ⇒ ~4× fewer writes; assert a conservative ≥3×.
+        assert!(
+            small_writes >= 3 * big_writes,
+            "expected the bigger coalesce cap to cut writes/MB ≥3×: small={small_writes} big={big_writes}"
+        );
     }
 
     #[test]
