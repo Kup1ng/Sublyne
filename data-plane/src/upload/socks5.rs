@@ -290,8 +290,7 @@ impl Socks5Upload {
         // it. The latency ICMP-SOCKS5 (PerFrame) mechanisms stay sticky so
         // a low-rate trickle isn't split across uplinks of differing
         // latency.
-        let stripe =
-            profile.write == WriteStrategy::Coalesce && crate::perf::socks5_stripe();
+        let stripe = profile.write == WriteStrategy::Coalesce && crate::perf::socks5_stripe();
 
         let upload = Self {
             tunnel_id,

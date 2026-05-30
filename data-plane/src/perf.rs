@@ -166,10 +166,10 @@ pub fn socks5_stripe() -> bool {
 
 fn resolve_socks5_stripe() -> bool {
     match env::var(ENV_SOCKS5_STRIPE) {
-        Ok(s) => !matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
+        }
         Err(_) => true,
     }
 }
