@@ -439,7 +439,11 @@ func buildSpec(t tunnels.Tunnel, proxy *socks5.Proxy) (ipc.TunnelSpec, error) {
 		if t.DownloadReceivePort.Int64 < 0 || t.DownloadReceivePort.Int64 > 65535 {
 			return spec, errors.New("download_receive_port out of range")
 		}
-		spec.LocalListenAddr = t.LocalListenAddr.String
+		listenAddr, err := appAddr(t.LocalListenAddr.String, t.Ports)
+		if err != nil {
+			return spec, fmt.Errorf("client tunnel local_listen_addr: %w", err)
+		}
+		spec.LocalListenAddr = listenAddr
 		spec.UploadTargetAddr = t.UploadTargetAddr.String
 		spec.DownloadReceivePort = uint16(t.DownloadReceivePort.Int64) //nolint:gosec // bounded above
 		// Mutually exclusive upload paths: a Client tunnel either
@@ -511,7 +515,11 @@ func buildSpec(t tunnels.Tunnel, proxy *socks5.Proxy) (ipc.TunnelSpec, error) {
 			return spec, errors.New("download_send_port out of range")
 		}
 		spec.UploadListenAddr = t.UploadListenAddr.String
-		spec.ForwardTarget = t.ForwardTarget.String
+		forwardAddr, err := appAddr(t.ForwardTarget.String, t.Ports)
+		if err != nil {
+			return spec, fmt.Errorf("remote tunnel forward_target: %w", err)
+		}
+		spec.ForwardTarget = forwardAddr
 		spec.DownloadSendPort = uint16(t.DownloadSendPort.Int64) //nolint:gosec // bounded above
 		spec.ClientRealIP = t.ClientRealIP.String
 		// Default to 'udp' so a Remote row without an explicit value

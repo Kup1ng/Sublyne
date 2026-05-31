@@ -56,11 +56,12 @@ func TestApply_RecordsVersionRow(t *testing.T) {
 	if err := conn.QueryRowContext(ctx, "SELECT MAX(version) FROM schema_version").Scan(&max); err != nil {
 		t.Fatalf("query schema_version: %v", err)
 	}
-	// Bumped to 10 when v2.5.0 multi-port tunnels added
-	// 0010_multiport.sql (adds tunnels.ports). Future phases that add a
-	// migration should bump this in lockstep.
-	if !max.Valid || max.Int64 != 10 {
-		t.Errorf("max(version) = %v valid=%v, want 10", max.Int64, max.Valid)
+	// Bumped to 11 when v2.7.0 unified the application-port list and
+	// stripped the port off local_listen_addr / forward_target
+	// (0011_unified_ports.sql). Future phases that add a migration should
+	// bump this in lockstep.
+	if !max.Valid || max.Int64 != 11 {
+		t.Errorf("max(version) = %v valid=%v, want 11", max.Int64, max.Valid)
 	}
 }
 
@@ -180,6 +181,110 @@ func TestLoad_DiscoversEmbeddedFiles(t *testing.T) {
 	for i := 1; i < len(ms); i++ {
 		if ms[i].version <= ms[i-1].version {
 			t.Errorf("versions not strictly increasing: %d then %d", ms[i-1].version, ms[i].version)
+		}
+	}
+}
+
+// migrationSQL returns the raw SQL body of the embedded migration with
+// the given version, so a test can replay it against rows seeded in the
+// PRE-migration shape. Apply() runs all migrations up front, so we can't
+// observe a data migration's effect on rows inserted afterwards — instead
+// we seed v2.6.0-shaped rows and replay the data migration's body.
+func migrationSQL(t *testing.T, version int) string {
+	t.Helper()
+	ms, err := load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for _, m := range ms {
+		if m.version == version {
+			return m.sql
+		}
+	}
+	t.Fatalf("migration version %d not found", version)
+	return ""
+}
+
+// TestApply_UnifiedPorts_FoldsMainPortAndStripsAddr verifies the v2.7.0
+// data migration (0011): the port embedded in local_listen_addr (Client) /
+// forward_target (Remote) is folded into the `ports` CSV and stripped off
+// the address, across IPv4 / bracketed-IPv6 / hostname and single- /
+// multi-port shapes. This is the "existing tunnels migrate silently" test.
+func TestApply_UnifiedPorts_FoldsMainPortAndStripsAddr(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDB(t)
+	if err := Apply(ctx, conn); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Seed rows in the v2.6.0 shape: the app port lives inside the address
+	// string, `ports` is empty for single-port and the full set (including
+	// the canonical port) for multi-port.
+	seedClient := func(name, localListen, ports string) {
+		t.Helper()
+		if _, err := conn.ExecContext(ctx, `INSERT INTO tunnels
+			(name, role, psk, download_spoof_source_ip, download_spoof_source_port,
+			 download_transport, local_listen_addr, download_receive_port, ports)
+			VALUES (?, 'client', 'psk-example-32-chars-aaaaaaaaaa', '203.0.113.5', 443,
+			        'udp', ?, 8443, ?)`, name, localListen, ports); err != nil {
+			t.Fatalf("seed client %s: %v", name, err)
+		}
+	}
+	seedRemote := func(name, forwardTarget, ports string) {
+		t.Helper()
+		if _, err := conn.ExecContext(ctx, `INSERT INTO tunnels
+			(name, role, psk, download_spoof_source_ip, download_spoof_source_port,
+			 download_transport, upload_listen_addr, forward_target, download_send_port,
+			 client_real_ip, ports)
+			VALUES (?, 'remote', 'psk-example-32-chars-bbbbbbbbbb', '203.0.113.5', 443,
+			        'udp', '0.0.0.0:55555', ?, 8443, '198.51.100.20', ?)`,
+			name, forwardTarget, ports); err != nil {
+			t.Fatalf("seed remote %s: %v", name, err)
+		}
+	}
+
+	seedClient("c-v4-single", "0.0.0.0:44443", "")
+	seedClient("c-v6-single", "[::]:44443", "")
+	seedClient("c-v4-multi", "0.0.0.0:44443", "44443,8001,8002")
+	seedRemote("r-v4-single", "127.0.0.1:5201", "")
+	seedRemote("r-v6-single", "[2001:db8::1]:5201", "")
+	seedRemote("r-host-single", "example.com:443", "")
+	seedRemote("r-v4-multi", "192.0.2.10:443", "443,8443")
+
+	// Replay the 0011 data migration against the seeded rows.
+	if _, err := conn.ExecContext(ctx, migrationSQL(t, 11)); err != nil {
+		t.Fatalf("replay 0011: %v", err)
+	}
+
+	type want struct {
+		role  string
+		addr  string // local_listen_addr (client) or forward_target (remote)
+		ports string
+	}
+	cases := map[string]want{
+		"c-v4-single":   {"client", "0.0.0.0", "44443"},
+		"c-v6-single":   {"client", "::", "44443"},
+		"c-v4-multi":    {"client", "0.0.0.0", "44443,8001,8002"},
+		"r-v4-single":   {"remote", "127.0.0.1", "5201"},
+		"r-v6-single":   {"remote", "2001:db8::1", "5201"},
+		"r-host-single": {"remote", "example.com", "443"},
+		"r-v4-multi":    {"remote", "192.0.2.10", "443,8443"},
+	}
+	for name, w := range cases {
+		var addr, ports string
+		col := "local_listen_addr"
+		if w.role == "remote" {
+			col = "forward_target"
+		}
+		if err := conn.QueryRowContext(ctx,
+			"SELECT "+col+", ports FROM tunnels WHERE name = ?", name).Scan(&addr, &ports); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if addr != w.addr {
+			t.Errorf("%s: %s = %q, want %q", name, col, addr, w.addr)
+		}
+		if ports != w.ports {
+			t.Errorf("%s: ports = %q, want %q", name, ports, w.ports)
 		}
 	}
 }

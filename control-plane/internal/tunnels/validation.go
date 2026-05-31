@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-// MaxPortsPerTunnel is the hard cap on how many application ports a
-// single multi-port tunnel may carry (PRD / IMPL_SPEC §1: typical 5–10,
-// hard cap 32). The list is the FULL authoritative set, INCLUDING the
-// canonical port already present in local_listen_addr / forward_target.
+// MaxPortsPerTunnel is the hard cap on how many application ports a single
+// tunnel may carry (PRD / IMPL_SPEC §1: typical 5–10, hard cap 32). Since
+// v2.7.0 the list is the single source of truth for the tunnel's ports —
+// local_listen_addr / forward_target carry only a host.
 const MaxPortsPerTunnel = 32
 
 // ValidationError carries a flat list of per-field problems so the API
@@ -128,11 +129,10 @@ func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, exist
 		validateRemoteFields(t, ve)
 	}
 
-	// Multi-port list rules (v2.5.0). Only enforced when the operator
-	// supplied a list; an empty list is the legacy single-port marker and
-	// validates exactly like v2.4.0. The list is the FULL authoritative
-	// set and must contain the canonical port (the port of
-	// local_listen_addr for Client / forward_target for Remote).
+	// Unified application-port list (v2.7.0). Every tunnel carries at least
+	// one port; all ports live together in t.Ports with a fixed 1:1
+	// same-number mapping between Client and Remote. validatePorts sorts the
+	// list in place so storage and the rebuilt IPC address are deterministic.
 	validatePorts(t, ve)
 
 	// Port-conflict scan. This is best-effort even when the field-level
@@ -155,9 +155,9 @@ func validateClientFields(t *Tunnel, ve *ValidationError) {
 	// interface (0.0.0.0 means "all"), port is what the end-user
 	// device connects to.
 	if !t.LocalListenAddr.Valid || strings.TrimSpace(t.LocalListenAddr.String) == "" {
-		ve.Fields["local_listen_addr"] = "Local listen address is required for client tunnels (e.g. 0.0.0.0:443)."
-	} else if _, _, err := splitHostPort(t.LocalListenAddr.String); err != nil {
-		ve.Fields["local_listen_addr"] = "Local listen address must be host:port, e.g. 0.0.0.0:443."
+		ve.Fields["local_listen_addr"] = "Local listen address is required for client tunnels (e.g. 0.0.0.0)."
+	} else if err := validateHost(t.LocalListenAddr.String); err != nil {
+		ve.Fields["local_listen_addr"] = "Local listen address " + err.Error()
 	}
 
 	if !t.DownloadReceivePort.Valid {
@@ -245,9 +245,9 @@ func validateRemoteFields(t *Tunnel, ve *ValidationError) {
 	}
 
 	if !t.ForwardTarget.Valid || strings.TrimSpace(t.ForwardTarget.String) == "" {
-		ve.Fields["forward_target"] = "Forward target is required for remote tunnels (the proxy panel's host:port)."
-	} else if _, _, err := splitHostPort(t.ForwardTarget.String); err != nil {
-		ve.Fields["forward_target"] = "Forward target must be host:port, e.g. 127.0.0.1:5201."
+		ve.Fields["forward_target"] = "Forward target is required for remote tunnels (the proxy panel's host/IP, e.g. 127.0.0.1)."
+	} else if err := validateHost(t.ForwardTarget.String); err != nil {
+		ve.Fields["forward_target"] = "Forward target " + err.Error()
 	}
 
 	if !t.DownloadSendPort.Valid {
@@ -311,26 +311,15 @@ func listenMatrixMessage(t Transport) string {
 	}
 }
 
-// canonicalPort returns the tunnel's primary application port — the port
-// of local_listen_addr for a Client, of forward_target for a Remote —
-// and ok=false when that address is unset or malformed (the field-level
-// validator already flags those cases).
-func canonicalPort(t *Tunnel) (int, bool) {
-	switch t.Role {
-	case RoleClient:
-		return portFromAddr(t.LocalListenAddr.String)
-	case RoleRemote:
-		return portFromAddr(t.ForwardTarget.String)
-	}
-	return 0, false
-}
-
-// validatePorts enforces the multi-port list rules from IMPL_SPEC §5A.3:
-// each port in 1..65535, no duplicates, at most MaxPortsPerTunnel, and
-// the canonical port must be a member of the list. An empty list is the
-// legacy single-port marker and skips every check.
+// validatePorts enforces the unified application-port list rules (v2.7.0):
+// the list is REQUIRED (every tunnel carries at least one port), each port
+// is in 1..65535, no duplicates, and at most MaxPortsPerTunnel. It sorts
+// the list in place so storage and the rebuilt IPC address are
+// deterministic — order is irrelevant to forwarding (every port is a
+// first-class peer, identically optimised).
 func validatePorts(t *Tunnel, ve *ValidationError) {
 	if len(t.Ports) == 0 {
+		ve.Fields["ports"] = "At least one port is required."
 		return
 	}
 	if len(t.Ports) > MaxPortsPerTunnel {
@@ -349,13 +338,7 @@ func validatePorts(t *Tunnel, ve *ValidationError) {
 		}
 		seen[p] = struct{}{}
 	}
-	// The canonical port (local_listen_addr / forward_target) must be in
-	// the set so the two sides agree on the full authoritative list.
-	if cp, ok := canonicalPort(t); ok {
-		if _, member := seen[cp]; !member {
-			ve.Fields["ports"] = fmt.Sprintf("The main port %d must be included in the port list.", cp)
-		}
-	}
+	sort.Ints(t.Ports)
 }
 
 func checkPortConflicts(ctx context.Context, repo *Repo, t *Tunnel, existingID int64, ve *ValidationError) error {
@@ -366,20 +349,18 @@ func checkPortConflicts(ctx context.Context, repo *Repo, t *Tunnel, existingID i
 
 	switch t.Role {
 	case RoleClient:
-		if port, ok := portFromAddr(t.LocalListenAddr.String); ok {
-			if owner, taken := occupied[port]; taken {
-				ve.Fields["local_listen_addr"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
-			}
-		}
+		// download_receive_port is a bind port too: it must be free across
+		// tunnels and must differ from this tunnel's own application ports.
 		if t.DownloadReceivePort.Valid {
 			port := int(t.DownloadReceivePort.Int64)
 			if owner, taken := occupied[port]; taken {
 				ve.Fields["download_receive_port"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
 			}
-			// Also catch the case where the new tunnel itself reuses
-			// local_listen_addr's port as download_receive_port.
-			if localPort, ok := portFromAddr(t.LocalListenAddr.String); ok && localPort == port {
-				ve.Fields["download_receive_port"] = "Download receive port must differ from local listen port."
+			for _, p := range t.Ports {
+				if p == port {
+					ve.Fields["download_receive_port"] = "Download receive port must differ from the application ports."
+					break
+				}
 			}
 		}
 	case RoleRemote:
@@ -390,19 +371,15 @@ func checkPortConflicts(ctx context.Context, repo *Repo, t *Tunnel, existingID i
 		}
 	}
 
-	// Multi-port app ports (v2.5.0). The set a tunnel occupies is
-	// (canonical port UNION Ports); the canonical port is the
-	// local_listen / forward_target port already checked above, so here
-	// we additionally check every OTHER member of the list. A clash on a
-	// list member is reported against the `ports` field. Single-port
-	// tunnels (empty Ports) skip this entirely, so their behaviour is
-	// byte-for-byte unchanged.
-	if len(t.Ports) > 0 {
-		canonical, hasCanonical := canonicalPort(t)
+	// Application ports. On a Client these are bind listeners (one UDP
+	// socket per port), so they must be unique across tunnels; a clash is
+	// reported on the `ports` field. On a Remote the application ports are
+	// FORWARD destinations — several tunnels may legitimately forward to the
+	// same upstream port — so they are not treated as exclusive, matching
+	// pre-v2.7.0 single-port behaviour where forward_target's port was never
+	// conflict-scanned.
+	if t.Role == RoleClient {
 		for _, port := range t.Ports {
-			if hasCanonical && port == canonical {
-				continue // already checked via local_listen_addr / forward_target
-			}
 			if owner, taken := occupied[port]; taken {
 				ve.Fields["ports"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
 				break
@@ -431,13 +408,6 @@ func collectOccupiedPorts(ctx context.Context, repo *Repo, excludeID int64) (map
 		if row.ID == excludeID {
 			continue
 		}
-		if row.LocalListenAddr.Valid {
-			if p, ok := portFromAddr(row.LocalListenAddr.String); ok {
-				if _, exists := occupied[p]; !exists {
-					occupied[p] = occupiedPort{name: row.Name, field: "local listen port"}
-				}
-			}
-		}
 		if row.DownloadReceivePort.Valid {
 			p := int(row.DownloadReceivePort.Int64)
 			if _, exists := occupied[p]; !exists {
@@ -451,14 +421,16 @@ func collectOccupiedPorts(ctx context.Context, repo *Repo, excludeID int64) (map
 				}
 			}
 		}
-		// Multi-port app ports (v2.5.0). When a row carries a port list,
-		// every member of that list (canonical port included) is occupied
-		// by the row, so a later tunnel sharing ANY of them is rejected.
-		// Single-port rows have an empty Ports list and contribute nothing
-		// here, keeping the legacy scan byte-for-byte identical.
-		for _, p := range row.Ports {
-			if _, exists := occupied[p]; !exists {
-				occupied[p] = occupiedPort{name: row.Name, field: "tunnel port"}
+		// Application ports occupy a bind port only on a CLIENT (one
+		// listener per port). A Remote's ports are forward destinations and
+		// may be shared between tunnels, so they are not registered as
+		// occupied. Since each server hosts one role, this naturally scans
+		// client app ports on a Client box and skips them on a Remote box.
+		if row.Role == RoleClient {
+			for _, p := range row.Ports {
+				if _, exists := occupied[p]; !exists {
+					occupied[p] = occupiedPort{name: row.Name, field: "tunnel port"}
+				}
 			}
 		}
 	}
@@ -474,6 +446,27 @@ func checkIP(s string) error {
 		return errors.New("must be a valid IPv4 or IPv6 address.")
 	}
 	return nil
+}
+
+// validateHost checks a bare host/IP address that carries NO port.
+// local_listen_addr (Client) and forward_target (Remote) hold only a host
+// since v2.7.0 — the application ports live in the unified Ports list. The
+// host must be a literal IP (the dataplane binds / forwards with a numeric
+// SocketAddr) or the wildcard 0.0.0.0 / ::. Including a port is the most
+// common post-refactor mistake, so it gets a teaching message that points
+// at the Ports field.
+func validateHost(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return errors.New("is required.")
+	}
+	if _, err := netip.ParseAddr(s); err == nil {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(s); err == nil {
+		return errors.New("must not include a port — list the port(s) in the Ports field.")
+	}
+	return errors.New("must be a valid IP address, e.g. 0.0.0.0 or 127.0.0.1.")
 }
 
 // splitHostPort accepts either bracketed IPv6 (`[::1]:443`) or

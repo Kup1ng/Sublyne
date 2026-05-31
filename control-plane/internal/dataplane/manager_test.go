@@ -11,6 +11,9 @@ import (
 )
 
 func TestBuildSpec_Client(t *testing.T) {
+	// v2.7.0: local_listen_addr is host-only; the application port lives
+	// in Ports. appAddr joins host + Ports[0] to rebuild the host:port the
+	// dataplane parses.
 	tun := tunnels.Tunnel{
 		ID:                      42,
 		Name:                    "c1",
@@ -22,7 +25,8 @@ func TestBuildSpec_Client(t *testing.T) {
 		MTU:                     1400,
 		MaxConnections:          50000,
 		IdleTimeout:             300,
-		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0:5001"},
+		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0"},
+		Ports:                   []int{44443},
 		DownloadReceivePort:     sql.NullInt64{Valid: true, Int64: 8443},
 		UploadTargetAddr:        sql.NullString{Valid: true, String: "198.51.100.10:55555"},
 		WGConfigID:              sql.NullInt64{Valid: true, Int64: 1},
@@ -34,7 +38,7 @@ func TestBuildSpec_Client(t *testing.T) {
 	if spec.ID != 42 || spec.Role != "client" || spec.Name != "c1" {
 		t.Errorf("scalar fields wrong: %+v", spec)
 	}
-	if spec.LocalListenAddr != "0.0.0.0:5001" {
+	if spec.LocalListenAddr != "0.0.0.0:44443" {
 		t.Errorf("local_listen_addr: %q", spec.LocalListenAddr)
 	}
 	if spec.UploadTargetAddr != "198.51.100.10:55555" {
@@ -43,6 +47,10 @@ func TestBuildSpec_Client(t *testing.T) {
 	if spec.DownloadReceivePort != 8443 {
 		t.Errorf("download_receive_port: %d", spec.DownloadReceivePort)
 	}
+	// Single-port tunnel stays wire-identical: no Ports array on the wire.
+	if len(spec.Ports) != 0 {
+		t.Errorf("single-port spec must not carry Ports, got %v", spec.Ports)
+	}
 	// 0x1000 | (42 & 0xfff) = 0x102a = 4138.
 	if spec.WireguardFwmark != 0x102a {
 		t.Errorf("fwmark: 0x%x (want 0x102a)", spec.WireguardFwmark)
@@ -50,6 +58,8 @@ func TestBuildSpec_Client(t *testing.T) {
 }
 
 func TestBuildSpec_Remote(t *testing.T) {
+	// v2.7.0: forward_target is host-only; the application port lives in
+	// Ports. upload_listen_addr stays host:port.
 	tun := tunnels.Tunnel{
 		ID:                      9,
 		Name:                    "r1",
@@ -62,7 +72,8 @@ func TestBuildSpec_Remote(t *testing.T) {
 		MaxConnections:          50000,
 		IdleTimeout:             300,
 		UploadListenAddr:        sql.NullString{Valid: true, String: "0.0.0.0:8001"},
-		ForwardTarget:           sql.NullString{Valid: true, String: "127.0.0.1:5201"},
+		ForwardTarget:           sql.NullString{Valid: true, String: "127.0.0.1"},
+		Ports:                   []int{5201},
 		DownloadSendPort:        sql.NullInt64{Valid: true, Int64: 5001},
 		ClientRealIP:            sql.NullString{Valid: true, String: "198.51.100.20"},
 	}
@@ -84,6 +95,35 @@ func TestBuildSpec_Remote(t *testing.T) {
 	}
 }
 
+func TestBuildSpec_LegacyEmbeddedPort(t *testing.T) {
+	// appAddr tolerates a legacy host:port still sitting in the address
+	// field when Ports is empty (a pre-0011 or hand-edited row), preserving
+	// the embedded port so correctness never hinges on the migration's
+	// string parsing. Production rows always carry Ports after 0011.
+	tun := tunnels.Tunnel{
+		ID:                      43,
+		Name:                    "legacy",
+		Role:                    tunnels.RoleClient,
+		PSK:                     "psk",
+		DownloadSpoofSourceIP:   "203.0.113.5",
+		DownloadSpoofSourcePort: 443,
+		DownloadTransport:       tunnels.TransportUDP,
+		MTU:                     1400,
+		MaxConnections:          50000,
+		IdleTimeout:             300,
+		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0:44443"},
+		DownloadReceivePort:     sql.NullInt64{Valid: true, Int64: 8443},
+		UploadTargetAddr:        sql.NullString{Valid: true, String: "198.51.100.10:55555"},
+	}
+	spec, err := buildSpec(tun, nil)
+	if err != nil {
+		t.Fatalf("buildSpec: %v", err)
+	}
+	if spec.LocalListenAddr != "0.0.0.0:44443" {
+		t.Errorf("local_listen_addr: %q, want 0.0.0.0:44443", spec.LocalListenAddr)
+	}
+}
+
 func TestBuildSpec_ClientSocks5UploadCarriesProxy(t *testing.T) {
 	// Phase R9a: a Client tunnel with UploadMode='socks5' must carry a
 	// Socks5Target on the wire and NOT a WireguardFwmark (mutually
@@ -100,7 +140,8 @@ func TestBuildSpec_ClientSocks5UploadCarriesProxy(t *testing.T) {
 		MTU:                     1400,
 		MaxConnections:          50000,
 		IdleTimeout:             300,
-		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0:5001"},
+		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0"},
+		Ports:                   []int{44443},
 		DownloadReceivePort:     sql.NullInt64{Valid: true, Int64: 8443},
 		UploadTargetAddr:        sql.NullString{Valid: true, String: "198.51.100.10:55555"},
 		UploadMode:              tunnels.UploadModeSocks5,
@@ -152,7 +193,8 @@ func TestBuildSpec_ClientSocks5RequiresProxy(t *testing.T) {
 		MTU:                     1400,
 		MaxConnections:          50000,
 		IdleTimeout:             300,
-		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0:5001"},
+		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0"},
+		Ports:                   []int{44443},
 		DownloadReceivePort:     sql.NullInt64{Valid: true, Int64: 8443},
 		UploadTargetAddr:        sql.NullString{Valid: true, String: "198.51.100.10:55555"},
 		UploadMode:              tunnels.UploadModeSocks5,
@@ -175,7 +217,8 @@ func TestBuildSpec_RemoteSocks5TcpListenMode(t *testing.T) {
 		MaxConnections:          50000,
 		IdleTimeout:             300,
 		UploadListenAddr:        sql.NullString{Valid: true, String: "0.0.0.0:8001"},
-		ForwardTarget:           sql.NullString{Valid: true, String: "127.0.0.1:5201"},
+		ForwardTarget:           sql.NullString{Valid: true, String: "127.0.0.1"},
+		Ports:                   []int{5201},
 		DownloadSendPort:        sql.NullInt64{Valid: true, Int64: 5001},
 		ClientRealIP:            sql.NullString{Valid: true, String: "198.51.100.20"},
 		UploadListenMode:        tunnels.UploadListenModeSocks5TCP,
@@ -192,7 +235,8 @@ func TestBuildSpec_RemoteSocks5TcpListenMode(t *testing.T) {
 func TestBuildSpec_MultiPortCarriesPorts(t *testing.T) {
 	// v2.5.0: a tunnel with >= 2 ports must carry the list on the wire as
 	// []uint16; a 0- or 1-element list must leave spec.Ports empty so the
-	// dataplane takes the byte-for-byte-identical single-port path.
+	// dataplane takes the byte-for-byte-identical single-port path. v2.7.0:
+	// local_listen_addr is host-only and appAddr derives host:Ports[0].
 	base := tunnels.Tunnel{
 		ID:                      42,
 		Name:                    "mp",
@@ -204,7 +248,7 @@ func TestBuildSpec_MultiPortCarriesPorts(t *testing.T) {
 		MTU:                     1400,
 		MaxConnections:          50000,
 		IdleTimeout:             300,
-		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0:8000"},
+		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0"},
 		DownloadReceivePort:     sql.NullInt64{Valid: true, Int64: 8443},
 		UploadTargetAddr:        sql.NullString{Valid: true, String: "198.51.100.10:55555"},
 		WGConfigID:              sql.NullInt64{Valid: true, Int64: 1},
@@ -216,30 +260,26 @@ func TestBuildSpec_MultiPortCarriesPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildSpec multi: %v", err)
 	}
+	// appAddr joins host + Ports[0]; the full list rides spec.Ports.
+	if spec.LocalListenAddr != "0.0.0.0:8000" {
+		t.Errorf("local_listen_addr = %q, want 0.0.0.0:8000", spec.LocalListenAddr)
+	}
 	if len(spec.Ports) != 3 || spec.Ports[0] != 8000 || spec.Ports[2] != 8002 {
 		t.Errorf("spec.Ports = %v, want [8000 8001 8002]", spec.Ports)
 	}
 
-	// Single-port: empty list => no Ports on the wire.
+	// Single-port: 1-element list => no Ports on the wire (wire-identical).
 	single := base
-	single.Ports = nil
+	single.Ports = []int{8000}
 	spec, err = buildSpec(single, nil)
 	if err != nil {
 		t.Fatalf("buildSpec single: %v", err)
 	}
+	if spec.LocalListenAddr != "0.0.0.0:8000" {
+		t.Errorf("single local_listen_addr = %q, want 0.0.0.0:8000", spec.LocalListenAddr)
+	}
 	if len(spec.Ports) != 0 {
 		t.Errorf("single-port spec must not carry Ports, got %v", spec.Ports)
-	}
-
-	// Defensive: a 1-element list is also single-port.
-	one := base
-	one.Ports = []int{8000}
-	spec, err = buildSpec(one, nil)
-	if err != nil {
-		t.Fatalf("buildSpec one: %v", err)
-	}
-	if len(spec.Ports) != 0 {
-		t.Errorf("1-element list must be treated as single-port, got %v", spec.Ports)
 	}
 }
 
@@ -324,7 +364,8 @@ func TestManager_UpdateNoSupervisorClient(t *testing.T) {
 		MTU:                     1400,
 		MaxConnections:          50000,
 		IdleTimeout:             300,
-		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0:5001"},
+		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0"},
+		Ports:                   []int{44443},
 		DownloadReceivePort:     sql.NullInt64{Valid: true, Int64: 8443},
 		UploadTargetAddr:        sql.NullString{Valid: true, String: "198.51.100.10:55555"},
 	}

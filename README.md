@@ -219,24 +219,33 @@ Sublyne hardens the SOCKS5 mode beyond the predecessor project:
 
 ---
 
-## Multi-port tunnels
+## Ports and multi-port tunnels
 
-A single tunnel can carry **several application ports** at once (up to
-32), with a fixed 1:1 same-number mapping — Client `:51820` ↔ Remote
-`:51820`, Client `:443` ↔ Remote `:443`, and so on. This lets you run,
-for example, WireGuard on one port, a VLESS/Reality service on another,
-and a third service through the **one** tunnel — one PSK, one session
-table, one download spoof path, one upload egress.
+Each tunnel's **Local listen address** (Client) and **Forward target**
+(Remote) are a host/IP only — e.g. `0.0.0.0` or `192.0.2.10`, no port.
+Every port the tunnel carries lives in a single **Ports** field: one
+comma-separated list, e.g. `443, 8001, 8002`. A single port is an
+ordinary one-service tunnel; list several to carry multiple services
+over the **one** tunnel — one PSK, one session table, one download
+spoof path, one upload egress. Every port is forwarded identically;
+there is no special "main" port.
+
+Ports use a fixed 1:1 same-number mapping — Client `:51820` ↔ Remote
+`:51820`, Client `:443` ↔ Remote `:443`, and so on (up to 32 ports).
+This lets you run, for example, WireGuard on one port, a VLESS/Reality
+service on another, and a third service through the same tunnel.
 
 Each forwarded datagram of a multi-port tunnel carries a 2-byte
 app-port tag *inside* the HMAC-authenticated payload, so the receiver
 can demultiplex it to the right service (and drop anything addressed to
-a port not in the configured set). Enter the extra ports in the tunnel
-form; the same list is used on both the Iran and foreign side.
+a port not in the configured set). The same **Ports** list is used on
+both the Iran and foreign side.
 
 This is **backward compatible**: a single-port tunnel is wire-identical
 to before (no tag), `PROTO_VERSION` is unchanged, and existing tunnels
-need no changes. See [`docs/multiport.md`](docs/multiport.md) for the
+need no changes. Tunnels created before v2.7.0 migrate automatically on
+upgrade: the old main port is folded into the **Ports** list and the
+address is trimmed to a host, with no change to the packets on the wire. See [`docs/multiport.md`](docs/multiport.md) for the
 wire design, the all-six-transport matrix, and the migration story.
 
 ---
