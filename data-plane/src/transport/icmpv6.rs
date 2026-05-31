@@ -28,7 +28,7 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use super::{internet_checksum, ParsedInbound};
+use super::{internet_checksum_pieces, ParsedInbound};
 use crate::spec::IcmpEchoMode;
 
 pub const IPV6_HDR_LEN: usize = 40;
@@ -94,14 +94,17 @@ pub fn build_packet(
     // ICMPv6 checksum (RFC 4443) — covers an IPv6 pseudo-header plus
     // the entire ICMPv6 message. Unlike ICMPv4, the pseudo-header is
     // mandatory.
-    let pseudo_len = 16 + 16 + 4 + 4;
-    let mut pseudo: Vec<u8> = Vec::with_capacity(pseudo_len + icmpv6_len);
-    pseudo.extend_from_slice(&src_ip.octets());
-    pseudo.extend_from_slice(&dst_ip.octets());
-    pseudo.extend_from_slice(&(icmpv6_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0u8, 0, 0, IP_PROTO_ICMPV6]);
-    pseudo.extend_from_slice(&out[IPV6_HDR_LEN..]);
-    let checksum = match internet_checksum(&pseudo) {
+    // Stream the IPv6 pseudo-header + the ICMPv6 message through the
+    // no-alloc checksum helper rather than copying the whole message into a
+    // freshly-allocated scratch Vec on every packet. Matches the UDP/TCP
+    // builders (the IPv4 ICMP builder needs no pseudo-header at all).
+    let checksum = match internet_checksum_pieces(&[
+        &src_ip.octets(),
+        &dst_ip.octets(),
+        &(icmpv6_len as u32).to_be_bytes(),
+        &[0u8, 0, 0, IP_PROTO_ICMPV6],
+        &out[IPV6_HDR_LEN..],
+    ]) {
         0 => 0xFFFF,
         v => v,
     };
@@ -157,6 +160,14 @@ pub fn open_raw_icmpv6_send_socket() -> io::Result<Socket> {
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "raw-icmpv6/send");
+    // See open_raw_icmp_send_socket: the kernel copies every matching ICMPv6
+    // packet onto this never-read send fd, pinning the forced 4 MiB recv
+    // buffer and dropping unrelated inbound ICMPv6. Attach the same drop-all
+    // BPF filter the UDP/TCP send sockets use.
+    if let Err(e) = super::attach_drop_all_filter(&sock) {
+        tracing::warn!(err = %e,
+            "raw-icmpv6/send: attach drop-all BPF filter failed; recv queue may accumulate");
+    }
     Ok(sock)
 }
 

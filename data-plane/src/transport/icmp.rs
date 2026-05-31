@@ -193,6 +193,15 @@ pub fn open_raw_icmp_send_socket() -> io::Result<Socket> {
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "raw-icmp/send");
+    // The kernel delivers a copy of every ICMP packet on the host to this
+    // raw send socket (`raw_local_deliver`); we never read it, so without a
+    // drop-all BPF filter the recv queue grows to the forced 4 MiB SO_RCVBUF
+    // and the kernel then silently drops new inbound ICMP. Same one-BPF-
+    // instruction guard the UDP/TCP send sockets already carry.
+    if let Err(e) = super::attach_drop_all_filter(&sock) {
+        tracing::warn!(err = %e,
+            "raw-icmp/send: attach drop-all BPF filter failed; recv queue may accumulate");
+    }
     Ok(sock)
 }
 
