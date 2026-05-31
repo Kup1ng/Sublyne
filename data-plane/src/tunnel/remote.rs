@@ -1093,7 +1093,10 @@ async fn download_seal_worker(
     // this worker; the per-packet `packet_buf` has to be freshly
     // allocated because it moves through the channel to the send
     // worker.
-    let mut sealed_scratch: Vec<u8> = Vec::with_capacity(initial_mtu + crate::hmac::OVERHEAD);
+    // +PORT_TAG_LEN so a full-MTU multi-port reply (tag + body, sealed)
+    // fits without a one-time per-worker realloc; harmless for single-port.
+    let mut sealed_scratch: Vec<u8> =
+        Vec::with_capacity(initial_mtu + crate::hmac::OVERHEAD + crate::multiport::PORT_TAG_LEN);
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {

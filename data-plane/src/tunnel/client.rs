@@ -489,8 +489,8 @@ async fn spawn_download_pipeline(
     // One bounded channel per worker. The recv task routes jobs by
     // `seq % workers` so each worker only ever sees seqs from its own
     // arithmetic subset — each worker therefore owns a private
-    // `SeqWindow` with NO cross-worker lock, AND the 128-bit bitmap
-    // covers `128 * workers` consecutive wire-seqs of reordering
+    // `SeqWindow` with NO cross-worker lock, AND the 1024-slot bitmap
+    // covers `1024 * workers` consecutive wire-seqs of reordering
     // headroom (more than enough at our packet rate).
     let mut worker_txs: Vec<mpsc::Sender<DownloadVerifyJob>> = Vec::with_capacity(workers);
     let mut worker_rxs: Vec<mpsc::Receiver<DownloadVerifyJob>> = Vec::with_capacity(workers);
