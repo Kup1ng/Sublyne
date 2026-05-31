@@ -61,6 +61,16 @@ pub struct TunnelMetrics {
     pub auth_drops: AtomicU64,
     /// Session-table-full rejections of new upload sessions.
     pub session_rejects: AtomicU64,
+    /// Download egress shed on the Remote under burst: seal-worker channel
+    /// full (`record_seal_drop`) or send-queue full (`record_send_drop`).
+    /// Folded into `packet_loss_estimate` so the panel surfaces bursty
+    /// download-path shedding that used to be only a log line.
+    pub seal_drops: AtomicU64,
+    pub send_drops: AtomicU64,
+    /// Client upload frames dropped before the wire (SOCKS5 pool saturated
+    /// or a forward send error). Counted so a dropped frame is not also
+    /// recorded as a delivered upload byte.
+    pub upload_drops: AtomicU64,
 
     /// Last packet-received Unix timestamp. PRD §2.4: drives
     /// Healthy/Idle/Down badges (≤60 s healthy, 60-300 idle, >300 down).
@@ -129,6 +139,9 @@ impl TunnelMetrics {
             packets_out: AtomicU64::new(0),
             auth_drops: AtomicU64::new(0),
             session_rejects: AtomicU64::new(0),
+            seal_drops: AtomicU64::new(0),
+            send_drops: AtomicU64::new(0),
+            upload_drops: AtomicU64::new(0),
             last_packet_received_at_unix: AtomicU64::new(0),
             last_packet_sent_at_unix: AtomicU64::new(0),
             upload_rtt_us_ewma_micros: AtomicU64::new(0),
@@ -219,6 +232,28 @@ impl TunnelMetrics {
         self.session_rejects.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a Remote download-egress drop caused by a full seal-worker
+    /// channel under burst. Folded into `packet_loss_estimate`.
+    pub fn record_seal_drop(&self) {
+        self.seal_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count `n` Remote download-egress drops: a full seal→send queue
+    /// (1 packet) or a send-worker batch dropped on a hard `sendmmsg`
+    /// error / writability failure / persistent-EAGAIN exhaustion (a
+    /// whole staged batch). Folded into `packet_loss_estimate`.
+    pub fn record_send_drop(&self, n: u64) {
+        self.send_drops.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count a Client upload frame dropped before reaching the wire (every
+    /// SOCKS5 connection down/full, or a WireGuard forward send error).
+    /// Kept separate from the download loss estimate so a dropped frame is
+    /// not also counted as a delivered upload.
+    pub fn record_upload_drop(&self) {
+        self.upload_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Publish the current session-table size for the next report.
     pub fn set_active_sessions(&self, n: u32) {
         self.active_sessions.store(n, Ordering::Relaxed);
@@ -234,12 +269,19 @@ impl TunnelMetrics {
         let packets_out = self.packets_out.load(Ordering::Relaxed);
         let auth = self.auth_drops.load(Ordering::Relaxed);
         let rejects = self.session_rejects.load(Ordering::Relaxed);
+        // Remote download-egress shedding under burst (seal / send queues
+        // full) is real download packet loss, so fold it into the same
+        // estimate. Upload-path drops live in `upload_drops` and are NOT
+        // download loss, so they stay out of this ratio.
+        let egress_drops =
+            self.seal_drops.load(Ordering::Relaxed) + self.send_drops.load(Ordering::Relaxed);
         // packet_loss_estimate as a 0..1 ratio of "lost"-style events to
         // "delivered" events over the lifetime of the dataplane. Go-side
         // ring computes deltas for the chart; the absolute ratio is what
         // the dashboard's gauge shows.
         let delivered = packets_in.max(1);
-        let loss = (auth + rejects) as f64 / (delivered + auth + rejects) as f64;
+        let lost = auth + rejects + egress_drops;
+        let loss = lost as f64 / (delivered + lost) as f64;
         PerTunnelStats {
             tunnel_id: self.tunnel_id,
             role: self.role.clone(),
