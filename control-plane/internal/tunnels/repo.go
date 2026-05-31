@@ -59,7 +59,8 @@ upload_listen_addr,
 forward_target,
 download_send_port,
 client_real_ip,
-upload_listen_mode
+upload_listen_mode,
+ports
 `
 
 // scanTunnel reads one row in the order the SELECT above lays them out.
@@ -69,6 +70,7 @@ func scanTunnel(row interface {
 }) (Tunnel, error) {
 	var t Tunnel
 	var enabled, pingSmoothing, pacing int
+	var portsCSV string
 	err := row.Scan(
 		&t.ID,
 		&t.Name,
@@ -98,6 +100,7 @@ func scanTunnel(row interface {
 		&t.DownloadSendPort,
 		&t.ClientRealIP,
 		&t.UploadListenMode,
+		&portsCSV,
 	)
 	if err != nil {
 		return Tunnel{}, err
@@ -105,6 +108,11 @@ func scanTunnel(row interface {
 	t.Enabled = enabled == 1
 	t.PingSmoothingEnabled = pingSmoothing == 1
 	t.PacingEnabled = pacing == 1
+	ports, err := ParsePortsCSV(portsCSV)
+	if err != nil {
+		return Tunnel{}, err
+	}
+	t.Ports = ports
 	return t, nil
 }
 
@@ -171,7 +179,8 @@ INSERT INTO tunnels (
   ping_smoothing_enabled, ping_smoothing_target_ms,
   pacing_enabled, pacing_target_ms,
   upload_listen_addr, forward_target, download_send_port, client_real_ip,
-  upload_listen_mode
+  upload_listen_mode,
+  ports
 ) VALUES (
   ?, ?, ?, ?,
   ?, ?, ?,
@@ -182,6 +191,7 @@ INSERT INTO tunnels (
   ?, ?,
   ?, ?,
   ?, ?, ?, ?,
+  ?,
   ?
 )`,
 		t.Name, string(t.Role), boolToInt(t.Enabled), t.PSK,
@@ -194,6 +204,7 @@ INSERT INTO tunnels (
 		boolToInt(t.PacingEnabled), t.PacingTargetMS,
 		t.UploadListenAddr, t.ForwardTarget, t.DownloadSendPort, t.ClientRealIP,
 		uploadListenMode,
+		PortsToCSV(t.Ports),
 	)
 	if err != nil {
 		if isUniqueConstraint(err, "tunnels.name") {
@@ -255,6 +266,7 @@ UPDATE tunnels SET
   pacing_enabled = ?, pacing_target_ms = ?,
   upload_listen_addr = ?, forward_target = ?, download_send_port = ?, client_real_ip = ?,
   upload_listen_mode = ?,
+  ports = ?,
   psk = ?,
   updated_at = CURRENT_TIMESTAMP
 WHERE id = ?`,
@@ -268,6 +280,7 @@ WHERE id = ?`,
 		boolToInt(t.PacingEnabled), t.PacingTargetMS,
 		t.UploadListenAddr, t.ForwardTarget, t.DownloadSendPort, t.ClientRealIP,
 		uploadListenMode,
+		PortsToCSV(t.Ports),
 		psk,
 		t.ID,
 	)

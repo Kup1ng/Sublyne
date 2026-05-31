@@ -189,6 +189,60 @@ func TestBuildSpec_RemoteSocks5TcpListenMode(t *testing.T) {
 	}
 }
 
+func TestBuildSpec_MultiPortCarriesPorts(t *testing.T) {
+	// v2.5.0: a tunnel with >= 2 ports must carry the list on the wire as
+	// []uint16; a 0- or 1-element list must leave spec.Ports empty so the
+	// dataplane takes the byte-for-byte-identical single-port path.
+	base := tunnels.Tunnel{
+		ID:                      42,
+		Name:                    "mp",
+		Role:                    tunnels.RoleClient,
+		PSK:                     "psk",
+		DownloadSpoofSourceIP:   "203.0.113.5",
+		DownloadSpoofSourcePort: 443,
+		DownloadTransport:       tunnels.TransportUDP,
+		MTU:                     1400,
+		MaxConnections:          50000,
+		IdleTimeout:             300,
+		LocalListenAddr:         sql.NullString{Valid: true, String: "0.0.0.0:8000"},
+		DownloadReceivePort:     sql.NullInt64{Valid: true, Int64: 8443},
+		UploadTargetAddr:        sql.NullString{Valid: true, String: "198.51.100.10:55555"},
+		WGConfigID:              sql.NullInt64{Valid: true, Int64: 1},
+	}
+
+	multi := base
+	multi.Ports = []int{8000, 8001, 8002}
+	spec, err := buildSpec(multi, nil)
+	if err != nil {
+		t.Fatalf("buildSpec multi: %v", err)
+	}
+	if len(spec.Ports) != 3 || spec.Ports[0] != 8000 || spec.Ports[2] != 8002 {
+		t.Errorf("spec.Ports = %v, want [8000 8001 8002]", spec.Ports)
+	}
+
+	// Single-port: empty list => no Ports on the wire.
+	single := base
+	single.Ports = nil
+	spec, err = buildSpec(single, nil)
+	if err != nil {
+		t.Fatalf("buildSpec single: %v", err)
+	}
+	if len(spec.Ports) != 0 {
+		t.Errorf("single-port spec must not carry Ports, got %v", spec.Ports)
+	}
+
+	// Defensive: a 1-element list is also single-port.
+	one := base
+	one.Ports = []int{8000}
+	spec, err = buildSpec(one, nil)
+	if err != nil {
+		t.Fatalf("buildSpec one: %v", err)
+	}
+	if len(spec.Ports) != 0 {
+		t.Errorf("1-element list must be treated as single-port, got %v", spec.Ports)
+	}
+}
+
 func TestBuildSpec_ClientMissingListen(t *testing.T) {
 	tun := tunnels.Tunnel{
 		ID:                42,

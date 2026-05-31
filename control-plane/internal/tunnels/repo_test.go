@@ -229,6 +229,73 @@ func TestRepoListOrdersByID(t *testing.T) {
 	}
 }
 
+func TestPortsCSVRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []int
+		csv  string
+	}{
+		{"empty", nil, ""},
+		{"single", []int{8000}, "8000"},
+		{"multi", []int{8000, 8001, 8002}, "8000,8001,8002"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PortsToCSV(tc.in); got != tc.csv {
+				t.Fatalf("PortsToCSV(%v) = %q, want %q", tc.in, got, tc.csv)
+			}
+			got, err := ParsePortsCSV(tc.csv)
+			if err != nil {
+				t.Fatalf("ParsePortsCSV(%q): %v", tc.csv, err)
+			}
+			if PortsToCSV(got) != tc.csv {
+				t.Fatalf("round-trip drifted: %q -> %v -> %q", tc.csv, got, PortsToCSV(got))
+			}
+		})
+	}
+}
+
+func TestParsePortsCSV_TolerantOfSpacesAndEmpties(t *testing.T) {
+	got, err := ParsePortsCSV(" 8000 , ,8001, ")
+	if err != nil {
+		t.Fatalf("ParsePortsCSV: %v", err)
+	}
+	if len(got) != 2 || got[0] != 8000 || got[1] != 8001 {
+		t.Fatalf("got %v, want [8000 8001]", got)
+	}
+}
+
+func TestParsePortsCSV_RejectsNonNumeric(t *testing.T) {
+	if _, err := ParsePortsCSV("8000,notaport"); err == nil {
+		t.Fatal("expected error for non-numeric entry")
+	}
+}
+
+func TestRepoMultiPortRoundTrip(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+
+	c := sampleClient("mp")
+	c.Ports = []int{44443, 8001, 8002}
+	created, err := repo.Create(ctx, c)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if PortsToCSV(created.Ports) != "44443,8001,8002" {
+		t.Fatalf("create round-trip lost ports: %v", created.Ports)
+	}
+
+	// Clearing the list (back to single-port) must persist as empty.
+	created.Ports = nil
+	updated, err := repo.Update(ctx, created, true)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(updated.Ports) != 0 {
+		t.Fatalf("update should have cleared ports, got %v", updated.Ports)
+	}
+}
+
 func names(rows []Tunnel) []string {
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {

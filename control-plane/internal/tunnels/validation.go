@@ -10,6 +10,12 @@ import (
 	"strings"
 )
 
+// MaxPortsPerTunnel is the hard cap on how many application ports a
+// single multi-port tunnel may carry (PRD / IMPL_SPEC §1: typical 5–10,
+// hard cap 32). The list is the FULL authoritative set, INCLUDING the
+// canonical port already present in local_listen_addr / forward_target.
+const MaxPortsPerTunnel = 32
+
 // ValidationError carries a flat list of per-field problems so the API
 // layer can ship them straight back to the form. The message text is
 // user-facing and surfaces in the panel exactly as written.
@@ -121,6 +127,13 @@ func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, exist
 	case RoleRemote:
 		validateRemoteFields(t, ve)
 	}
+
+	// Multi-port list rules (v2.5.0). Only enforced when the operator
+	// supplied a list; an empty list is the legacy single-port marker and
+	// validates exactly like v2.4.0. The list is the FULL authoritative
+	// set and must contain the canonical port (the port of
+	// local_listen_addr for Client / forward_target for Remote).
+	validatePorts(t, ve)
 
 	// Port-conflict scan. This is best-effort even when the field-level
 	// validation above flagged the IP:port — if local_listen_addr is
@@ -298,6 +311,53 @@ func listenMatrixMessage(t Transport) string {
 	}
 }
 
+// canonicalPort returns the tunnel's primary application port — the port
+// of local_listen_addr for a Client, of forward_target for a Remote —
+// and ok=false when that address is unset or malformed (the field-level
+// validator already flags those cases).
+func canonicalPort(t *Tunnel) (int, bool) {
+	switch t.Role {
+	case RoleClient:
+		return portFromAddr(t.LocalListenAddr.String)
+	case RoleRemote:
+		return portFromAddr(t.ForwardTarget.String)
+	}
+	return 0, false
+}
+
+// validatePorts enforces the multi-port list rules from IMPL_SPEC §5A.3:
+// each port in 1..65535, no duplicates, at most MaxPortsPerTunnel, and
+// the canonical port must be a member of the list. An empty list is the
+// legacy single-port marker and skips every check.
+func validatePorts(t *Tunnel, ve *ValidationError) {
+	if len(t.Ports) == 0 {
+		return
+	}
+	if len(t.Ports) > MaxPortsPerTunnel {
+		ve.Fields["ports"] = fmt.Sprintf("A tunnel can carry at most %d ports; you listed %d.", MaxPortsPerTunnel, len(t.Ports))
+		return
+	}
+	seen := make(map[int]struct{}, len(t.Ports))
+	for _, p := range t.Ports {
+		if p < 1 || p > 65535 {
+			ve.Fields["ports"] = fmt.Sprintf("Each port must be between 1 and 65535; %d is out of range.", p)
+			return
+		}
+		if _, dup := seen[p]; dup {
+			ve.Fields["ports"] = fmt.Sprintf("Port %d is listed more than once. Each port may appear only once.", p)
+			return
+		}
+		seen[p] = struct{}{}
+	}
+	// The canonical port (local_listen_addr / forward_target) must be in
+	// the set so the two sides agree on the full authoritative list.
+	if cp, ok := canonicalPort(t); ok {
+		if _, member := seen[cp]; !member {
+			ve.Fields["ports"] = fmt.Sprintf("The main port %d must be included in the port list.", cp)
+		}
+	}
+}
+
 func checkPortConflicts(ctx context.Context, repo *Repo, t *Tunnel, existingID int64, ve *ValidationError) error {
 	occupied, err := collectOccupiedPorts(ctx, repo, existingID)
 	if err != nil {
@@ -326,6 +386,26 @@ func checkPortConflicts(ctx context.Context, repo *Repo, t *Tunnel, existingID i
 		if port, ok := portFromAddr(t.UploadListenAddr.String); ok {
 			if owner, taken := occupied[port]; taken {
 				ve.Fields["upload_listen_addr"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
+			}
+		}
+	}
+
+	// Multi-port app ports (v2.5.0). The set a tunnel occupies is
+	// (canonical port UNION Ports); the canonical port is the
+	// local_listen / forward_target port already checked above, so here
+	// we additionally check every OTHER member of the list. A clash on a
+	// list member is reported against the `ports` field. Single-port
+	// tunnels (empty Ports) skip this entirely, so their behaviour is
+	// byte-for-byte unchanged.
+	if len(t.Ports) > 0 {
+		canonical, hasCanonical := canonicalPort(t)
+		for _, port := range t.Ports {
+			if hasCanonical && port == canonical {
+				continue // already checked via local_listen_addr / forward_target
+			}
+			if owner, taken := occupied[port]; taken {
+				ve.Fields["ports"] = fmt.Sprintf("Port %d is already used by tunnel %q (%s).", port, owner.name, owner.field)
+				break
 			}
 		}
 	}
@@ -369,6 +449,16 @@ func collectOccupiedPorts(ctx context.Context, repo *Repo, excludeID int64) (map
 				if _, exists := occupied[p]; !exists {
 					occupied[p] = occupiedPort{name: row.Name, field: "upload listen port"}
 				}
+			}
+		}
+		// Multi-port app ports (v2.5.0). When a row carries a port list,
+		// every member of that list (canonical port included) is occupied
+		// by the row, so a later tunnel sharing ANY of them is rejected.
+		// Single-port rows have an empty Ports list and contribute nothing
+		// here, keeping the legacy scan byte-for-byte identical.
+		for _, p := range row.Ports {
+			if _, exists := occupied[p]; !exists {
+				occupied[p] = occupiedPort{name: row.Name, field: "tunnel port"}
 			}
 		}
 	}

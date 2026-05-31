@@ -409,6 +409,22 @@ func buildSpec(t tunnels.Tunnel, proxy *socks5.Proxy) (ipc.TunnelSpec, error) {
 		PacingEnabled:           t.PacingEnabled,
 		PacingTargetMS:          uint32(t.PacingTargetMS), //nolint:gosec // bounded above
 	}
+	// Multi-port (v2.5.0): carry the app-port list to the dataplane only
+	// when the tunnel is genuinely multi-port (>= 2 ports). A 0- or
+	// 1-element list is single-port — leave spec.Ports empty so the
+	// dataplane takes the byte-for-byte-identical v2.4.0 path. The list is
+	// shared by both roles. The validator already bounds each port to
+	// 1..65535, so the uint16 narrowing here is always in range.
+	if len(t.Ports) >= 2 {
+		ports := make([]uint16, 0, len(t.Ports))
+		for _, p := range t.Ports {
+			if p < 0 || p > 65535 {
+				return ipc.TunnelSpec{}, fmt.Errorf("port out of range: %d", p)
+			}
+			ports = append(ports, uint16(p)) //nolint:gosec // bounded above
+		}
+		spec.Ports = ports
+	}
 	switch t.Role {
 	case tunnels.RoleClient:
 		if !t.LocalListenAddr.Valid {

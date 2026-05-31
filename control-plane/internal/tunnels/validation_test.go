@@ -412,6 +412,138 @@ func TestValidate_Matrix_RemoteTCPSYNWithSocks5TCPOK(t *testing.T) {
 	}
 }
 
+// --- v2.5.0 multi-port -----------------------------------------------
+
+func TestValidate_MultiPort_HappyClient(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("mp-ok")
+	// Canonical Client port is local_listen_addr's 44443; the list MUST
+	// include it (full authoritative set).
+	c.Ports = []int{44443, 8001, 8002}
+	if err := Validate(ctx, repo, RoleClient, &c, 0); err != nil {
+		t.Fatalf("valid multi-port list should pass: %v", err)
+	}
+}
+
+func TestValidate_MultiPort_SinglePortEmptyListStillValid(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("mp-empty")
+	c.Ports = nil // legacy single-port marker
+	if err := Validate(ctx, repo, RoleClient, &c, 0); err != nil {
+		t.Fatalf("empty Ports must validate exactly like single-port: %v", err)
+	}
+}
+
+func TestValidate_MultiPort_RejectsDuplicate(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("mp-dup")
+	c.Ports = []int{44443, 8001, 8001}
+	err := Validate(ctx, repo, RoleClient, &c, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["ports"]; !ok {
+		t.Errorf("expected ports error for duplicate, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_MultiPort_RejectsOutOfRange(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("mp-range")
+	c.Ports = []int{44443, 70000}
+	err := Validate(ctx, repo, RoleClient, &c, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["ports"]; !ok {
+		t.Errorf("expected ports error for out-of-range, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_MultiPort_RejectsTooMany(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("mp-toomany")
+	ports := make([]int, 0, MaxPortsPerTunnel+1)
+	ports = append(ports, 44443) // canonical
+	for p := 9000; len(ports) <= MaxPortsPerTunnel; p++ {
+		ports = append(ports, p)
+	}
+	c.Ports = ports
+	err := Validate(ctx, repo, RoleClient, &c, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["ports"]; !ok {
+		t.Errorf("expected ports error for >%d ports, fields=%v", MaxPortsPerTunnel, ve.Fields)
+	}
+}
+
+func TestValidate_MultiPort_RejectsCanonicalNotInList(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("mp-canon")
+	// Canonical port 44443 deliberately omitted.
+	c.Ports = []int{8001, 8002}
+	err := Validate(ctx, repo, RoleClient, &c, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["ports"]; !ok {
+		t.Errorf("expected ports error when canonical port missing, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_MultiPort_HappyRemote(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	r := sampleRemote("mp-remote-ok")
+	// Canonical Remote port is forward_target's 5201.
+	r.Ports = []int{5201, 5202, 5203}
+	if err := Validate(ctx, repo, RoleRemote, &r, 0); err != nil {
+		t.Fatalf("valid remote multi-port list should pass: %v", err)
+	}
+}
+
+func TestValidate_MultiPort_CrossTunnelOverlapOnListMember(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+
+	// First tunnel claims app ports {44443, 8001, 8002}.
+	a := sampleClient("mp-a")
+	a.Ports = []int{44443, 8001, 8002}
+	if _, err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+
+	// Second tunnel uses a different local_listen / receive port so the
+	// ONLY collision is on the shared app-port list member 8002.
+	b := sampleClient("mp-b")
+	b.LocalListenAddr = sql.NullString{String: "0.0.0.0:44455", Valid: true}
+	b.DownloadReceivePort = sql.NullInt64{Int64: 8455, Valid: true}
+	b.Ports = []int{44455, 8002, 8003}
+	err := Validate(ctx, repo, RoleClient, &b, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	msg, ok := ve.Fields["ports"]
+	if !ok {
+		t.Fatalf("expected ports overlap error, fields=%v", ve.Fields)
+	}
+	if !strings.Contains(msg, "8002") || !strings.Contains(msg, "mp-a") {
+		t.Errorf("overlap message should name the port and owner; got %q", msg)
+	}
+}
+
 func TestValidate_LocalListenSameAsDownloadReceiveIsRejected(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
