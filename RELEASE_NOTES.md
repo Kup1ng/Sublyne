@@ -1,5 +1,38 @@
 # Release notes
 
+## v2.7.0 — Unified port list (2026-06-01)
+
+**What changed for you**
+
+The tunnel form no longer asks for ports in two places. Before, you typed the
+"main" port inside the address (e.g. `0.0.0.0:443`) and any extra ports in a
+separate "Additional ports" box. Now:
+
+- **Local listen address** (Iran side) and **Forward target address** (foreign
+  side) take a host/IP only — e.g. `0.0.0.0` or `127.0.0.1`. No port.
+- **Ports** is a single list where you type every port for the tunnel,
+  comma-separated — e.g. `443, 8001, 8002`. One port is a normal single-service
+  tunnel; list several to carry multiple services over the one tunnel.
+
+Every port in the list is forwarded identically — same speed, same path, same
+security. There is no "main port" that gets special treatment.
+
+**Your existing tunnels keep working with zero action.** On upgrade, each
+tunnel's old main port is automatically folded into its new port list and its
+address is trimmed to a host. Open any tunnel afterward and you'll see one
+unified Ports list already filled in correctly.
+
+**No flag-day.** This is a single-box update. The packets on the wire are
+unchanged — a one-port tunnel is byte-for-byte identical to v2.6.0, and
+multi-port tunnels use the same 2-byte port tag as v2.5.0/v2.6.0. You can
+upgrade the two servers independently.
+
+**Under the hood:** the data plane already treated every port identically (one
+shared seal/upload pipeline, per-port sockets bound from the same code path);
+this release removes the last place the control plane and UI treated a "main"
+port as special. Schema migration `0011` performs the one-time fold. Not yet
+validated on the live hardware pair.
+
 ## v2.6.0 — Drop-visibility + download-ingest batching + dashboard controls
 
 A performance, packet-loss-hardening, and panel-usability release. **No wire
