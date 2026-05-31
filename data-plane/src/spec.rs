@@ -186,6 +186,19 @@ pub struct TunnelSpec {
     pub pacing_enabled: bool,
     #[serde(default = "default_pacing_target_ms")]
     pub pacing_target_ms: u32,
+
+    /// Multi-port app ports (shared by both roles, 1:1 same-number).
+    /// Empty (the default, and what older Go control planes emit) = a
+    /// single-port tunnel, wire-identical to before. A list of length
+    /// >= 2 activates the application-port tag: per-port sockets are
+    /// bound on the bind host taken from `local_listen_addr` (Client) /
+    /// `forward_target` (Remote), and every forwarded datagram is
+    /// prefixed with a 2-byte port tag (see [`crate::multiport`]). A
+    /// 1-element list is treated defensively as single-port. The list
+    /// INCLUDES the primary port that also appears in
+    /// `local_listen_addr` / `forward_target`.
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 fn default_mtu() -> u32 {
@@ -332,6 +345,7 @@ impl TunnelSpec {
                     forward_target: None,
                     download_send_port: None,
                     client_real_ip: None,
+                    ports: self.ports.clone(),
                 })
             }
             Role::Remote => {
@@ -366,6 +380,7 @@ impl TunnelSpec {
                     forward_target: Some(forward_target),
                     download_send_port: Some(send_port),
                     client_real_ip: Some(client_ip),
+                    ports: self.ports.clone(),
                 })
             }
         }
@@ -392,6 +407,19 @@ pub struct ResolvedSpec {
     pub forward_target: Option<SocketAddr>,
     pub download_send_port: Option<u16>,
     pub client_real_ip: Option<std::net::IpAddr>,
+    /// Multi-port app ports (shared by both roles). Empty or single =
+    /// single-port legacy path; length >= 2 activates the per-port
+    /// sockets + application-port tag (see [`ResolvedSpec::multiport`]).
+    pub ports: Vec<u16>,
+}
+
+impl ResolvedSpec {
+    /// True when this tunnel carries several application ports and must
+    /// use the [`crate::multiport`] tag. A 0- or 1-element list is the
+    /// single-port legacy path, wire-identical to before.
+    pub fn multiport(&self) -> bool {
+        self.ports.len() >= 2
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +453,7 @@ mod tests {
             pacing_target_ms: 100,
             socks5_target: None,
             upload_listen_mode: UploadListenMode::Udp,
+            ports: Vec::new(),
         }
     }
 
@@ -455,6 +484,7 @@ mod tests {
             pacing_target_ms: 100,
             socks5_target: None,
             upload_listen_mode: UploadListenMode::Udp,
+            ports: Vec::new(),
         }
     }
 
@@ -479,6 +509,48 @@ mod tests {
         let mut s = base_client();
         s.psk = String::new();
         assert!(matches!(s.validate(), Err(SpecError::EmptyPsk)));
+    }
+
+    #[test]
+    fn ports_defaults_empty_and_is_single_port() {
+        // A spec without `ports` (older Go control planes) must default to
+        // an empty list, which the resolver reports as single-port.
+        let json = serde_json::json!({
+            "id": 1,
+            "role": "client",
+            "name": "c",
+            "psk": "psk",
+            "download_transport": "udp",
+            "download_spoof_source_ip": "203.0.113.5",
+            "download_spoof_source_port": 443,
+            "local_listen_addr": "127.0.0.1:5001",
+            "download_receive_port": 8443,
+            "upload_target_addr": "127.0.0.1:8001",
+        });
+        let spec: TunnelSpec = serde_json::from_value(json).expect("decode no-ports spec");
+        assert!(spec.ports.is_empty());
+        let resolved = spec.validate().expect("validate");
+        assert!(!resolved.multiport(), "empty ports must be single-port");
+        assert!(resolved.ports.is_empty());
+    }
+
+    #[test]
+    fn ports_multiport_carries_into_resolved() {
+        let mut s = base_client();
+        s.ports = vec![8000, 8001, 8002];
+        let resolved = s.validate().expect("validate");
+        assert!(resolved.multiport(), "len>=2 ports must be multiport");
+        assert_eq!(resolved.ports, vec![8000, 8001, 8002]);
+    }
+
+    #[test]
+    fn ports_single_element_is_not_multiport() {
+        // The panel never emits a 1-element list, but the dataplane treats
+        // it defensively as single-port.
+        let mut s = base_remote();
+        s.ports = vec![9001];
+        let resolved = s.validate().expect("validate");
+        assert!(!resolved.multiport(), "1-element ports must be single-port");
     }
 
     #[test]

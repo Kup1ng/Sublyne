@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod manager;
 pub mod memory;
 pub mod metrics;
+pub mod multiport;
 pub mod perf;
 pub mod ping_smoothing;
 pub mod protocol;
