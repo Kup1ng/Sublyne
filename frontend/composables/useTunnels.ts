@@ -1,6 +1,24 @@
-import { useApi } from '~/composables/useApi'
+import { useApi, apiFetch, type ApiError } from '~/composables/useApi'
 import type { Tunnel } from '~/types/api'
 import { pickAllowed } from '~/utils/pick'
+import { sanitizeTunnelFilename } from '~/utils/clientFile'
+
+// TunnelExportEnvelope is the versioned wrapper the backend produces on export
+// and accepts on import (see control-plane tunnelExportEnvelope). It is its OWN
+// strict shape — NOT the tunnel-input whitelist — so every field is forwarded
+// verbatim. `tunnel.psk` is null unless the file was exported with ?secrets=1;
+// the operator supplies it at import time when missing. WG/SOCKS5 are
+// referenced by name (wireguard_config_name / socks5_proxy_name), never by
+// their secret bytes.
+export interface TunnelExportEnvelope {
+  type: string
+  schema_version: number
+  secrets_included: boolean
+  tunnel: Record<string, unknown> & {
+    name?: string
+    psk?: string | null
+  }
+}
 
 // Backend tunnelInput field set — id / role / state / created_at /
 // updated_at / runtime_state etc. come back on GETs but are rejected
@@ -88,15 +106,65 @@ export function useTunnels() {
     await refresh()
   }
 
-  async function exportOne(id: number): Promise<string> {
-    const blob = await fetch(`${webPathPrefix()}/api/tunnels/${id}/export`, {
-      credentials: 'include',
-    }).then((r) => r.text())
-    return blob
+  // exportOne fetches a tunnel's portable envelope and returns the raw text
+  // (for clipboard/download), the parsed envelope, and a derived download
+  // filename. Side-effect-free: the caller decides download vs copy. Pass
+  // { secrets: true } to include the PSK (?secrets=1). Uses the shared
+  // apiFetch so the obfuscated web-path prefix + session cookie are handled.
+  async function exportOne(
+    id: number,
+    opts?: { secrets?: boolean },
+  ): Promise<{ filename: string; text: string; envelope: TunnelExportEnvelope }> {
+    const query = opts?.secrets ? '?secrets=1' : ''
+    const res = await apiFetch(`/tunnels/${id}/export${query}`, { method: 'GET' })
+    if (!res.ok) {
+      const err = new Error(`export failed: ${res.status}`) as ApiError
+      err.code = 'export_failed'
+      err.status = res.status
+      throw err
+    }
+    const text = await res.text()
+    const envelope = JSON.parse(text) as TunnelExportEnvelope
+    const name = envelope?.tunnel?.name ?? ''
+    return { filename: sanitizeTunnelFilename(name), text, envelope }
   }
 
-  async function importOne(payload: string) {
-    const t = await api.post<Tunnel>('/tunnels/import', JSON.parse(payload))
+  // importOne parses an export envelope (raw text), applies optional operator
+  // overrides (name on clash, psk when the file carries no secret), and POSTs
+  // the WHOLE envelope. The backend envelope is its own strict shape, so we do
+  // NOT run pickAllowed here. ApiError (with .fields) propagates to the caller.
+  async function importOne(
+    envelopeText: string,
+    overrides?: { name?: string; psk?: string },
+  ): Promise<Tunnel> {
+    let obj: unknown
+    try {
+      obj = JSON.parse(envelopeText)
+    } catch {
+      throw new Error('That doesn’t look like a valid Sublyne export file (not JSON).')
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      throw new Error('That doesn’t look like a valid Sublyne export file.')
+    }
+    const env = obj as TunnelExportEnvelope
+    if (!env.tunnel || typeof env.tunnel !== 'object') {
+      throw new Error('That export file is missing its tunnel section.')
+    }
+    if (overrides?.name) {
+      env.tunnel.name = overrides.name
+    }
+    if (overrides?.psk && overrides.psk.length > 0) {
+      env.tunnel.psk = overrides.psk
+    }
+    const t = await api.post<Tunnel>('/tunnels/import', env)
+    await refresh()
+    return t
+  }
+
+  // clone duplicates a tunnel server-side (new name "<orig> (copy)", disabled,
+  // all config + links + ports copied) and refreshes the list.
+  async function clone(id: number): Promise<Tunnel> {
+    const t = await api.post<Tunnel>(`/tunnels/${id}/clone`)
     await refresh()
     return t
   }
@@ -113,5 +181,6 @@ export function useTunnels() {
     stop,
     exportOne,
     importOne,
+    clone,
   }
 }

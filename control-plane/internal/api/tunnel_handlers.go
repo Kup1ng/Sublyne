@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -392,6 +393,7 @@ func MountTunnelRoutes(r chi.Router, deps TunnelDeps) {
 	r.Post("/{id}/stop", StopTunnelHandler(deps))
 	r.Get("/{id}/export", ExportTunnelHandler(deps))
 	r.Post("/import", ImportTunnelHandler(deps))
+	r.Post("/{id}/clone", CloneTunnelHandler(deps))
 }
 
 // ListTunnelsHandler returns every tunnel with the PSK redacted.
@@ -981,11 +983,197 @@ func DeleteTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 	}
 }
 
-// ExportTunnelHandler returns a single tunnel as JSON, with the real
-// PSK present. The operator is downloading their own config; the panel
-// already requires a session to reach this endpoint. The exported
-// shape is wrapped as {"tunnel": …} so import can accept the same
-// document round-trip.
+// Export envelope constants. The export document is a versioned
+// envelope so a future schema change can be detected and rejected with
+// a clear message rather than silently mis-parsed. Bump
+// ExportSchemaVersion (and teach import to accept the new value) only
+// for a breaking shape change.
+const (
+	// ExportType tags every Sublyne tunnel-export document. Import
+	// rejects any body whose `type` differs, which also rejects the
+	// pre-v2.7.0 bare {"tunnel": …} shape (it has no `type`).
+	ExportType = "sublyne-tunnel-export"
+	// ExportSchemaVersion is the current envelope schema. Import accepts
+	// only this exact value.
+	ExportSchemaVersion = 1
+)
+
+// tunnelExportBody is the portable, by-name shape of a tunnel inside an
+// export envelope. It deliberately differs from tunnelDTO: it omits
+// id / enabled / runtime_state / created_at / updated_at (none of which
+// are portable between panels), and it references panel resources
+// (WireGuard config, SOCKS5 proxy) by their stable NAME rather than a
+// per-panel id, since ids differ between the two boxes. The PSK and the
+// legacy inline WireGuard text are present only when the operator
+// explicitly opted into ?secrets=1 (otherwise null).
+type tunnelExportBody struct {
+	Name                    string `json:"name"`
+	Role                    string `json:"role"`
+	DownloadSpoofSourceIP   string `json:"download_spoof_source_ip"`
+	DownloadSpoofSourcePort int    `json:"download_spoof_source_port"`
+	DownloadTransport       string `json:"download_transport"`
+	IcmpEchoMode            string `json:"icmp_echo_mode"`
+	MTU                     int    `json:"mtu"`
+	MaxConnections          int    `json:"max_connections"`
+	IdleTimeout             int    `json:"idle_timeout"`
+
+	Ports []int `json:"ports"`
+
+	LocalListenAddr     *string `json:"local_listen_addr"`
+	DownloadReceivePort *int    `json:"download_receive_port"`
+	UploadTargetAddr    *string `json:"upload_target_addr"`
+	UploadMode          string  `json:"upload_mode"`
+
+	UploadListenAddr *string `json:"upload_listen_addr"`
+	ForwardTarget    *string `json:"forward_target"`
+	DownloadSendPort *int    `json:"download_send_port"`
+	ClientRealIP     *string `json:"client_real_ip"`
+	UploadListenMode string  `json:"upload_listen_mode"`
+
+	PingSmoothingEnabled  bool `json:"ping_smoothing_enabled"`
+	PingSmoothingTargetMS int  `json:"ping_smoothing_target_ms"`
+	PacingEnabled         bool `json:"pacing_enabled"`
+	PacingTargetMS        int  `json:"pacing_target_ms"`
+
+	// PSK is null unless ?secrets=1 was set on export. The frontend may
+	// inject a value here before posting to /import when the file lacks
+	// one.
+	PSK *string `json:"psk"`
+
+	// By-name references resolved against THIS panel on import.
+	WireguardConfigName *string `json:"wireguard_config_name"`
+	Socks5ProxyName     *string `json:"socks5_proxy_name"`
+
+	// WireguardConfig is the legacy Phase-6 inline pasted text, present
+	// only when ?secrets=1 was set AND the source tunnel carried inline
+	// text. The referenced WG config's own private keys are never
+	// embedded — that resource is referenced only by name above.
+	WireguardConfig *string `json:"wireguard_config"`
+}
+
+// tunnelExportEnvelope is the top-level export document: a versioned
+// wrapper around tunnelExportBody.
+type tunnelExportEnvelope struct {
+	Type            string           `json:"type"`
+	SchemaVersion   int              `json:"schema_version"`
+	SecretsIncluded bool             `json:"secrets_included"`
+	Tunnel          tunnelExportBody `json:"tunnel"`
+}
+
+// buildExportBody renders a tunnel into the portable export body,
+// resolving wg_config_id / socks5_proxy_id to their stable names. When
+// secrets is false the PSK and legacy inline WG text are stripped to
+// null. The referenced WG config / SOCKS5 proxy secrets are NEVER
+// embedded regardless of `secrets` — they are panel resources referenced
+// only by name (a documented scope boundary).
+func buildExportBody(ctx context.Context, deps TunnelDeps, t tunnels.Tunnel, secrets bool) tunnelExportBody {
+	b := tunnelExportBody{
+		Name:                    t.Name,
+		Role:                    string(t.Role),
+		DownloadSpoofSourceIP:   t.DownloadSpoofSourceIP,
+		DownloadSpoofSourcePort: t.DownloadSpoofSourcePort,
+		DownloadTransport:       string(t.DownloadTransport),
+		IcmpEchoMode:            string(t.IcmpEchoMode),
+		MTU:                     t.MTU,
+		MaxConnections:          t.MaxConnections,
+		IdleTimeout:             t.IdleTimeout,
+		Ports:                   t.Ports,
+		UploadMode:              string(t.UploadMode),
+		UploadListenMode:        string(t.UploadListenMode),
+		PingSmoothingEnabled:    t.PingSmoothingEnabled,
+		PingSmoothingTargetMS:   t.PingSmoothingTargetMS,
+		PacingEnabled:           t.PacingEnabled,
+		PacingTargetMS:          t.PacingTargetMS,
+	}
+	if b.UploadMode == "" {
+		b.UploadMode = string(tunnels.UploadModeWireguard)
+	}
+	if b.UploadListenMode == "" {
+		b.UploadListenMode = string(tunnels.UploadListenModeUDP)
+	}
+	if t.LocalListenAddr.Valid {
+		s := t.LocalListenAddr.String
+		b.LocalListenAddr = &s
+	}
+	if t.DownloadReceivePort.Valid {
+		p := int(t.DownloadReceivePort.Int64)
+		b.DownloadReceivePort = &p
+	}
+	if t.UploadTargetAddr.Valid {
+		s := t.UploadTargetAddr.String
+		b.UploadTargetAddr = &s
+	}
+	if t.UploadListenAddr.Valid {
+		s := t.UploadListenAddr.String
+		b.UploadListenAddr = &s
+	}
+	if t.ForwardTarget.Valid {
+		s := t.ForwardTarget.String
+		b.ForwardTarget = &s
+	}
+	if t.DownloadSendPort.Valid {
+		p := int(t.DownloadSendPort.Int64)
+		b.DownloadSendPort = &p
+	}
+	if t.ClientRealIP.Valid {
+		s := t.ClientRealIP.String
+		b.ClientRealIP = &s
+	}
+	// Resolve panel-resource references to their stable names.
+	if t.WGConfigID.Valid && t.WGConfigID.Int64 > 0 && deps.WGRepo != nil {
+		if cfg, err := deps.WGRepo.Get(ctx, t.WGConfigID.Int64); err == nil {
+			name := cfg.Name
+			b.WireguardConfigName = &name
+		}
+	}
+	if t.Socks5ProxyID.Valid && t.Socks5ProxyID.Int64 > 0 && deps.SOCKS5Repo != nil {
+		if p, err := deps.SOCKS5Repo.Get(ctx, t.Socks5ProxyID.Int64); err == nil {
+			name := p.Name
+			b.Socks5ProxyName = &name
+		}
+	}
+	if secrets {
+		psk := t.PSK
+		b.PSK = &psk
+		if t.WireguardConfig.Valid && t.WireguardConfig.String != "" {
+			wg := t.WireguardConfig.String
+			b.WireguardConfig = &wg
+		}
+	}
+	return b
+}
+
+// sanitizeFilename lowercases name and replaces any character outside
+// [a-z0-9-_] with '-', collapsing runs of '-' and trimming leading /
+// trailing '-'. Falls back to "tunnel" when the result is empty.
+func sanitizeFilename(name string) string {
+	var sb strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(name) {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_'
+		if ok {
+			sb.WriteRune(r)
+			prevDash = false
+			continue
+		}
+		// Any other rune (including '-') becomes a single collapsed '-'.
+		if !prevDash {
+			sb.WriteByte('-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(sb.String(), "-")
+	if out == "" {
+		return "tunnel"
+	}
+	return out
+}
+
+// ExportTunnelHandler emits a single tunnel as a versioned, by-name
+// export envelope (see tunnelExportEnvelope). Secrets (PSK + legacy
+// inline WireGuard text) are stripped to null by default; pass
+// ?secrets=1 to include them. The operator is downloading their own
+// config; the panel already requires a session to reach this endpoint.
 func ExportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := tunnelIDFromURL(r)
@@ -1002,60 +1190,141 @@ func ExportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 			writeJSONError(w, http.StatusInternalServerError, "could not load tunnel")
 			return
 		}
-		w.Header().Set("Content-Disposition", "attachment; filename=\"tunnel-"+strconv.FormatInt(t.ID, 10)+".json\"")
+		secrets := r.URL.Query().Get("secrets") == "1"
+		envelope := tunnelExportEnvelope{
+			Type:            ExportType,
+			SchemaVersion:   ExportSchemaVersion,
+			SecretsIncluded: secrets,
+			Tunnel:          buildExportBody(r.Context(), deps, t, secrets),
+		}
+		w.Header().Set("Content-Disposition",
+			"attachment; filename=\""+sanitizeFilename(t.Name)+".sublyne-tunnel.json\"")
 		if deps.Audit != nil {
 			deps.Audit.Record(r.Context(), audit.ActionTunnelExport, deps.actorOf(r), ClientIP(r), t.Name, map[string]any{
 				"tunnel_id": t.ID,
+				"secrets":   secrets,
 			})
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"tunnel": withRuntime(toDTO(t, false), deps.Dataplane)})
+		writeJSON(w, http.StatusOK, envelope)
 	}
 }
 
-// ImportTunnelHandler accepts a previously-exported single-tunnel JSON
-// document and inserts it as a new tunnel. The name must not already
-// exist; the role must match the server's role.
+// ImportTunnelHandler accepts a versioned export envelope (see
+// tunnelExportEnvelope) and inserts it as a new, stopped tunnel. It is
+// strict: the document must carry the right `type` and a known
+// `schema_version`, and any panel-resource reference (WireGuard config /
+// SOCKS5 proxy) is resolved by NAME against THIS panel. A pre-v2.7.0
+// bare {"tunnel": …} export has no `type` and is rejected with the clear
+// "isn't a Sublyne tunnel export" message.
 func ImportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Tunnel tunnelDTO `json:"tunnel"`
-		}
-		if err := decodeJSON(r.Body, &body); err != nil {
+		var envelope tunnelExportEnvelope
+		if err := decodeJSON(r.Body, &envelope); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// Convert DTO → input → tunnel. We don't trust the exported id
-		// or enabled flag.
-		in := tunnelInput{
-			Name:                    body.Tunnel.Name,
-			Enabled:                 false,
-			PSK:                     ptr(body.Tunnel.PSK),
-			DownloadSpoofSourceIP:   body.Tunnel.DownloadSpoofSourceIP,
-			DownloadSpoofSourcePort: body.Tunnel.DownloadSpoofSourcePort,
-			DownloadTransport:       body.Tunnel.DownloadTransport,
-			MTU:                     body.Tunnel.MTU,
-			MaxConnections:          body.Tunnel.MaxConnections,
-			IdleTimeout:             body.Tunnel.IdleTimeout,
-			IcmpEchoMode:            body.Tunnel.IcmpEchoMode,
-			Ports:                   body.Tunnel.Ports,
-			LocalListenAddr:         body.Tunnel.LocalListenAddr,
-			DownloadReceivePort:     body.Tunnel.DownloadReceivePort,
-			UploadTargetAddr:        body.Tunnel.UploadTargetAddr,
-			WireguardConfig:         body.Tunnel.WireguardConfig,
-			UploadMode:              body.Tunnel.UploadMode,
-			Socks5ProxyID:           body.Tunnel.Socks5ProxyID,
-			PingSmoothingEnabled:    body.Tunnel.PingSmoothingEnabled,
-			PingSmoothingTargetMS:   body.Tunnel.PingSmoothingTargetMS,
-			PacingEnabled:           body.Tunnel.PacingEnabled,
-			PacingTargetMS:          body.Tunnel.PacingTargetMS,
-			UploadListenAddr:        body.Tunnel.UploadListenAddr,
-			ForwardTarget:           body.Tunnel.ForwardTarget,
-			DownloadSendPort:        body.Tunnel.DownloadSendPort,
-			ClientRealIP:            body.Tunnel.ClientRealIP,
-			UploadListenMode:        body.Tunnel.UploadListenMode,
+		if envelope.Type != ExportType {
+			writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
+				"file": "This isn't a Sublyne tunnel export file.",
+			}})
+			return
 		}
+		if envelope.SchemaVersion != ExportSchemaVersion {
+			writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
+				"file": fmt.Sprintf(
+					"This export was made by a different Sublyne version (schema %d). This Sublyne understands version %d.",
+					envelope.SchemaVersion, ExportSchemaVersion),
+			}})
+			return
+		}
+
+		body := envelope.Tunnel
+		in := tunnelInput{
+			Name:                    body.Name,
+			Enabled:                 false,
+			PSK:                     body.PSK,
+			DownloadSpoofSourceIP:   body.DownloadSpoofSourceIP,
+			DownloadSpoofSourcePort: body.DownloadSpoofSourcePort,
+			DownloadTransport:       body.DownloadTransport,
+			MTU:                     body.MTU,
+			MaxConnections:          body.MaxConnections,
+			IdleTimeout:             body.IdleTimeout,
+			IcmpEchoMode:            body.IcmpEchoMode,
+			Ports:                   body.Ports,
+			LocalListenAddr:         body.LocalListenAddr,
+			DownloadReceivePort:     body.DownloadReceivePort,
+			UploadTargetAddr:        body.UploadTargetAddr,
+			WireguardConfig:         body.WireguardConfig,
+			UploadMode:              body.UploadMode,
+			PingSmoothingEnabled:    body.PingSmoothingEnabled,
+			PingSmoothingTargetMS:   body.PingSmoothingTargetMS,
+			PacingEnabled:           body.PacingEnabled,
+			PacingTargetMS:          body.PacingTargetMS,
+			UploadListenAddr:        body.UploadListenAddr,
+			ForwardTarget:           body.ForwardTarget,
+			DownloadSendPort:        body.DownloadSendPort,
+			ClientRealIP:            body.ClientRealIP,
+			UploadListenMode:        body.UploadListenMode,
+		}
+
+		// Resolve panel-resource references by NAME against this panel.
+		// The exported tunnel referenced these by name (ids differ per
+		// box); a missing target is a per-field error the operator can
+		// fix by creating the resource first.
+		if body.WireguardConfigName != nil && *body.WireguardConfigName != "" {
+			if deps.WGRepo == nil {
+				writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
+					"wireguard_config_name": "This panel can't resolve WireGuard configs.",
+				}})
+				return
+			}
+			cfg, err := deps.WGRepo.GetByName(r.Context(), *body.WireguardConfigName)
+			if errors.Is(err, wg.ErrConfigNotFound) {
+				writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
+					"wireguard_config_name": fmt.Sprintf(
+						"No WireGuard config named %q on this panel. Create it on the WireGuard page first.",
+						*body.WireguardConfigName),
+				}})
+				return
+			}
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "could not resolve WireGuard config")
+				return
+			}
+			in.WGConfigID = ptr(cfg.ID)
+		}
+		if body.Socks5ProxyName != nil && *body.Socks5ProxyName != "" {
+			if deps.SOCKS5Repo == nil {
+				writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
+					"socks5_proxy_name": "This panel can't resolve SOCKS5 proxies.",
+				}})
+				return
+			}
+			p, err := deps.SOCKS5Repo.GetByName(r.Context(), *body.Socks5ProxyName)
+			if errors.Is(err, socks5.ErrProxyNotFound) {
+				writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
+					"socks5_proxy_name": fmt.Sprintf(
+						"No SOCKS5 proxy named %q on this panel. Add it on the SOCKS5 page first.",
+						*body.Socks5ProxyName),
+				}})
+				return
+			}
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "could not resolve SOCKS5 proxy")
+				return
+			}
+			in.Socks5ProxyID = ptr(p.ID)
+		}
+
 		in.applyDefaults()
-		t := in.toTunnel(deps.ServerRole, *in.PSK)
+		// PSK: if the envelope carried one (secrets export, or the
+		// frontend injected it), use it; otherwise leave empty so
+		// tunnels.Validate rejects it with a `psk` field error.
+		psk := ""
+		if in.PSK != nil {
+			psk = *in.PSK
+		}
+		t := in.toTunnel(deps.ServerRole, psk)
 		if err := tunnels.Validate(r.Context(), deps.Repo, deps.ServerRole, &t, 0); err != nil {
 			writeValidationError(w, err)
 			return
@@ -1087,6 +1356,96 @@ func ImportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusCreated, withRuntime(toDTO(out, true), deps.Dataplane))
 	}
+}
+
+// CloneTunnelHandler duplicates an existing tunnel on the SAME panel as
+// a new, stopped row. The full model is copied (including the PSK,
+// wg_config_id / socks5_proxy_id links, ports, addresses, transport,
+// modes, MTU, …); only the id (reset) and name (suffixed unique) and
+// the enabled flag (forced false) change.
+//
+// It deliberately does NOT run tunnels.Validate: a same-panel clone
+// intentionally duplicates the source's bind-exclusive ports (a clash
+// the operator resolves by editing the clone before starting it). The
+// clone lands stopped, and Update's Validate will enforce uniqueness on
+// the operator's next save. Repo.Create still enforces name-uniqueness
+// as a backstop.
+func CloneTunnelHandler(deps TunnelDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := tunnelIDFromURL(r)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		src, err := deps.Repo.Get(r.Context(), id)
+		if errors.Is(err, tunnels.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "tunnel not found")
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "could not load tunnel")
+			return
+		}
+
+		existing, err := deps.Repo.List(r.Context())
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "could not load tunnels")
+			return
+		}
+		taken := make(map[string]struct{}, len(existing))
+		for _, e := range existing {
+			taken[e.Name] = struct{}{}
+		}
+		name, ok := uniqueCloneName(src.Name, taken)
+		if !ok {
+			writeJSONError(w, http.StatusInternalServerError, "could not find a free name for the clone")
+			return
+		}
+
+		// Copy the full model; reset identity + lifecycle fields.
+		clone := src
+		clone.ID = 0
+		clone.Name = name
+		clone.Enabled = false
+
+		out, err := deps.Repo.Create(r.Context(), clone)
+		if errors.Is(err, tunnels.ErrNameTaken) {
+			// Lost a race for the name we picked; surface a 409 the
+			// operator can retry.
+			writeJSONError(w, http.StatusConflict, "A tunnel with that name already exists. Try again.")
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "could not clone tunnel")
+			return
+		}
+		deps.invalidateCache()
+		if deps.Audit != nil {
+			deps.Audit.Record(r.Context(), audit.ActionTunnelClone, deps.actorOf(r), ClientIP(r), out.Name, map[string]any{
+				"tunnel_id":   out.ID,
+				"cloned_from": id,
+			})
+		}
+		writeJSON(w, http.StatusCreated, withRuntime(toDTO(out, true), deps.Dataplane))
+	}
+}
+
+// uniqueCloneName returns the first free "<base> (copy)", "<base>
+// (copy 2)", "<base> (copy 3)", … not present in taken (case-sensitive
+// exact match). ok is false if all 100 attempts are exhausted.
+func uniqueCloneName(base string, taken map[string]struct{}) (string, bool) {
+	for i := 1; i <= 100; i++ {
+		var candidate string
+		if i == 1 {
+			candidate = base + " (copy)"
+		} else {
+			candidate = fmt.Sprintf("%s (copy %d)", base, i)
+		}
+		if _, clash := taken[candidate]; !clash {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
 // decodeJSON is a small helper that locks the decoder down with

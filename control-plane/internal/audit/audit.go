@@ -54,6 +54,7 @@ const (
 	ActionBackupDownload    = "backup_download"
 	ActionRestoreUpload     = "restore_upload"
 	ActionCrashRecovered    = "crash_recovered"
+	ActionTunnelClone       = "tunnel_clone"
 )
 
 // ActorAdmin is the actor string for actions performed by the single

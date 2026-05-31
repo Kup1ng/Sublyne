@@ -508,8 +508,29 @@ wait_for_healthz() {
   fi
   local panel_port="$1" web_path="$2" tries=0 max_tries=60
   while [ "$tries" -lt "$max_tries" ]; do
-    if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${panel_port}/${web_path}/api/healthz"; then
+    # -f so a non-2xx still counts as "not ready" and we keep looping;
+    # drop -S and silence stderr so the transient "connection refused"
+    # curl prints on the first iteration(s) doesn't leak to the
+    # operator's terminal. systemd Type=simple returns at fork/exec,
+    # before the Go process calls listen(), so the early polls
+    # legitimately race the bind — that noise is expected, not an error.
+    if curl -fs -o /dev/null --max-time 2 "http://127.0.0.1:${panel_port}/${web_path}/api/healthz" 2>/dev/null; then
       return 0
+    fi
+    # Fast-fail a crash-loop: if the unit has already gone to "failed"
+    # (not "activating"/"active"), it will never bind no matter how long
+    # we wait, so stop early and fall through to the loud diagnostics
+    # below instead of burning the full ~60 s budget. Stay conservative —
+    # never break on the first couple of iterations, since a
+    # legitimately-starting service reports "activating" for a moment.
+    # Guarded behind SUBLYNE_TEST_SKIP_SYSTEMCTL (via maybe_systemctl)
+    # so CI's fake — which never starts a real unit — stays green.
+    if [ "$tries" -gt 2 ] && [ -z "$SUBLYNE_TEST_SKIP_SYSTEMCTL" ] \
+       && command -v systemctl >/dev/null 2>&1; then
+      if [ "$(maybe_systemctl is-active sublyne.service 2>/dev/null)" = "failed" ]; then
+        echo "       (sublyne.service entered 'failed' state while waiting; stopping early)" >&2
+        break
+      fi
     fi
     sleep 1
     tries=$((tries + 1))
@@ -628,7 +649,7 @@ fresh_install() {
 
   echo "==> Waiting for healthz"
   if ! wait_for_healthz "$panel_port" "$web_path"; then
-    echo "Error: service did not become healthy within 30 s." >&2
+    echo "Error: service did not become healthy within 60 s." >&2
     echo "       Inspect 'journalctl -u sublyne -n 100' for details." >&2
     exit 1
   fi
@@ -704,13 +725,20 @@ update_install() {
   if [ -n "$panel_port" ] && [ -n "$web_path" ]; then
     echo "==> Waiting for healthz"
     if ! wait_for_healthz "$panel_port" "$web_path"; then
-      echo "Error: service did not become healthy within 30 s after update." >&2
+      echo "Error: service did not become healthy within 60 s after update." >&2
       echo "       Inspect 'journalctl -u sublyne -n 100' for details." >&2
       echo "       The new binary is in place; you can roll back by copying" >&2
       echo "       the previous release artifact to ${BINARY_SRC} and re-running" >&2
       echo "       option 2 (Update)." >&2
       exit 1
     fi
+  else
+    # Couldn't parse panel_port / web_path back out of the config, so we
+    # can't probe healthz. Warn loudly rather than skip silently — a
+    # config parse failure must not masquerade as a successful update.
+    echo "Warning: could not read panel_port/web_path from ${CONFIG_PATH};" >&2
+    echo "         skipping the post-update health check. Verify manually" >&2
+    echo "         with 'systemctl status sublyne' and the panel URL." >&2
   fi
 
   cat <<EOF
@@ -787,10 +815,17 @@ reinstall() {
   if [ -n "$panel_port" ] && [ -n "$web_path" ]; then
     echo "==> Waiting for healthz"
     if ! wait_for_healthz "$panel_port" "$web_path"; then
-      echo "Error: service did not become healthy within 30 s after reinstall." >&2
+      echo "Error: service did not become healthy within 60 s after reinstall." >&2
       echo "       Inspect 'journalctl -u sublyne -n 100' for details." >&2
       exit 1
     fi
+  else
+    # Couldn't parse panel_port / web_path back out of the config, so we
+    # can't probe healthz. Warn loudly rather than skip silently — a
+    # config parse failure must not masquerade as a successful reinstall.
+    echo "Warning: could not read panel_port/web_path from ${CONFIG_PATH};" >&2
+    echo "         skipping the post-reinstall health check. Verify manually" >&2
+    echo "         with 'systemctl status sublyne' and the panel URL." >&2
   fi
 
   local ip

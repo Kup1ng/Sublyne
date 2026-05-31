@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import { Cable, Plus, Play, Square, Pencil } from 'lucide-vue-next'
-import { onMounted } from 'vue'
+import { Cable, Plus, Play, Square, Pencil, Download, Copy, Upload } from 'lucide-vue-next'
+import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useDrawer } from '~/composables/useDrawer'
 import { useMetrics } from '~/composables/useMetrics'
 import { useTunnels } from '~/composables/useTunnels'
 import { useTunnelActions } from '~/composables/useTunnelActions'
+import type { Tunnel } from '~/types/api'
+import TunnelExportDialog from '~/components/tunnel/TunnelExportDialog.vue'
+import TunnelImportDialog from '~/components/tunnel/TunnelImportDialog.vue'
 import { formatBitsPerSecond, formatNumber } from '~/utils/format'
 
+const router = useRouter()
 const tunnels = useTunnels()
 const metrics = useMetrics()
 const actions = useTunnelActions()
@@ -19,11 +24,35 @@ onMounted(async () => {
 })
 
 const rates = metrics.rates
+
+const showImport = ref(false)
+// One export dialog for the whole table; the row buttons set its target.
+const exportTarget = ref<Tunnel | null>(null)
+const showExport = ref(false)
+
+function openExport(t: Tunnel) {
+  exportTarget.value = t
+  showExport.value = true
+}
+
+async function onClone(t: Tunnel) {
+  const created = await actions.clone(t.id)
+  if (created) router.push(`/tunnels/${created.id}`)
+}
+
+async function onImported(tunnel: Tunnel) {
+  await tunnels.refresh()
+  router.push(`/tunnels/${tunnel.id}`)
+}
 </script>
 
 <template>
   <Topbar title="Tunnels" subtitle="One row per port mapping." @open-menu="drawer.show">
     <template #actions>
+      <AppButton size="sm" variant="secondary" @click="showImport = true">
+        <Upload class="size-4" />
+        Import
+      </AppButton>
       <NuxtLink to="/tunnels/new">
         <AppButton size="sm">
           <Plus class="size-4" />
@@ -113,6 +142,26 @@ const rates = metrics.rates
                   <Square v-if="!actions.isBusy(t.id)" class="size-3.5" />
                   Stop
                 </AppButton>
+                <AppButton
+                  size="sm"
+                  variant="ghost"
+                  aria-label="Export tunnel"
+                  title="Export tunnel"
+                  @click="openExport(t)"
+                >
+                  <Download class="size-3.5" />
+                </AppButton>
+                <AppButton
+                  size="sm"
+                  variant="ghost"
+                  aria-label="Clone tunnel"
+                  title="Clone tunnel"
+                  :loading="actions.isBusy(t.id)"
+                  :disabled="actions.isBusy(t.id)"
+                  @click="onClone(t)"
+                >
+                  <Copy v-if="!actions.isBusy(t.id)" class="size-3.5" />
+                </AppButton>
                 <NuxtLink :to="`/tunnels/${t.id}`">
                   <AppButton size="sm" variant="ghost">
                     <Pencil class="size-3.5" />
@@ -125,4 +174,7 @@ const rates = metrics.rates
       </table>
     </div>
   </AppCard>
+
+  <TunnelImportDialog v-model:open="showImport" @imported="onImported" />
+  <TunnelExportDialog v-if="exportTarget" v-model:open="showExport" :tunnel="exportTarget" />
 </template>

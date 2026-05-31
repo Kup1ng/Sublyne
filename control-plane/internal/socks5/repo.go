@@ -140,6 +140,23 @@ func (r *Repo) Get(ctx context.Context, id int64) (Proxy, error) {
 	return p, nil
 }
 
+// GetByName returns the proxy with the given name, or ErrProxyNotFound.
+// Used by the by-name tunnel-import/export path so an exported tunnel can
+// reference a SOCKS5 proxy by its stable name rather than a per-panel id
+// (ids differ between the two boxes). The `name` column carries a UNIQUE
+// constraint, so at most one row matches.
+func (r *Repo) GetByName(ctx context.Context, name string) (Proxy, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT `+proxyColumns+` FROM socks5_proxies WHERE name = ?`, name)
+	p, err := scanProxy(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Proxy{}, ErrProxyNotFound
+	}
+	if err != nil {
+		return Proxy{}, fmt.Errorf("socks5: get by name %q: %w", name, err)
+	}
+	return p, nil
+}
+
 // Create inserts a new proxy and returns the freshly-persisted row.
 // The caller is responsible for running validation first; this method
 // does not re-check semantics. A UNIQUE constraint violation on

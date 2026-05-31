@@ -123,6 +123,23 @@ func (r *Repo) Get(ctx context.Context, id int64) (Config, error) {
 	return c, nil
 }
 
+// GetByName returns the config with the given name, or ErrConfigNotFound.
+// Used by the by-name tunnel-import/export path so an exported tunnel can
+// reference a WireGuard config by its stable name rather than a per-panel
+// id (ids differ between the two boxes). The `name` column carries a
+// UNIQUE constraint, so at most one row matches.
+func (r *Repo) GetByName(ctx context.Context, name string) (Config, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT `+configColumns+` FROM wireguard_configs WHERE name = ?`, name)
+	c, err := scanConfig(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Config{}, ErrConfigNotFound
+	}
+	if err != nil {
+		return Config{}, fmt.Errorf("wg: get by name %q: %w", name, err)
+	}
+	return c, nil
+}
+
 // Create inserts a new config and returns the freshly-persisted row.
 // The caller is responsible for parsing the raw text first and
 // supplying the derived summary fields (InterfaceAddress, Endpoint,

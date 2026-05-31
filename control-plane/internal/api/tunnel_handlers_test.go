@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Kup1ng/Sublyne/control-plane/internal/tunnels"
+	"github.com/Kup1ng/Sublyne/control-plane/internal/wg"
 )
 
 // loginAndTokenHeader returns an Authorization: Bearer header for a
@@ -296,8 +298,8 @@ func TestUpdateTunnel_PSKOmittedKeepsExisting(t *testing.T) {
 		t.Fatalf("update = %d body=%s", res.Status, string(res.Body))
 	}
 
-	// Export should still show the original PSK.
-	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export"), hdr)
+	// Export (with secrets) should still show the original PSK.
+	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export?secrets=1"), hdr)
 	if exp.Status != http.StatusOK {
 		t.Fatalf("export: %d %s", exp.Status, string(exp.Body))
 	}
@@ -420,7 +422,8 @@ func TestExportTunnel_RevealsPSK(t *testing.T) {
 	s := httpServerForFixture(t, f)
 	hdr := loginAndTokenHeader(t, s.URL)
 	id := mustCreate(t, s.URL, hdr, validClientBody)
-	res := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export"), hdr)
+	// Secrets are opt-in: ?secrets=1 reveals the PSK.
+	res := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export?secrets=1"), hdr)
 	if res.Status != http.StatusOK {
 		t.Fatalf("export: %d body=%s", res.Status, string(res.Body))
 	}
@@ -432,33 +435,141 @@ func TestExportTunnel_RevealsPSK(t *testing.T) {
 	}
 }
 
-func TestImportTunnel_RoundTrip(t *testing.T) {
+// seedWGConfig inserts a WireGuard config row directly via the repo
+// (bypassing the parser) and returns its id and name. Tunnel import
+// round-trips reference a WG config by NAME, so the import target panel
+// must already have a config of that name; this seeds it.
+func seedWGConfig(t *testing.T, f *testFixture, name string) (int64, string) {
+	t.Helper()
+	cfg, err := f.wgRepo.Create(context.Background(), wg.Config{
+		Name:             name,
+		RawText:          "[Interface]\nPrivateKey=seed\n[Peer]\nPublicKey=peer\nEndpoint=198.51.100.10:51820\nAllowedIPs=0.0.0.0/0",
+		InterfaceAddress: "10.0.0.2/32",
+		Endpoint:         "198.51.100.10:51820",
+		PublicKeySelf:    "seedpub",
+		PeerCount:        1,
+	})
+	if err != nil {
+		t.Fatalf("seed wg config: %v", err)
+	}
+	return cfg.ID, cfg.Name
+}
+
+// clientBodyWithWG returns a client tunnel body that links a WireGuard
+// config by id instead of the legacy inline text, so export resolves a
+// wireguard_config_name and import can re-link it by name.
+func clientBodyWithWG(wgID int64) string {
+	b := strings.Replace(validClientBody,
+		`"wireguard_config": "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0"`,
+		`"wg_config_id": `+strconv.FormatInt(wgID, 10), 1)
+	return b
+}
+
+func TestExportImport_RoundTripIdentical(t *testing.T) {
 	f := newTestFixture(t)
 	s := httpServerForFixture(t, f)
 	hdr := loginAndTokenHeader(t, s.URL)
-	id := mustCreate(t, s.URL, hdr, validClientBody)
 
-	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export"), hdr)
+	wgID, wgName := seedWGConfig(t, f, "seller-wg")
+	id := mustCreate(t, s.URL, hdr, clientBodyWithWG(wgID))
+
+	// Read the original DTO so we can compare resolved fields later.
+	origRes := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)), hdr)
+	if origRes.Status != http.StatusOK {
+		t.Fatalf("get original: %d %s", origRes.Status, string(origRes.Body))
+	}
+	var orig tunnelDTO
+	if err := json.Unmarshal(origRes.Body, &orig); err != nil {
+		t.Fatalf("decode original: %v", err)
+	}
+
+	// Export WITH secrets and assert the envelope shape.
+	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export?secrets=1"), hdr)
 	if exp.Status != http.StatusOK {
 		t.Fatalf("export: %d %s", exp.Status, string(exp.Body))
 	}
-	// Tweak the name so it doesn't collide.
-	imported := strings.Replace(string(exp.Body), `"name":"tunnel-1"`, `"name":"tunnel-clone"`, 1)
-	// Change the app port and receive port so it doesn't collide.
-	imported = strings.Replace(imported, `"ports":[44443]`, `"ports":[44444]`, 1)
-	imported = strings.Replace(imported, `"download_receive_port":8443`, `"download_receive_port":8444`, 1)
+	var env tunnelExportEnvelope
+	if err := json.Unmarshal(exp.Body, &env); err != nil {
+		t.Fatalf("decode envelope: %v body=%s", err, string(exp.Body))
+	}
+	if env.Type != ExportType || env.SchemaVersion != ExportSchemaVersion {
+		t.Fatalf("envelope header = %q/%d, want %q/%d", env.Type, env.SchemaVersion, ExportType, ExportSchemaVersion)
+	}
+	if !env.SecretsIncluded {
+		t.Errorf("secrets_included should be true with ?secrets=1")
+	}
+	if env.Tunnel.PSK == nil || *env.Tunnel.PSK != "shared-psk-32-chars-long-xxxxxxxx" {
+		t.Errorf("export psk = %v, want the real PSK", env.Tunnel.PSK)
+	}
+	if env.Tunnel.WireguardConfigName == nil || *env.Tunnel.WireguardConfigName != wgName {
+		t.Errorf("wireguard_config_name = %v, want %q", env.Tunnel.WireguardConfigName, wgName)
+	}
 
+	// Delete the original so its bind ports (a Client tunnel's ports are
+	// exclusive across the panel) are free — this lets the import keep
+	// IDENTICAL ports and prove a true byte-for-byte config round-trip on
+	// the same panel. Stop is not needed: it was never started.
+	if del := doDelete(t, panelURL(s, "/api/tunnels/"+strID(id)), hdr); del.Status != http.StatusOK {
+		t.Fatalf("delete original: %d %s", del.Status, string(del.Body))
+	}
+
+	// Import the same envelope with a changed name only.
+	imported := strings.Replace(string(exp.Body), `"name":"tunnel-1"`, `"name":"tunnel-imported"`, 1)
 	res := postJSON(t, panelURL(s, "/api/tunnels/import"), imported, hdr)
 	if res.Status != http.StatusCreated {
 		t.Fatalf("import: %d body=%s", res.Status, string(res.Body))
 	}
+	var got tunnelDTO
+	if err := json.Unmarshal(res.Body, &got); err != nil {
+		t.Fatalf("decode import response: %v", err)
+	}
+
+	if got.Enabled {
+		t.Error("imported tunnel must land stopped")
+	}
+	if got.Name != "tunnel-imported" {
+		t.Errorf("name = %q, want tunnel-imported", got.Name)
+	}
+	if got.ID == orig.ID {
+		t.Errorf("imported tunnel should get a fresh id, got %d", got.ID)
+	}
+	// Config fields equal the original (modulo id/name/enabled). The WG
+	// link must have been RESOLVED by name to this panel's id.
+	if got.WGConfigID == nil || *got.WGConfigID != wgID {
+		t.Errorf("resolved wg_config_id = %v, want %d", got.WGConfigID, wgID)
+	}
+	if got.Role != orig.Role {
+		t.Errorf("role = %q, want %q", got.Role, orig.Role)
+	}
+	if got.DownloadTransport != orig.DownloadTransport {
+		t.Errorf("download_transport = %q, want %q", got.DownloadTransport, orig.DownloadTransport)
+	}
+	if got.UploadMode != orig.UploadMode {
+		t.Errorf("upload_mode = %q, want %q", got.UploadMode, orig.UploadMode)
+	}
+	if got.MTU != orig.MTU {
+		t.Errorf("mtu = %d, want %d", got.MTU, orig.MTU)
+	}
+	if got.DownloadSpoofSourceIP != orig.DownloadSpoofSourceIP {
+		t.Errorf("spoof ip = %q, want %q", got.DownloadSpoofSourceIP, orig.DownloadSpoofSourceIP)
+	}
+	if got.DownloadSpoofSourcePort != orig.DownloadSpoofSourcePort {
+		t.Errorf("spoof port = %d, want %d", got.DownloadSpoofSourcePort, orig.DownloadSpoofSourcePort)
+	}
+	if len(got.Ports) != len(orig.Ports) || (len(got.Ports) == 1 && got.Ports[0] != orig.Ports[0]) {
+		t.Errorf("ports = %v, want %v", got.Ports, orig.Ports)
+	}
+	if (got.LocalListenAddr == nil) != (orig.LocalListenAddr == nil) ||
+		(got.LocalListenAddr != nil && *got.LocalListenAddr != *orig.LocalListenAddr) {
+		t.Errorf("local_listen_addr = %v, want %v", got.LocalListenAddr, orig.LocalListenAddr)
+	}
+	if (got.UploadTargetAddr == nil) != (orig.UploadTargetAddr == nil) ||
+		(got.UploadTargetAddr != nil && *got.UploadTargetAddr != *orig.UploadTargetAddr) {
+		t.Errorf("upload_target_addr = %v, want %v", got.UploadTargetAddr, orig.UploadTargetAddr)
+	}
 }
 
-func TestImportTunnel_RejectsPortConflict(t *testing.T) {
-	// Phase 13 acceptance: importing a tunnel whose local_listen_addr
-	// or download_receive_port already belongs to another tunnel on
-	// this server must fail. The handler runs the same validator as
-	// CRUD; this test pins that promise.
+func TestExport_DefaultStripsSecrets(t *testing.T) {
 	f := newTestFixture(t)
 	s := httpServerForFixture(t, f)
 	hdr := loginAndTokenHeader(t, s.URL)
@@ -468,17 +579,188 @@ func TestImportTunnel_RejectsPortConflict(t *testing.T) {
 	if exp.Status != http.StatusOK {
 		t.Fatalf("export: %d %s", exp.Status, string(exp.Body))
 	}
-	// Rename so the unique-name check doesn't trip first, but leave
-	// local_listen_addr + download_receive_port unchanged so the port
-	// conflict is the only blocker.
-	clashing := strings.Replace(string(exp.Body), `"name":"tunnel-1"`, `"name":"tunnel-clash"`, 1)
-	res := postJSON(t, panelURL(s, "/api/tunnels/import"), clashing, hdr)
-	if res.Status != http.StatusBadRequest {
-		t.Fatalf("import (port clash): got %d want 400; body=%s", res.Status, string(res.Body))
+	var env tunnelExportEnvelope
+	if err := json.Unmarshal(exp.Body, &env); err != nil {
+		t.Fatalf("decode envelope: %v body=%s", err, string(exp.Body))
 	}
-	if !strings.Contains(string(res.Body), "local_listen_addr") &&
-		!strings.Contains(string(res.Body), "download_receive_port") {
-		t.Errorf("expected per-field validation error pointing at the conflicting port, got %s", string(res.Body))
+	if env.SecretsIncluded {
+		t.Errorf("secrets_included should be false by default")
+	}
+	if env.Tunnel.PSK != nil {
+		t.Errorf("psk should be null without ?secrets=1, got %v", *env.Tunnel.PSK)
+	}
+	if strings.Contains(string(exp.Body), "shared-psk-32-chars-long") {
+		t.Errorf("default export leaked the PSK: %s", string(exp.Body))
+	}
+}
+
+func TestImport_RejectsWrongType(t *testing.T) {
+	f := newTestFixture(t)
+	s := httpServerForFixture(t, f)
+	hdr := loginAndTokenHeader(t, s.URL)
+	// A pre-v2.7.0 bare {"tunnel": …} export has no `type`.
+	body := `{"tunnel":{"name":"x","role":"client"}}`
+	res := postJSON(t, panelURL(s, "/api/tunnels/import"), body, hdr)
+	if res.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body=%s", res.Status, string(res.Body))
+	}
+	if !strings.Contains(string(res.Body), `"file"`) ||
+		!strings.Contains(string(res.Body), "isn't a Sublyne tunnel export") {
+		t.Errorf("expected a `file` field error, got %s", string(res.Body))
+	}
+}
+
+func TestImport_RejectsWrongSchemaVersion(t *testing.T) {
+	f := newTestFixture(t)
+	s := httpServerForFixture(t, f)
+	hdr := loginAndTokenHeader(t, s.URL)
+	body := `{"type":"sublyne-tunnel-export","schema_version":2,"secrets_included":false,"tunnel":{"name":"x","role":"client"}}`
+	res := postJSON(t, panelURL(s, "/api/tunnels/import"), body, hdr)
+	if res.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body=%s", res.Status, string(res.Body))
+	}
+	if !strings.Contains(string(res.Body), `"file"`) ||
+		!strings.Contains(string(res.Body), "schema 2") {
+		t.Errorf("expected a `file` field error naming schema 2, got %s", string(res.Body))
+	}
+}
+
+func TestImport_UnknownWGName(t *testing.T) {
+	f := newTestFixture(t)
+	s := httpServerForFixture(t, f)
+	hdr := loginAndTokenHeader(t, s.URL)
+
+	wgID, _ := seedWGConfig(t, f, "seller-wg")
+	id := mustCreate(t, s.URL, hdr, clientBodyWithWG(wgID))
+	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export?secrets=1"), hdr)
+	if exp.Status != http.StatusOK {
+		t.Fatalf("export: %d %s", exp.Status, string(exp.Body))
+	}
+	// Point the reference at a config name that doesn't exist here, and
+	// rename so the unique-name check doesn't trip first.
+	imported := strings.Replace(string(exp.Body), `"wireguard_config_name":"seller-wg"`, `"wireguard_config_name":"nonesuch"`, 1)
+	imported = strings.Replace(imported, `"name":"tunnel-1"`, `"name":"tunnel-x"`, 1)
+	res := postJSON(t, panelURL(s, "/api/tunnels/import"), imported, hdr)
+	if res.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body=%s", res.Status, string(res.Body))
+	}
+	if !strings.Contains(string(res.Body), "wireguard_config_name") {
+		t.Errorf("expected a wireguard_config_name field error, got %s", string(res.Body))
+	}
+}
+
+func TestImport_MissingPSKRejected(t *testing.T) {
+	f := newTestFixture(t)
+	s := httpServerForFixture(t, f)
+	hdr := loginAndTokenHeader(t, s.URL)
+
+	wgID, _ := seedWGConfig(t, f, "seller-wg")
+	id := mustCreate(t, s.URL, hdr, clientBodyWithWG(wgID))
+	// Default export strips the PSK to null.
+	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export"), hdr)
+	if exp.Status != http.StatusOK {
+		t.Fatalf("export: %d %s", exp.Status, string(exp.Body))
+	}
+	imported := strings.Replace(string(exp.Body), `"name":"tunnel-1"`, `"name":"tunnel-nopsk"`, 1)
+	res := postJSON(t, panelURL(s, "/api/tunnels/import"), imported, hdr)
+	if res.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body=%s", res.Status, string(res.Body))
+	}
+	if !strings.Contains(string(res.Body), `"psk"`) {
+		t.Errorf("expected a psk field error (min length), got %s", string(res.Body))
+	}
+}
+
+func TestImport_NameClashConflict(t *testing.T) {
+	f := newTestFixture(t)
+	s := httpServerForFixture(t, f)
+	hdr := loginAndTokenHeader(t, s.URL)
+	id := mustCreate(t, s.URL, hdr, validClientBody)
+	// Export with secrets so the PSK is present; keep the name the same
+	// (the unique-name check is the blocker we want) but move the bind
+	// ports so the port-conflict validator doesn't fire FIRST with a 400
+	// — the name clash must surface as the 409 from Repo.Create.
+	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/export?secrets=1"), hdr)
+	if exp.Status != http.StatusOK {
+		t.Fatalf("export: %d %s", exp.Status, string(exp.Body))
+	}
+	body := strings.Replace(string(exp.Body), `"ports":[44443]`, `"ports":[44456]`, 1)
+	body = strings.Replace(body, `"download_receive_port":8443`, `"download_receive_port":8456`, 1)
+	res := postJSON(t, panelURL(s, "/api/tunnels/import"), body, hdr)
+	if res.Status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 body=%s", res.Status, string(res.Body))
+	}
+}
+
+func TestClone_CopiesAndStartsStopped(t *testing.T) {
+	f := newTestFixture(t)
+	s := httpServerForFixture(t, f)
+	hdr := loginAndTokenHeader(t, s.URL)
+
+	wgID, _ := seedWGConfig(t, f, "seller-wg")
+	id := mustCreate(t, s.URL, hdr, clientBodyWithWG(wgID))
+
+	res := postJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/clone"), `{}`, hdr)
+	if res.Status != http.StatusCreated {
+		t.Fatalf("clone: %d body=%s", res.Status, string(res.Body))
+	}
+	var clone tunnelDTO
+	if err := json.Unmarshal(res.Body, &clone); err != nil {
+		t.Fatalf("decode clone: %v", err)
+	}
+	if clone.ID == id {
+		t.Errorf("clone should have a fresh id, got %d", clone.ID)
+	}
+	if clone.Name != "tunnel-1 (copy)" {
+		t.Errorf("clone name = %q, want %q", clone.Name, "tunnel-1 (copy)")
+	}
+	if clone.Enabled {
+		t.Error("clone must land stopped")
+	}
+	if clone.WGConfigID == nil || *clone.WGConfigID != wgID {
+		t.Errorf("clone wg_config_id = %v, want %d", clone.WGConfigID, wgID)
+	}
+	if len(clone.Ports) != 1 || clone.Ports[0] != 44443 {
+		t.Errorf("clone ports = %v, want [44443]", clone.Ports)
+	}
+	// PSK preserved: export the clone with secrets and check.
+	exp := getJSON(t, panelURL(s, "/api/tunnels/"+strID(clone.ID)+"/export?secrets=1"), hdr)
+	if exp.Status != http.StatusOK {
+		t.Fatalf("export clone: %d %s", exp.Status, string(exp.Body))
+	}
+	if !strings.Contains(string(exp.Body), "shared-psk-32-chars-long-xxxxxxxx") {
+		t.Errorf("clone should preserve the PSK, got %s", string(exp.Body))
+	}
+}
+
+func TestClone_NameSuffixIncrements(t *testing.T) {
+	f := newTestFixture(t)
+	s := httpServerForFixture(t, f)
+	hdr := loginAndTokenHeader(t, s.URL)
+	id := mustCreate(t, s.URL, hdr, validClientBody)
+
+	first := postJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/clone"), `{}`, hdr)
+	if first.Status != http.StatusCreated {
+		t.Fatalf("clone 1: %d body=%s", first.Status, string(first.Body))
+	}
+	var c1 tunnelDTO
+	if err := json.Unmarshal(first.Body, &c1); err != nil {
+		t.Fatalf("decode clone 1: %v", err)
+	}
+	if c1.Name != "tunnel-1 (copy)" {
+		t.Errorf("first clone name = %q, want %q", c1.Name, "tunnel-1 (copy)")
+	}
+
+	second := postJSON(t, panelURL(s, "/api/tunnels/"+strID(id)+"/clone"), `{}`, hdr)
+	if second.Status != http.StatusCreated {
+		t.Fatalf("clone 2: %d body=%s", second.Status, string(second.Body))
+	}
+	var c2 tunnelDTO
+	if err := json.Unmarshal(second.Body, &c2); err != nil {
+		t.Fatalf("decode clone 2: %v", err)
+	}
+	if c2.Name != "tunnel-1 (copy 2)" {
+		t.Errorf("second clone name = %q, want %q", c2.Name, "tunnel-1 (copy 2)")
 	}
 }
 
