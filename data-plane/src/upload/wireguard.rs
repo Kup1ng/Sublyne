@@ -276,7 +276,7 @@ impl WireguardUpload {
 
 #[async_trait]
 impl UploadTransport for WireguardUpload {
-    async fn send(&self, _session: SessionKey, payload: &[u8]) -> io::Result<()> {
+    async fn send(&self, _session: SessionKey, payload: &[u8]) -> io::Result<bool> {
         // One syscall per packet. On the connected socket (the normal
         // case) `send()` skips the per-datagram destination + route
         // resolution that `send_to()` repeats every call. The
@@ -288,7 +288,7 @@ impl UploadTransport for WireguardUpload {
         // it for sticky pool routing.
         if self.connected.load(Ordering::Relaxed) {
             match self.egress.send(payload).await {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(true),
                 Err(e) => match classify_send_err(&e) {
                     // Backpressure: leave the socket connected and let
                     // the caller retry, exactly as before this change.
@@ -324,7 +324,7 @@ impl UploadTransport for WireguardUpload {
                 }
                 Err(_) => {}
             }
-            result.map(|_| ())
+            result.map(|_| true)
         }
     }
 }

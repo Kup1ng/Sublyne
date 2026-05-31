@@ -457,11 +457,17 @@ fn spawn_upload_task_tagged(
                         }
                         None => &buf[..n],
                     };
-                    if let Err(e) = upload_transport.send(session, out).await {
-                        warn!(tunnel_id = id, err = %e,
-                            "client: upload forward failed");
-                    } else {
-                        metrics.record_upload(n, now_unix());
+                    match upload_transport.send(session, out).await {
+                        // Delivered to the wire (or queued for it).
+                        Ok(true) => metrics.record_upload(n, now_unix()),
+                        // Dropped before the wire (SOCKS5 pool saturated):
+                        // count the drop, do NOT count it as a sent upload.
+                        Ok(false) => metrics.record_upload_drop(),
+                        Err(e) => {
+                            warn!(tunnel_id = id, err = %e,
+                                "client: upload forward failed");
+                            metrics.record_upload_drop();
+                        }
                     }
                 }
             }
