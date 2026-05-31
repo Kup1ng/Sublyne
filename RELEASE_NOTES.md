@@ -1,5 +1,70 @@
 # Release notes
 
+## v2.6.0 — Drop-visibility + download-ingest batching + dashboard controls
+
+A performance, packet-loss-hardening, and panel-usability release. **No wire
+change** — a v2.6.0 box interoperates with a v2.5.0 box on every row, so the
+two servers can be upgraded one at a time (single-box update, no flag-day).
+`PROTO_VERSION` stays `2`; the HMAC envelope, anti-replay `SeqWindow` (1024
+slots), random `session_id`, DF-clear, fwmark steering, SOCKS5 framing, and
+the multi-port app-port tag are all byte-identical to v2.5.0.
+
+### Data-plane: stop silent packet loss, batch the busiest socket
+
+- **Remote forward-reply ingest now drains with `recvmmsg`.** The socket that
+  receives the entire download payload stream (the busiest on the Remote) was
+  reading one datagram per syscall while its own docstring claimed batched
+  draining. Under a bursty ≥1 Gbps reply stream the single-syscall loop could
+  not empty the kernel buffer fast enough, so the kernel silently dropped the
+  overflow. It now drains a whole `recvmmsg` batch per wake-up — matching the
+  already-batched send side — sized by the existing `SUBLYNE_RECV_BATCH` knob
+  (set it to `1` to recover the old one-at-a-time behaviour). Sequence numbers
+  are still assigned one-per-datagram in arrival order and the single send
+  socket still serialises wire FIFO, so the anti-replay window is unaffected.
+- **Download- and upload-path drops are now visible on the panel.** Several
+  bounded-drop points (seal-channel full, send-queue full, the send-worker
+  dropping a staged batch on a hard `sendmmsg` error / writability failure /
+  persistent back-pressure, and SOCKS5 pool saturation) previously only wrote
+  a log line. Download-egress shedding now folds into the existing
+  `packet_loss_estimate` so the dashboard's loss gauge reflects it, and a
+  SOCKS5 frame dropped because every connection is down/full is no longer
+  miscounted as a *delivered* upload byte.
+- **Raw ICMP / ICMPv6 / ping-smoothing send sockets get the drop-all BPF
+  filter** the UDP/TCP send sockets already carry. Without it the kernel
+  copies every host ICMP packet onto these never-read sockets, pinning the
+  forced 4 MiB receive buffer and dropping unrelated inbound ICMP.
+- **Zero-allocation ICMPv6 checksum.** The ICMPv6 builder no longer copies the
+  whole message into a fresh per-packet `Vec` for the pseudo-header checksum;
+  it streams the pieces like the UDP/TCP builders (byte-identical result).
+
+### Panel
+
+- **Start/Stop buttons on the Dashboard tunnel tiles.** Each tile gains the
+  same primary action the Tunnels page has — Start when stopped, Stop when
+  running — reusing one shared action so the two pages can never drift. The
+  button disables with a spinner during the transition, a toast reports
+  failure, and the tile reflects the new state immediately.
+- **Redesigned live bandwidth chart.** The 30-second canvas sparkline now
+  renders the intended theme colours (the previous version drew black because
+  a canvas cannot resolve CSS `var()` in a colour string), with monotone-cubic
+  smoothing over a light moving average, soft gradient fills, a stable
+  "nice-rounded" auto-scaled Y axis with a unit label, and a current-value pill
+  riding each line. Still a single dependency-free canvas repaint per frame.
+
+### Why this is v2.6.0 (a minor release)
+
+Backward-compatible feature additions (dashboard controls, drop metering) plus
+performance fixes, with no wire-format change. By semver that is a minor bump.
+
+### Invariants preserved
+
+HMAC auth + 1024-slot anti-replay `SeqWindow`; parallel-seal → single-send wire
+ordering (PR #36); random `session_id` (no wall-clock); DF-clear on spoof
+egress; fwmark / ip-rule steering; 4 MiB forced socket buffers (v2.2.0); SOCKS5
+keepalive + `TCP_USER_TIMEOUT`, per-slot driver + bounded queue, striping +
+BBR (v2.1.0/v2.2.0/v2.4.0); multi-port app-port tag inside the sealed payload
+(v2.5.0). PSK never leaks; no inter-server control plane.
+
 ## v2.5.0 — Multi-port tunnels
 
 A single Sublyne tunnel can now carry **several application ports** (up to
