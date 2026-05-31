@@ -21,7 +21,7 @@ import {
   mechanismName,
   uploadModeAllowed,
 } from '~/utils/uploadMatrix'
-import { buildPorts, extrasFromPorts, parseExtraPorts, portFromAddr } from '~/utils/multiport'
+import { MAX_PORTS_PER_TUNNEL, buildPorts, parsePorts, portsToInput } from '~/utils/multiport'
 
 const props = defineProps<{
   initial?: Partial<Tunnel>
@@ -155,44 +155,35 @@ const socksOptions = computed(() =>
   socks.list.value.map((p) => ({ value: p.id, label: `${p.name} (${p.host}:${p.port})` })),
 )
 
-// Multi-port: the main port is taken from local_listen_addr (Client) /
-// forward_target (Remote); the operator types only the EXTRA ports here as
-// a comma-separated string. On submit we send `ports` = sorted unique
-// [mainPort, ...extras] when there are extras, else omit it (single-port).
-const mainPort = computed(() =>
-  portFromAddr(isClient.value ? draft.value.local_listen_addr : draft.value.forward_target),
-)
-const extraPortsInput = ref('')
+// Unified application ports (v2.7.0): the operator enters ALL ports for the
+// tunnel as one comma-separated list. There is no "main port" vs "extras" —
+// every port is a first-class peer, forwarded identically. The address
+// fields above carry only a host.
+const portsInput = ref('')
 
-// Seed the extras field from an existing tunnel's `ports` (minus the main
-// port). watchEffect re-runs when props.initial loads asynchronously.
+// Seed the ports field from an existing tunnel's `ports`. watchEffect re-runs
+// when props.initial loads asynchronously.
 watchEffect(() => {
   if (props.initial) {
-    extraPortsInput.value = extrasFromPorts(props.initial.ports, mainPort.value)
+    portsInput.value = portsToInput(props.initial.ports)
   }
 })
 
-const extraPortsParsed = computed(() => parseExtraPorts(extraPortsInput.value, mainPort.value))
-const extraPortsError = computed(() =>
-  extraPortsParsed.value.ok ? null : extraPortsParsed.value.error,
-)
-const portsPreview = computed(() => {
-  const parsed = extraPortsParsed.value
-  if (!parsed.ok) return null
-  return buildPorts(mainPort.value, parsed.extras) ?? null
-})
+const portsParsed = computed(() => parsePorts(portsInput.value))
+// A red error shows only for a genuine mistake, not for an empty field.
+const portsError = computed(() => portsParsed.value.error)
+const portsCount = computed(() => portsParsed.value.ports.length)
 
 function err(field: string) {
   return props.errors?.[field] ?? null
 }
 
 function submit() {
-  if (extraPortsError.value) return
-  const parsed = extraPortsParsed.value
-  // Omit `ports` for a single-port tunnel so the request stays wire-
-  // identical to legacy tunnels; set the full union when multi-port.
-  const ports = parsed.ok ? buildPorts(mainPort.value, parsed.extras) : undefined
-  emit('submit', { ...draft.value, ports })
+  const parsed = portsParsed.value
+  // Block submit on a parse error or an empty list — every tunnel needs at
+  // least one port (the Go validator enforces this too).
+  if (parsed.error || parsed.ports.length === 0) return
+  emit('submit', { ...draft.value, ports: buildPorts(parsed.ports) })
 }
 </script>
 
@@ -231,14 +222,14 @@ function submit() {
       <div class="grid gap-5 md:grid-cols-2">
         <FieldGroup
           label="Local listen address"
-          help="UDP listener for the end user, e.g. 0.0.0.0:443."
+          help="Host/IP to bind the listener on — 0.0.0.0 for all interfaces, or a specific IP. No port here; list the port(s) in the Ports section below."
           :error="err('local_listen_addr')"
           required
         >
           <AppInput
             v-model="draft.local_listen_addr"
             :invalid="!!err('local_listen_addr')"
-            placeholder="0.0.0.0:443"
+            placeholder="0.0.0.0"
             monospace
           />
         </FieldGroup>
@@ -384,15 +375,15 @@ function submit() {
           <AppSelect v-model="draft.upload_listen_mode" :options="remoteListenOptions" />
         </FieldGroup>
         <FieldGroup
-          label="Forward target"
-          help="The real destination (host:port) — typically your proxy panel."
+          label="Forward target address"
+          help="Host/IP of the real destination (your proxy panel) — e.g. 127.0.0.1 or 192.0.2.10. No port here; list the port(s) in the Ports section below."
           :error="err('forward_target')"
           required
         >
           <AppInput
             v-model="draft.forward_target"
             :invalid="!!err('forward_target')"
-            placeholder="192.0.2.10:443"
+            placeholder="192.0.2.10"
             monospace
           />
         </FieldGroup>
@@ -505,24 +496,25 @@ function submit() {
     </AppCard>
 
     <AppCard
-      title="Application ports"
-      description="Carry several services over this one tunnel. Both sides must use the same list."
+      title="Ports"
+      description="Every UDP port this tunnel carries. All ports are forwarded identically — same speed, same path, same security. Both sides use the same list."
     >
       <div class="grid gap-5 md:grid-cols-2">
         <FieldGroup
-          label="Additional ports (multi-port)"
-          help="Leave blank for a normal single-port tunnel. To carry several services over this one tunnel, list the EXTRA port numbers here, comma-separated. The SAME port numbers are used on both the Iran and foreign side (client :8001 ↔ remote :8001). The main port above is always included automatically."
-          hint="Comma-separated, e.g. 8001, 8002. Max 32 ports total (including the main port)."
-          :error="extraPortsError"
+          label="Ports"
+          help="All UDP ports for this tunnel, comma-separated. Each port is bound on the Iran side and forwarded to the SAME port number on the foreign side (e.g. 443 ↔ 443). One port is a normal single-service tunnel; list several to carry multiple services over the one secure pipeline."
+          hint="Comma-separated, e.g. 443, 8001, 8002."
+          :error="portsError"
+          required
         >
           <AppInput
-            v-model="extraPortsInput"
-            :invalid="!!extraPortsError"
-            placeholder="8001, 8002"
+            v-model="portsInput"
+            :invalid="!!portsError"
+            placeholder="443, 8001"
             monospace
           />
-          <p v-if="portsPreview" class="mt-1.5 text-[12px] font-medium text-brand">
-            Ports: {{ portsPreview.join(', ') }}
+          <p class="mt-1.5 text-[12px] font-medium text-subtle">
+            {{ portsCount }} / {{ MAX_PORTS_PER_TUNNEL }} ports
           </p>
         </FieldGroup>
       </div>

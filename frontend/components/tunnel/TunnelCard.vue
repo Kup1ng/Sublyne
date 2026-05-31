@@ -21,12 +21,13 @@ const upLabel = computed(() => (props.rate ? formatBitsPerSecond(props.rate.bps_
 const downLabel = computed(() => (props.rate ? formatBitsPerSecond(props.rate.bps_down) : '—'))
 const sessionsLabel = computed(() => (props.rate ? formatNumber(props.rate.sessions) : '—'))
 
-// Multi-port tunnels carry several application ports (1 element would be a
-// single-port tunnel). Surface the full list as a small badge; stats stay
-// aggregate across all ports.
+// Surface the tunnel's application ports as a small badge. Since v2.7.0 the
+// address no longer carries the port, so show it for every tunnel (one or
+// many). Stats stay aggregate across all ports — every port is forwarded
+// identically.
 const portsLabel = computed(() => {
   const ports = props.tunnel.ports
-  return ports && ports.length >= 2 ? ports.join(', ') : null
+  return ports && ports.length >= 1 ? ports.join(', ') : null
 })
 </script>
 
