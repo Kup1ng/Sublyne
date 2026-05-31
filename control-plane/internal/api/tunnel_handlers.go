@@ -106,6 +106,11 @@ type tunnelDTO struct {
 	IdleTimeout             int    `json:"idle_timeout"`
 	IcmpEchoMode            string `json:"icmp_echo_mode"`
 
+	// Ports (v2.5.0 multi-port): the full authoritative list of
+	// application ports this tunnel carries. Empty / absent = legacy
+	// single-port. Returned as the parsed array on read.
+	Ports []int `json:"ports,omitempty"`
+
 	LocalListenAddr     *string `json:"local_listen_addr"`
 	DownloadReceivePort *int    `json:"download_receive_port"`
 	UploadTargetAddr    *string `json:"upload_target_addr"`
@@ -154,6 +159,7 @@ func toDTO(t tunnels.Tunnel, redactPSK bool) tunnelDTO {
 		MaxConnections:          t.MaxConnections,
 		IdleTimeout:             t.IdleTimeout,
 		IcmpEchoMode:            string(t.IcmpEchoMode),
+		Ports:                   t.Ports,
 		UploadMode:              string(t.UploadMode),
 		UploadListenMode:        string(t.UploadListenMode),
 		PingSmoothingEnabled:    t.PingSmoothingEnabled,
@@ -248,6 +254,11 @@ type tunnelInput struct {
 	IdleTimeout             int     `json:"idle_timeout"`
 	IcmpEchoMode            string  `json:"icmp_echo_mode"`
 
+	// Ports (v2.5.0 multi-port): the full authoritative list of
+	// application ports. Absent or [] means single-port; the validator
+	// enforces range / dedup / cap / canonical-membership when present.
+	Ports []int `json:"ports,omitempty"`
+
 	LocalListenAddr     *string `json:"local_listen_addr"`
 	DownloadReceivePort *int    `json:"download_receive_port"`
 	UploadTargetAddr    *string `json:"upload_target_addr"`
@@ -327,6 +338,7 @@ func (in *tunnelInput) toTunnel(role tunnels.Role, psk string) tunnels.Tunnel {
 		MaxConnections:          in.MaxConnections,
 		IdleTimeout:             in.IdleTimeout,
 		IcmpEchoMode:            tunnels.IcmpEchoMode(in.IcmpEchoMode),
+		Ports:                   in.Ports,
 		UploadMode:              tunnels.UploadMode(in.UploadMode),
 		UploadListenMode:        tunnels.UploadListenMode(in.UploadListenMode),
 		PingSmoothingEnabled:    in.PingSmoothingEnabled,
@@ -1025,6 +1037,7 @@ func ImportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 			MaxConnections:          body.Tunnel.MaxConnections,
 			IdleTimeout:             body.Tunnel.IdleTimeout,
 			IcmpEchoMode:            body.Tunnel.IcmpEchoMode,
+			Ports:                   body.Tunnel.Ports,
 			LocalListenAddr:         body.Tunnel.LocalListenAddr,
 			DownloadReceivePort:     body.Tunnel.DownloadReceivePort,
 			UploadTargetAddr:        body.Tunnel.UploadTargetAddr,

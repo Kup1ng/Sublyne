@@ -56,11 +56,11 @@ func TestApply_RecordsVersionRow(t *testing.T) {
 	if err := conn.QueryRowContext(ctx, "SELECT MAX(version) FROM schema_version").Scan(&max); err != nil {
 		t.Fatalf("query schema_version: %v", err)
 	}
-	// Bumped to 9 when the v2 upload×download matrix added
-	// 0009_upload_matrix.sql. Future phases that add a migration
-	// should bump this in lockstep.
-	if !max.Valid || max.Int64 != 9 {
-		t.Errorf("max(version) = %v valid=%v, want 9", max.Int64, max.Valid)
+	// Bumped to 10 when v2.5.0 multi-port tunnels added
+	// 0010_multiport.sql (adds tunnels.ports). Future phases that add a
+	// migration should bump this in lockstep.
+	if !max.Valid || max.Int64 != 10 {
+		t.Errorf("max(version) = %v valid=%v, want 10", max.Int64, max.Valid)
 	}
 }
 

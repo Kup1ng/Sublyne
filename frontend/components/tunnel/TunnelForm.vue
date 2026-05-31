@@ -21,6 +21,7 @@ import {
   mechanismName,
   uploadModeAllowed,
 } from '~/utils/uploadMatrix'
+import { buildPorts, extrasFromPorts, parseExtraPorts, portFromAddr } from '~/utils/multiport'
 
 const props = defineProps<{
   initial?: Partial<Tunnel>
@@ -154,12 +155,44 @@ const socksOptions = computed(() =>
   socks.list.value.map((p) => ({ value: p.id, label: `${p.name} (${p.host}:${p.port})` })),
 )
 
+// Multi-port: the main port is taken from local_listen_addr (Client) /
+// forward_target (Remote); the operator types only the EXTRA ports here as
+// a comma-separated string. On submit we send `ports` = sorted unique
+// [mainPort, ...extras] when there are extras, else omit it (single-port).
+const mainPort = computed(() =>
+  portFromAddr(isClient.value ? draft.value.local_listen_addr : draft.value.forward_target),
+)
+const extraPortsInput = ref('')
+
+// Seed the extras field from an existing tunnel's `ports` (minus the main
+// port). watchEffect re-runs when props.initial loads asynchronously.
+watchEffect(() => {
+  if (props.initial) {
+    extraPortsInput.value = extrasFromPorts(props.initial.ports, mainPort.value)
+  }
+})
+
+const extraPortsParsed = computed(() => parseExtraPorts(extraPortsInput.value, mainPort.value))
+const extraPortsError = computed(() =>
+  extraPortsParsed.value.ok ? null : extraPortsParsed.value.error,
+)
+const portsPreview = computed(() => {
+  const parsed = extraPortsParsed.value
+  if (!parsed.ok) return null
+  return buildPorts(mainPort.value, parsed.extras) ?? null
+})
+
 function err(field: string) {
   return props.errors?.[field] ?? null
 }
 
 function submit() {
-  emit('submit', draft.value)
+  if (extraPortsError.value) return
+  const parsed = extraPortsParsed.value
+  // Omit `ports` for a single-port tunnel so the request stays wire-
+  // identical to legacy tunnels; set the full union when multi-port.
+  const ports = parsed.ok ? buildPorts(mainPort.value, parsed.extras) : undefined
+  emit('submit', { ...draft.value, ports })
 }
 </script>
 
@@ -467,6 +500,30 @@ function submit() {
           help="Sessions idle longer than this are evicted."
         >
           <AppInput v-model="draft.idle_timeout" type="number" monospace />
+        </FieldGroup>
+      </div>
+    </AppCard>
+
+    <AppCard
+      title="Application ports"
+      description="Carry several services over this one tunnel. Both sides must use the same list."
+    >
+      <div class="grid gap-5 md:grid-cols-2">
+        <FieldGroup
+          label="Additional ports (multi-port)"
+          help="Leave blank for a normal single-port tunnel. To carry several services over this one tunnel, list the EXTRA port numbers here, comma-separated. The SAME port numbers are used on both the Iran and foreign side (client :8001 ↔ remote :8001). The main port above is always included automatically."
+          hint="Comma-separated, e.g. 8001, 8002. Max 32 ports total (including the main port)."
+          :error="extraPortsError"
+        >
+          <AppInput
+            v-model="extraPortsInput"
+            :invalid="!!extraPortsError"
+            placeholder="8001, 8002"
+            monospace
+          />
+          <p v-if="portsPreview" class="mt-1.5 text-[12px] font-medium text-brand">
+            Ports: {{ portsPreview.join(', ') }}
+          </p>
         </FieldGroup>
       </div>
     </AppCard>

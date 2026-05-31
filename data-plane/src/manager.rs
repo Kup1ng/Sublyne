@@ -524,6 +524,7 @@ mod tests {
             pacing_target_ms: 100,
             socks5_target: None,
             upload_listen_mode: crate::spec::UploadListenMode::Udp,
+            ports: Vec::new(),
         };
         // This test requires CAP_NET_RAW for the raw socket open;
         // mark it ignored so unprivileged CI still passes. The

@@ -14,6 +14,14 @@ const status = computed<TunnelRate['status'] | null>(() => {
 const upLabel = computed(() => (props.rate ? formatBitsPerSecond(props.rate.bps_up) : '—'))
 const downLabel = computed(() => (props.rate ? formatBitsPerSecond(props.rate.bps_down) : '—'))
 const sessionsLabel = computed(() => (props.rate ? formatNumber(props.rate.sessions) : '—'))
+
+// Multi-port tunnels carry several application ports (1 element would be a
+// single-port tunnel). Surface the full list as a small badge; stats stay
+// aggregate across all ports.
+const portsLabel = computed(() => {
+  const ports = props.tunnel.ports
+  return ports && ports.length >= 2 ? ports.join(', ') : null
+})
 </script>
 
 <template>
@@ -34,6 +42,10 @@ const sessionsLabel = computed(() => (props.rate ? formatNumber(props.rate.sessi
         </div>
       </div>
       <TunnelStatusBadge :status="status" />
+    </div>
+
+    <div v-if="portsLabel" class="mt-3">
+      <AppBadge tone="brand">Ports: {{ portsLabel }}</AppBadge>
     </div>
 
     <dl class="mt-4 grid grid-cols-3 gap-2 text-[12px]">

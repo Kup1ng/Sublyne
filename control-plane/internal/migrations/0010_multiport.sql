@@ -1,0 +1,23 @@
+-- 0010_multiport.sql
+-- v2.5.0 multi-port tunnels. A single tunnel can now carry several
+-- application ports through the one secure download-spoof / upload
+-- pipeline, with a fixed 1:1 same-number mapping between Client and
+-- Remote (client :8000 <-> remote :8000, client :8001 <-> remote :8001,
+-- ...).
+--
+-- Storage: a comma-separated list of port numbers in a single TEXT
+-- column. The empty string (the DEFAULT, and the value backfilled onto
+-- every existing row) means "legacy single-port": the tunnel's one port
+-- continues to live in local_listen_addr (Client) / forward_target
+-- (Remote) exactly as before, and the data plane behaves byte-for-byte
+-- like v2.4.0. A non-empty list (e.g. '8000,8001,8002') is the full
+-- authoritative set of application ports the tunnel carries (including
+-- the canonical port already present in local_listen_addr /
+-- forward_target); the bind host is taken from those existing columns
+-- and every port in the list is bound on both sides.
+--
+-- No column is dropped or rewritten, so this migration is fully
+-- backward compatible: existing single-port tunnels keep working with
+-- zero operator action.
+
+ALTER TABLE tunnels ADD COLUMN ports TEXT NOT NULL DEFAULT '';

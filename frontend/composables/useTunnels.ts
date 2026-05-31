@@ -16,6 +16,7 @@ const TUNNEL_INPUT_FIELDS = [
   'max_connections',
   'idle_timeout',
   'icmp_echo_mode',
+  'ports',
   // client-side optional
   'local_listen_addr',
   'download_receive_port',

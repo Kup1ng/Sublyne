@@ -37,6 +37,7 @@
 //! single recv loop drains the kernel buffer with `recvmmsg(16)`, so
 //! kernel-side throughput is not the bottleneck even at 200 Mbit/s.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
@@ -53,6 +54,7 @@ use crate::batch::{self, RecvBatch};
 use crate::hmac::{self, HmacKey, OpenError, SeqWindow};
 use crate::manager::SpawnError;
 use crate::metrics::TunnelMetrics;
+use crate::multiport;
 use crate::protocol::TunnelState;
 use crate::session::{InsertOutcome, SessionTable};
 use crate::spec::{ResolvedSpec, Transport, TunnelSpec};
@@ -94,6 +96,46 @@ struct DownloadVerifyJob {
     /// Transport label for log lines.
     transport: &'static str,
 }
+
+/// One application port's delivery resources on a multi-port Client
+/// tunnel: the UDP listener bound on `(local_host, port)` and the
+/// per-port session table tracking that port's end-user peers. Mirrors
+/// the single-port `(listener, session_table)` pair, replicated per port
+/// and keyed by the decoded application-port tag.
+#[derive(Clone)]
+struct PortBinding {
+    listener: Arc<UdpSocket>,
+    sessions: Arc<SessionTable>,
+}
+
+/// How a download-verify worker delivers a verified payload back to the
+/// end user.
+///
+/// - `Single` is the legacy single-port path: ONE listener + ONE session
+///   table, delivering the whole (untagged) payload exactly as before.
+/// - `Multi` is the multi-port path: the worker decodes the 2-byte
+///   application-port tag from the verified payload, looks the port up in
+///   the binding map, and delivers the untagged body via that port's
+///   listener. Unknown ports are dropped + warned (rate-limited).
+///
+/// All workers share ONE seq stream and each owns ONE [`SeqWindow`]
+/// (keyed by `seq % N`); the application port is demuxed from the
+/// authenticated payload tag AFTER the HMAC check, never by sharding the
+/// replay window per port.
+#[derive(Clone)]
+enum PortRouter {
+    Single {
+        listener: Arc<UdpSocket>,
+        sessions: Arc<SessionTable>,
+    },
+    Multi(Arc<HashMap<u16, PortBinding>>),
+}
+
+/// Process-wide sampled counter for multi-port download packets whose
+/// decoded application-port tag is not in the tunnel's configured set
+/// (config drift between the two sides). Sampled like the version-mismatch
+/// counter so a wholesale-misconfigured peer doesn't flood the app log.
+static UNKNOWN_PORT_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Parser function pointer for an IPv4 raw-socket download transport.
 /// Each transport supplies an implementation that peels its specific
@@ -168,23 +210,101 @@ pub(super) async fn spawn(
         .await
         .map_err(SpawnError::Io)?;
 
-    // Upload-side task: end-user → forward to upload_target via the
-    // selected upload transport (WG-marked UDP or SOCKS5 TCP). The
-    // listener port travels into the upload task so it can stamp each
-    // `SessionKey` with `(client_addr, local_port)` for SOCKS5 sticky
-    // routing — the WG transport ignores it.
-    spawn_upload_task(
-        tasks,
-        id,
-        name.clone(),
-        listener.clone(),
-        local.port(),
-        upload_transport.clone(),
-        session_table.clone(),
-        mutable_config.clone(),
-        metrics.clone(),
-        stop_rx.clone(),
-    );
+    // Multi-port vs single-port routing. A multi-port tunnel binds one
+    // listener + one session table PER application port (all sharing the
+    // single `upload_transport` egress) and tags every datagram with the
+    // 2-byte application-port tag; the single-port path is left
+    // byte-for-byte identical to before. See [`crate::multiport`].
+    let router = if resolved.multiport() {
+        let local_host = local.ip();
+        let mut bindings: HashMap<u16, PortBinding> = HashMap::with_capacity(resolved.ports.len());
+        for &port in &resolved.ports {
+            if bindings.contains_key(&port) {
+                continue;
+            }
+            let addr = SocketAddr::new(local_host, port);
+            let port_listener = bind_dualstack_udp(addr).map_err(SpawnError::Io)?;
+            crate::perf::tune_socket(&port_listener, "client/listen");
+            let port_listener = Arc::new(port_listener);
+            let port_sessions = Arc::new(SessionTable::new(
+                spec.max_connections,
+                spec.idle_timeout_sec,
+            ));
+            info!(tunnel_id = id, addr = %addr, family = address_family_label(addr),
+                "client: multi-port local_listen bound");
+            // One upload task per port: stamps SessionKey.local_port = P
+            // and prepends the port tag before handing bytes to the shared
+            // upload transport.
+            spawn_upload_task_tagged(
+                tasks,
+                id,
+                name.clone(),
+                port_listener.clone(),
+                port,
+                Some(port),
+                upload_transport.clone(),
+                port_sessions.clone(),
+                mutable_config.clone(),
+                metrics.clone(),
+                stop_rx.clone(),
+            );
+            // One idle sweeper per port session table.
+            spawn_idle_sweeper(
+                tasks,
+                id,
+                spec.idle_timeout_sec,
+                port_sessions.clone(),
+                metrics.clone(),
+                stop_rx.clone(),
+            );
+            bindings.insert(
+                port,
+                PortBinding {
+                    listener: port_listener,
+                    sessions: port_sessions,
+                },
+            );
+        }
+        // The primary listener bound on `local` is unused on the multi-
+        // port path (each port has its own listener). Dropping the Arc
+        // here closes it.
+        drop(listener);
+        PortRouter::Multi(Arc::new(bindings))
+    } else {
+        // Upload-side task: end-user → forward to upload_target via the
+        // selected upload transport (WG-marked UDP or SOCKS5 TCP). The
+        // listener port travels into the upload task so it can stamp each
+        // `SessionKey` with `(client_addr, local_port)` for SOCKS5 sticky
+        // routing — the WG transport ignores it.
+        spawn_upload_task_tagged(
+            tasks,
+            id,
+            name.clone(),
+            listener.clone(),
+            local.port(),
+            None,
+            upload_transport.clone(),
+            session_table.clone(),
+            mutable_config.clone(),
+            metrics.clone(),
+            stop_rx.clone(),
+        );
+
+        // (3) Idle sweeper.
+        spawn_idle_sweeper(
+            tasks,
+            id,
+            spec.idle_timeout_sec,
+            session_table.clone(),
+            metrics.clone(),
+            stop_rx.clone(),
+        );
+
+        PortRouter::Single {
+            listener: listener.clone(),
+            sessions: session_table.clone(),
+        }
+    };
 
     // Download-side: per-transport raw recv → bounded channel → N HMAC
     // verify-and-deliver workers. See module-doc for why fan-out is on
@@ -195,8 +315,7 @@ pub(super) async fn spawn(
         resolved,
         id,
         name.clone(),
-        listener.clone(),
-        session_table.clone(),
+        router,
         mutable_config.clone(),
         metrics.clone(),
         download_port,
@@ -205,16 +324,6 @@ pub(super) async fn spawn(
         stop_rx.clone(),
     )
     .await?;
-
-    // (3) Idle sweeper.
-    spawn_idle_sweeper(
-        tasks,
-        id,
-        spec.idle_timeout_sec,
-        session_table.clone(),
-        metrics.clone(),
-        stop_rx.clone(),
-    );
 
     // (4) Phase 13: cosmetic ping smoothing. The responder task is
     // always spawned for Client tunnels so flipping the toggle via
@@ -268,13 +377,23 @@ fn bind_dualstack_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(sock.into())
 }
 
+/// Upload listener task. When `tag_port` is `None` (single-port) the
+/// payload is shipped opaque, byte-for-byte as before. When `tag_port` is
+/// `Some(P)` (multi-port) the body is prefixed with the 2-byte
+/// application-port tag (`encode_tag`) before being handed to the shared
+/// upload transport; the per-task scratch `Vec` is reused across packets.
+///
+/// The MTU cap check (PR #15) is always applied to the UNTAGGED body `n`,
+/// so multi-port effectively reduces usable app payload by `PORT_TAG_LEN`
+/// bytes — the same cap applies to both paths.
 #[allow(clippy::too_many_arguments)]
-fn spawn_upload_task(
+fn spawn_upload_task_tagged(
     tasks: &mut JoinSet<()>,
     id: i64,
     name: Arc<String>,
     listener: Arc<UdpSocket>,
     local_port: u16,
+    tag_port: Option<u16>,
     upload_transport: Arc<dyn UploadTransport>,
     session_table: Arc<SessionTable>,
     mutable_config: MutableConfigSlot,
@@ -288,6 +407,9 @@ fn spawn_upload_task(
         // cap check would then see n==mtu and accept the corrupted
         // packet — see PR #15.
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+        // Per-task scratch reused for the tagged payload on the multi-port
+        // path. Never allocated on the single-port path.
+        let mut tagged: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
                 _ = stop_rx.changed() => {
@@ -326,7 +448,16 @@ fn spawn_upload_task(
                         client_addr: src,
                         local_port,
                     };
-                    if let Err(e) = upload_transport.send(session, &buf[..n]).await {
+                    // Single-port: ship the body opaque (wire-identical).
+                    // Multi-port: prepend the 2-byte application-port tag.
+                    let out: &[u8] = match tag_port {
+                        Some(p) => {
+                            multiport::encode_tag(p, &buf[..n], &mut tagged);
+                            &tagged
+                        }
+                        None => &buf[..n],
+                    };
+                    if let Err(e) = upload_transport.send(session, out).await {
                         warn!(tunnel_id = id, err = %e,
                             "client: upload forward failed");
                     } else {
@@ -345,8 +476,7 @@ async fn spawn_download_pipeline(
     resolved: &ResolvedSpec,
     id: i64,
     name: Arc<String>,
-    listener: Arc<UdpSocket>,
-    session_table: Arc<SessionTable>,
+    router: PortRouter,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
     download_port: u16,
@@ -359,8 +489,8 @@ async fn spawn_download_pipeline(
     // One bounded channel per worker. The recv task routes jobs by
     // `seq % workers` so each worker only ever sees seqs from its own
     // arithmetic subset — each worker therefore owns a private
-    // `SeqWindow` with NO cross-worker lock, AND the 128-bit bitmap
-    // covers `128 * workers` consecutive wire-seqs of reordering
+    // `SeqWindow` with NO cross-worker lock, AND the 1024-slot bitmap
+    // covers `1024 * workers` consecutive wire-seqs of reordering
     // headroom (more than enough at our packet rate).
     let mut worker_txs: Vec<mpsc::Sender<DownloadVerifyJob>> = Vec::with_capacity(workers);
     let mut worker_rxs: Vec<mpsc::Receiver<DownloadVerifyJob>> = Vec::with_capacity(workers);
@@ -481,18 +611,19 @@ async fn spawn_download_pipeline(
     }
 
     // Spawn N verify-and-deliver workers, each consuming from its own
-    // per-worker channel with its own per-worker SeqWindow.
+    // per-worker channel with its own per-worker SeqWindow. All workers
+    // share ONE seq stream + ONE SeqWindow each (keyed by `seq % N`); the
+    // application port is demuxed from the verified payload tag AFTER the
+    // HMAC check, never by sharding the window per port.
     for (worker_id, rx) in worker_rxs.into_iter().enumerate() {
-        let listener = listener.clone();
-        let session_table = session_table.clone();
+        let router = router.clone();
         let mutable_config = mutable_config.clone();
         let metrics = metrics.clone();
         let name = name.clone();
         let stop_rx = stop_rx.clone();
         tasks.spawn(download_verify_worker(
             rx,
-            listener,
-            session_table,
+            router,
             mutable_config,
             metrics,
             id,
@@ -757,8 +888,7 @@ async fn spawn_v6_recv_loop(
 #[allow(clippy::too_many_arguments)]
 async fn download_verify_worker(
     mut rx: mpsc::Receiver<DownloadVerifyJob>,
-    listener: Arc<UdpSocket>,
-    session_table: Arc<SessionTable>,
+    router: PortRouter,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
     id: i64,
@@ -794,8 +924,7 @@ async fn download_verify_worker(
                     psk.as_ref(),
                     &job.sealed,
                     &mut window,
-                    &listener,
-                    &session_table,
+                    &router,
                     &metrics,
                     id,
                     job.transport,
@@ -812,8 +941,7 @@ async fn deliver_verified_job(
     psk: &HmacKey,
     sealed: &[u8],
     window: &mut SeqWindow,
-    listener: &UdpSocket,
-    session_table: &SessionTable,
+    router: &PortRouter,
     metrics: &TunnelMetrics,
     id: i64,
     transport_label: &'static str,
@@ -823,62 +951,62 @@ async fn deliver_verified_job(
     // routes by `seq % N` so only this worker ever sees this seq.
     let verify_result = hmac::open_with(psk, sealed, window);
     match verify_result {
-        Ok(body) => {
-            // Stamp `last_packet_received_at_unix` and the per-transport
-            // packet counter as soon as a HMAC-verified packet arrives,
-            // BEFORE the delivery step. PRD §2.4 derives the dashboard
-            // health badge from "observed packet activity"; a verified
-            // packet is observed activity even if `any_session` later
-            // returns no peer to deliver it to. Mirrors the Remote side
-            // in `tunnel::remote::spawn_download_recv_loop`, which also
-            // records the metric on recv rather than on send.
-            //
-            // Without this, a tunnel that's receiving spoofed packets
-            // but has no live upstream session (e.g., right after idle
-            // eviction, before the next end-user packet creates a fresh
-            // session) would show the Idle / Down badge despite real
-            // download activity reaching the box.
-            metrics.record_download(body.len(), now_unix());
-            metrics.record_transport_packet(transport_label);
-            let peer_opt = session_table.any_session();
-            if let Some(peer) = peer_opt {
-                // Phase 13: pacing. When pacing_enabled the operator has
-                // told us to artificially defer the download so the
-                // perceived round-trip rises toward `pacing_target_ms`.
-                // EXPERIMENTAL — PRD §3.3 warns this reduces bandwidth.
-                // Delay = 0 (the default and the non-pacing path) is a
-                // no-op zero-cost branch.
-                if pacing_delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(pacing_delay_ms as u64)).await;
+        Ok(payload) => {
+            // Resolve the delivery target. Single-port: deliver the whole
+            // verified payload via the one listener (wire-identical to
+            // before). Multi-port: decode the authenticated 2-byte
+            // application-port tag, validate it against the configured
+            // set, and deliver the untagged body via that port's listener.
+            let (listener, session_table, body): (&UdpSocket, &SessionTable, &[u8]) = match router {
+                PortRouter::Single { listener, sessions } => (listener, sessions, payload),
+                PortRouter::Multi(bindings) => {
+                    let (port, body) = match multiport::decode_tag(payload) {
+                        Some(v) => v,
+                        None => {
+                            debug!(
+                                tunnel_id = id,
+                                transport = transport_label,
+                                "client: multi-port download payload too short for port tag"
+                            );
+                            return;
+                        }
+                    };
+                    match bindings.get(&port) {
+                        Some(b) => (b.listener.as_ref(), b.sessions.as_ref(), body),
+                        None => {
+                            // Authenticated but the port isn't in our set —
+                            // config drift between the two sides. Count it
+                            // as an auth/seq drop so the dashboard moves,
+                            // and warn (sampled) so the operator looks.
+                            let prev = UNKNOWN_PORT_DROPS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if prev % 1000 == 0 {
+                                warn!(
+                                    tunnel_id = id,
+                                    transport = transport_label,
+                                    port,
+                                    dropped_total = prev + 1,
+                                    "client: multi-port download tagged with a port that is \
+                                     not in this tunnel's configured set — the two sides have \
+                                     different port lists; align them"
+                                );
+                            }
+                            metrics.record_auth_drop();
+                            return;
+                        }
+                    }
                 }
-                if let Err(e) = listener.send_to(body, peer).await {
-                    warn!(tunnel_id = id, %peer, err = %e,
-                        transport = transport_label,
-                        "client: deliver to end user failed");
-                } else {
-                    // trace! (not debug!) — this fires per packet on the
-                    // download success path. At INFO/DEBUG level the
-                    // tracing macro skips arg evaluation, but the level
-                    // check + dispatch is still ~tens of ns per packet,
-                    // and an operator who flips the panel to DEBUG would
-                    // otherwise drown in N×pps lines. TRACE is the right
-                    // level: the diagnostic is still reachable, but never
-                    // formatted at default filtering.
-                    trace!(tunnel_id = id, %peer, n = body.len(),
-                        transport = transport_label,
-                        "client: delivered download payload");
-                }
-            } else {
-                // Same per-packet hot-path concern: until the first
-                // upload establishes a session, every spoofed download
-                // packet hits this branch. trace! keeps the diagnostic
-                // available without flooding DEBUG logs.
-                trace!(
-                    tunnel_id = id,
-                    transport = transport_label,
-                    "client: download arrived but no upstream session yet"
-                );
-            }
+            };
+            deliver_to_end_user(
+                listener,
+                session_table,
+                body,
+                metrics,
+                id,
+                transport_label,
+                pacing_delay_ms,
+            )
+            .await;
         }
         Err(OpenError::TooShort) => {
             debug!(
@@ -923,6 +1051,75 @@ async fn deliver_verified_job(
             );
             metrics.record_auth_drop();
         }
+    }
+}
+
+/// Deliver one (untagged) verified body back to the end user via
+/// `listener`, picking the freshest peer from `session_table`. This is the
+/// historical single-port delivery logic, extracted verbatim so both the
+/// single-port and per-port multi-port paths share it. Metrics, pacing,
+/// and the per-packet TRACE diagnostics are byte-for-byte the same as
+/// before.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_to_end_user(
+    listener: &UdpSocket,
+    session_table: &SessionTable,
+    body: &[u8],
+    metrics: &TunnelMetrics,
+    id: i64,
+    transport_label: &'static str,
+    pacing_delay_ms: u32,
+) {
+    // Stamp `last_packet_received_at_unix` and the per-transport packet
+    // counter as soon as a HMAC-verified packet arrives, BEFORE the
+    // delivery step. PRD §2.4 derives the dashboard health badge from
+    // "observed packet activity"; a verified packet is observed activity
+    // even if `any_session` later returns no peer to deliver it to.
+    // Mirrors the Remote side in `tunnel::remote::spawn_download_recv_loop`,
+    // which also records the metric on recv rather than on send.
+    //
+    // Without this, a tunnel that's receiving spoofed packets but has no
+    // live upstream session (e.g., right after idle eviction, before the
+    // next end-user packet creates a fresh session) would show the Idle /
+    // Down badge despite real download activity reaching the box.
+    metrics.record_download(body.len(), now_unix());
+    metrics.record_transport_packet(transport_label);
+    let peer_opt = session_table.any_session();
+    if let Some(peer) = peer_opt {
+        // Phase 13: pacing. When pacing_enabled the operator has told us
+        // to artificially defer the download so the perceived round-trip
+        // rises toward `pacing_target_ms`. EXPERIMENTAL — PRD §3.3 warns
+        // this reduces bandwidth. Delay = 0 (the default and the
+        // non-pacing path) is a no-op zero-cost branch.
+        if pacing_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(pacing_delay_ms as u64)).await;
+        }
+        if let Err(e) = listener.send_to(body, peer).await {
+            warn!(tunnel_id = id, %peer, err = %e,
+                transport = transport_label,
+                "client: deliver to end user failed");
+        } else {
+            // trace! (not debug!) — this fires per packet on the download
+            // success path. At INFO/DEBUG level the tracing macro skips
+            // arg evaluation, but the level check + dispatch is still
+            // ~tens of ns per packet, and an operator who flips the panel
+            // to DEBUG would otherwise drown in N×pps lines. TRACE is the
+            // right level: the diagnostic is still reachable, but never
+            // formatted at default filtering.
+            trace!(tunnel_id = id, %peer, n = body.len(),
+                transport = transport_label,
+                "client: delivered download payload");
+        }
+    } else {
+        // Same per-packet hot-path concern: until the first upload
+        // establishes a session, every spoofed download packet hits this
+        // branch. trace! keeps the diagnostic available without flooding
+        // DEBUG logs.
+        trace!(
+            tunnel_id = id,
+            transport = transport_label,
+            "client: download arrived but no upstream session yet"
+        );
     }
 }
 

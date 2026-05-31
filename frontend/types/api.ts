@@ -91,6 +91,13 @@ export interface Tunnel {
   mtu?: number
   max_connections?: number
   idle_timeout?: number
+  // Multi-port: the full authoritative list of application ports this
+  // tunnel carries (INCLUDING the main port from local_listen_addr /
+  // forward_target), with a fixed 1:1 same-number mapping on both sides.
+  // Absent or [] = single-port (wire-identical to legacy tunnels). The
+  // panel never produces a 1-element list (1 port = single-port). Sent on
+  // create/update and returned on read.
+  ports?: number[]
 
   // Bookkeeping
   state?: TunnelState

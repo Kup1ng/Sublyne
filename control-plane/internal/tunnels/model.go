@@ -8,7 +8,12 @@
 // from the Rust dataplane over IPC.
 package tunnels
 
-import "database/sql"
+import (
+	"database/sql"
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // Transport is the spoof-envelope L4 used to carry download payloads
 // past Iran's DPI. PRD §3.1 / §3.2 list the four valid values; the
@@ -225,6 +230,18 @@ type Tunnel struct {
 	IdleTimeout             int
 	IcmpEchoMode            IcmpEchoMode
 
+	// Ports (v2.5.0 multi-port) is the full authoritative list of
+	// application ports this tunnel carries through the one secure
+	// download-spoof / upload pipeline, with a fixed 1:1 same-number
+	// mapping between Client and Remote. Empty (nil / len 0) means
+	// legacy single-port: the one port lives in local_listen_addr
+	// (Client) / forward_target (Remote) and the data plane behaves
+	// byte-for-byte like v2.4.0. A non-empty list INCLUDES the canonical
+	// port already present in those columns; the bind host is taken from
+	// them. Stored as a comma-separated TEXT column (see PortsToCSV /
+	// ParsePortsCSV and migration 0010_multiport.sql).
+	Ports []int `json:"ports,omitempty"`
+
 	// Client-only fields. Pointers carry the SQL NULL distinction
 	// because some are strings (NULL vs empty) and the validator
 	// needs to tell them apart on update.
@@ -250,4 +267,43 @@ type Tunnel struct {
 	// Client's UploadMode: a Client tunnel with upload_mode='socks5'
 	// must point at a Remote tunnel with upload_listen_mode='socks5_tcp'.
 	UploadListenMode UploadListenMode
+}
+
+// PortsToCSV renders a port list into the comma-separated TEXT shape the
+// `tunnels.ports` column stores (e.g. []int{8000, 8001} -> "8000,8001").
+// A nil / empty list maps to "" — the legacy single-port marker.
+func PortsToCSV(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}
+
+// ParsePortsCSV is the inverse of PortsToCSV. It trims surrounding
+// whitespace on each entry, skips empty entries (so "" and trailing
+// commas are tolerated), and parses base-10 integers. The empty string
+// returns (nil, nil) — the legacy single-port marker. A non-numeric
+// entry returns an error; range / dedup checks live in validation.go.
+func ParsePortsCSV(csv string) ([]int, error) {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil, nil
+	}
+	var ports []int
+	for _, raw := range strings.Split(csv, ",") {
+		field := strings.TrimSpace(raw)
+		if field == "" {
+			continue
+		}
+		p, err := strconv.Atoi(field)
+		if err != nil {
+			return nil, fmt.Errorf("tunnels: parse port %q: %w", field, err)
+		}
+		ports = append(ports, p)
+	}
+	return ports, nil
 }

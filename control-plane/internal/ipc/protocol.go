@@ -106,6 +106,16 @@ type TunnelSpec struct {
 	// DownloadTransport is not icmp or icmpv6.
 	IcmpEchoMode string `json:"icmp_echo_mode,omitempty"`
 
+	// Ports (v2.5.0 multi-port) — shared by both roles. The full
+	// authoritative list of application ports this tunnel carries, with a
+	// fixed 1:1 same-number mapping (client :8000 <-> remote :8000).
+	// Omitted (empty) means single-port: the data plane takes the
+	// byte-for-byte-identical v2.4.0 path and binds only the one port in
+	// local_listen_addr / forward_target. When present (>= 2 entries) the
+	// per-port app-tag wire format activates; the bind host is taken from
+	// local_listen_addr (Client) / forward_target (Remote).
+	Ports []uint16 `json:"ports,omitempty"`
+
 	// Client-only.
 	LocalListenAddr     string `json:"local_listen_addr,omitempty"`
 	DownloadReceivePort uint16 `json:"download_receive_port,omitempty"`
