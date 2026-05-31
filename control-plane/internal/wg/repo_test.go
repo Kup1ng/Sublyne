@@ -197,3 +197,27 @@ func TestRepoList_OrdersByID(t *testing.T) {
 		t.Errorf("list order: %+v", rows)
 	}
 }
+
+func TestRepoGetByName_Found(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	created, err := repo.Create(ctx, sampleConfig(t, "by-name"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := repo.GetByName(ctx, "by-name")
+	if err != nil {
+		t.Fatalf("GetByName: %v", err)
+	}
+	if got.ID != created.ID || got.Name != "by-name" {
+		t.Errorf("GetByName = %+v, want id=%d name=by-name", got, created.ID)
+	}
+}
+
+func TestRepoGetByName_NotFound(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	if _, err := repo.GetByName(ctx, "nonesuch"); !errors.Is(err, ErrConfigNotFound) {
+		t.Errorf("GetByName unknown name err = %v, want ErrConfigNotFound", err)
+	}
+}
