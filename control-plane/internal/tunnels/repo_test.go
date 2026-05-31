@@ -49,7 +49,8 @@ func sampleClient(name string) Tunnel {
 		MTU:                     1400,
 		MaxConnections:          50000,
 		IdleTimeout:             300,
-		LocalListenAddr:         sql.NullString{String: "0.0.0.0:44443", Valid: true},
+		LocalListenAddr:         sql.NullString{String: "0.0.0.0", Valid: true},
+		Ports:                   []int{44443},
 		DownloadReceivePort:     sql.NullInt64{Int64: 8443, Valid: true},
 		UploadTargetAddr:        sql.NullString{String: "198.51.100.10:55555", Valid: true},
 		WireguardConfig:         sql.NullString{String: "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0", Valid: true},
@@ -72,7 +73,8 @@ func sampleRemote(name string) Tunnel {
 		MaxConnections:          50000,
 		IdleTimeout:             300,
 		UploadListenAddr:        sql.NullString{String: "0.0.0.0:55555", Valid: true},
-		ForwardTarget:           sql.NullString{String: "127.0.0.1:5201", Valid: true},
+		ForwardTarget:           sql.NullString{String: "127.0.0.1", Valid: true},
+		Ports:                   []int{5201},
 		DownloadSendPort:        sql.NullInt64{Int64: 8443, Valid: true},
 		ClientRealIP:            sql.NullString{String: "198.51.100.20", Valid: true},
 		IcmpEchoMode:            IcmpEchoModeReply,
@@ -96,7 +98,7 @@ func TestRepoCreateRoundTrip(t *testing.T) {
 	if got.Role != RoleClient {
 		t.Errorf("role = %q, want client", got.Role)
 	}
-	if !got.LocalListenAddr.Valid || got.LocalListenAddr.String != "0.0.0.0:44443" {
+	if !got.LocalListenAddr.Valid || got.LocalListenAddr.String != "0.0.0.0" {
 		t.Errorf("local_listen_addr round-trip = %+v", got.LocalListenAddr)
 	}
 	if got.MTU != 1400 || got.IdleTimeout != 300 || got.MaxConnections != 50000 {

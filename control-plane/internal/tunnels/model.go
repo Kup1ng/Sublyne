@@ -230,16 +230,19 @@ type Tunnel struct {
 	IdleTimeout             int
 	IcmpEchoMode            IcmpEchoMode
 
-	// Ports (v2.5.0 multi-port) is the full authoritative list of
-	// application ports this tunnel carries through the one secure
-	// download-spoof / upload pipeline, with a fixed 1:1 same-number
-	// mapping between Client and Remote. Empty (nil / len 0) means
-	// legacy single-port: the one port lives in local_listen_addr
-	// (Client) / forward_target (Remote) and the data plane behaves
-	// byte-for-byte like v2.4.0. A non-empty list INCLUDES the canonical
-	// port already present in those columns; the bind host is taken from
-	// them. Stored as a comma-separated TEXT column (see PortsToCSV /
-	// ParsePortsCSV and migration 0010_multiport.sql).
+	// Ports is the full list of application ports this tunnel carries
+	// through the one secure download-spoof / upload pipeline, with a fixed
+	// 1:1 same-number mapping between Client and Remote (client :8000 <->
+	// remote :8000). Since v2.7.0 it is the single source of truth for the
+	// tunnel's ports and is always non-empty (>= 1) for a saved tunnel —
+	// the bind host comes from LocalListenAddr (Client) / ForwardTarget
+	// (Remote), which now carry only a host. Every port is a first-class
+	// peer: the data plane treats them identically. Stored as a
+	// comma-separated TEXT column (see PortsToCSV / ParsePortsCSV,
+	// migrations 0010_multiport.sql and 0011_unified_ports.sql). The
+	// validator sorts it and bounds it to 1..MaxPortsPerTunnel. The IPC
+	// layer still gates the 2-byte app-port tag on len >= 2, so a
+	// single-port tunnel stays byte-identical on the wire.
 	Ports []int `json:"ports,omitempty"`
 
 	// Client-only fields. Pointers carry the SQL NULL distinction

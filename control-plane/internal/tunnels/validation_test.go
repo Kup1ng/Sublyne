@@ -22,7 +22,7 @@ func TestValidate_RequiredClientFields(t *testing.T) {
 		"name", "psk", "download_transport", "download_spoof_source_ip",
 		"download_spoof_source_port", "mtu", "max_connections", "idle_timeout",
 		"local_listen_addr", "download_receive_port", "upload_target_addr",
-		"wg_config_id",
+		"wg_config_id", "ports",
 	} {
 		if _, ok := ve.Fields[key]; !ok {
 			t.Errorf("expected validation error on field %q, fields=%v", key, ve.Fields)
@@ -42,6 +42,7 @@ func TestValidate_RequiredRemoteFields(t *testing.T) {
 	for _, key := range []string{
 		"name", "psk", "download_transport",
 		"upload_listen_addr", "forward_target", "download_send_port", "client_real_ip",
+		"ports",
 	} {
 		if _, ok := ve.Fields[key]; !ok {
 			t.Errorf("expected validation error on field %q, fields=%v", key, ve.Fields)
@@ -129,25 +130,25 @@ func TestValidate_IcmpEchoMode_RejectsUnknown(t *testing.T) {
 	}
 }
 
-func TestValidate_PortConflict_LocalListenVsExistingLocalListen(t *testing.T) {
+func TestValidate_PortConflict_AppPortVsExistingAppPort(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
-	a := sampleClient("a")
+	a := sampleClient("a") // app port 44443
 	if _, err := repo.Create(ctx, a); err != nil {
 		t.Fatalf("create a: %v", err)
 	}
 
 	b := sampleClient("b")
-	b.LocalListenAddr = sql.NullString{String: "0.0.0.0:44443", Valid: true} // collides
-	b.DownloadReceivePort = sql.NullInt64{Int64: 8444, Valid: true}          // different
+	b.Ports = []int{44443}                                          // collides on the app port
+	b.DownloadReceivePort = sql.NullInt64{Int64: 8444, Valid: true} // different
 	err := Validate(ctx, repo, RoleClient, &b, 0)
 	var ve *ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("err = %v, want ValidationError", err)
 	}
-	msg, ok := ve.Fields["local_listen_addr"]
+	msg, ok := ve.Fields["ports"]
 	if !ok {
-		t.Fatalf("missing local_listen_addr error: %v", ve.Fields)
+		t.Fatalf("missing ports error: %v", ve.Fields)
 	}
 	if !strings.Contains(msg, "44443") || !strings.Contains(msg, "\"a\"") {
 		t.Errorf("unexpected conflict message: %q", msg)
@@ -162,7 +163,7 @@ func TestValidate_PortConflict_DownloadReceiveVsExistingDownloadReceive(t *testi
 		t.Fatalf("create a: %v", err)
 	}
 	b := sampleClient("b")
-	b.LocalListenAddr = sql.NullString{String: "0.0.0.0:44444", Valid: true} // different
+	b.Ports = []int{44444} // different app port — isolates the download_receive_port clash
 	// b.DownloadReceivePort defaults to 8443 — collides with a.DownloadReceivePort.
 	err := Validate(ctx, repo, RoleClient, &b, 0)
 	var ve *ValidationError
@@ -203,7 +204,7 @@ func TestValidate_RejectsBadIP(t *testing.T) {
 	}
 }
 
-func TestValidate_RejectsBadHostPort(t *testing.T) {
+func TestValidate_RejectsBadHost(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
 	t1 := sampleClient("badhp")
@@ -215,6 +216,28 @@ func TestValidate_RejectsBadHostPort(t *testing.T) {
 	}
 	if _, ok := ve.Fields["local_listen_addr"]; !ok {
 		t.Errorf("expected local_listen_addr error: %v", ve.Fields)
+	}
+}
+
+// The address field is host-only since v2.7.0; pasting a host:port (the
+// most common mistake) must be rejected with a message pointing at the
+// Ports field.
+func TestValidate_RejectsHostWithPort(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	t1 := sampleClient("withport")
+	t1.LocalListenAddr = sql.NullString{String: "0.0.0.0:443", Valid: true}
+	err := Validate(ctx, repo, RoleClient, &t1, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	msg, ok := ve.Fields["local_listen_addr"]
+	if !ok {
+		t.Fatalf("expected local_listen_addr error: %v", ve.Fields)
+	}
+	if !strings.Contains(msg, "port") {
+		t.Errorf("message should mention the port mistake; got %q", msg)
 	}
 }
 
@@ -233,34 +256,38 @@ func TestValidate_TransportEnumGuard(t *testing.T) {
 	}
 }
 
-func TestValidate_IPv6LocalListenIsAcceptedAndScannedForConflicts(t *testing.T) {
-	// PRD §8.3: IPv4 and IPv6 are first-class. The validator must
-	// accept `[::]:port` for local_listen_addr and still flag a
-	// later tunnel that reuses the same port.
+func TestValidate_IPv6HostIsAcceptedAndPortsScannedForConflicts(t *testing.T) {
+	// PRD §8.3: IPv4 and IPv6 are first-class. The host-only address field
+	// must accept a bare IPv6 literal (`::`), and the unified port list must
+	// still flag a later tunnel that reuses the same application port,
+	// regardless of which address family each binds.
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
 	a := sampleClient("a")
-	a.LocalListenAddr = sql.NullString{String: "[::]:44443", Valid: true}
+	a.LocalListenAddr = sql.NullString{String: "::", Valid: true}
+	a.Ports = []int{44443}
 	a.DownloadReceivePort = sql.NullInt64{Int64: 8443, Valid: true}
 	if _, err := repo.Create(ctx, a); err != nil {
 		t.Fatalf("create v6 listener: %v", err)
 	}
 
 	b := sampleClient("b")
-	b.LocalListenAddr = sql.NullString{String: "0.0.0.0:44443", Valid: true}
+	b.LocalListenAddr = sql.NullString{String: "0.0.0.0", Valid: true}
+	b.Ports = []int{44443} // same app port as the v6 listener
 	b.DownloadReceivePort = sql.NullInt64{Int64: 8444, Valid: true}
 	err := Validate(ctx, repo, RoleClient, &b, 0)
 	var ve *ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("err = %v, want ValidationError", err)
 	}
-	if msg, ok := ve.Fields["local_listen_addr"]; !ok || !strings.Contains(msg, "44443") {
+	if msg, ok := ve.Fields["ports"]; !ok || !strings.Contains(msg, "44443") {
 		t.Fatalf("v6 listener should conflict with v4 on the same port, fields=%v", ve.Fields)
 	}
 
 	// And reversed direction: existing v4, new v6 must also be rejected.
 	c := sampleClient("c")
-	c.LocalListenAddr = sql.NullString{String: "[::]:44443", Valid: true}
+	c.LocalListenAddr = sql.NullString{String: "::", Valid: true}
+	c.Ports = []int{44443}
 	c.DownloadReceivePort = sql.NullInt64{Int64: 8445, Valid: true}
 	if err := Validate(ctx, repo, RoleClient, &c, 0); err == nil {
 		t.Fatalf("c should fail the conflict scan, got nil error")
@@ -418,21 +445,40 @@ func TestValidate_MultiPort_HappyClient(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
 	c := sampleClient("mp-ok")
-	// Canonical Client port is local_listen_addr's 44443; the list MUST
-	// include it (full authoritative set).
-	c.Ports = []int{44443, 8001, 8002}
+	// The unified list is the single source of truth; the address field is
+	// host-only. Validate sorts the list in place.
+	c.Ports = []int{8002, 44443, 8001}
 	if err := Validate(ctx, repo, RoleClient, &c, 0); err != nil {
 		t.Fatalf("valid multi-port list should pass: %v", err)
 	}
+	if want := []int{8001, 8002, 44443}; len(c.Ports) != 3 ||
+		c.Ports[0] != want[0] || c.Ports[1] != want[1] || c.Ports[2] != want[2] {
+		t.Errorf("Validate should sort Ports in place; got %v", c.Ports)
+	}
 }
 
-func TestValidate_MultiPort_SinglePortEmptyListStillValid(t *testing.T) {
+func TestValidate_SinglePortListIsValid(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
-	c := sampleClient("mp-empty")
-	c.Ports = nil // legacy single-port marker
+	c := sampleClient("sp-one")
+	c.Ports = []int{44443} // one port = a normal single-service tunnel
 	if err := Validate(ctx, repo, RoleClient, &c, 0); err != nil {
-		t.Fatalf("empty Ports must validate exactly like single-port: %v", err)
+		t.Fatalf("a one-port list must validate: %v", err)
+	}
+}
+
+func TestValidate_EmptyPortsRejected(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	c := sampleClient("sp-none")
+	c.Ports = nil // no ports — now a hard error (every tunnel needs >= 1)
+	err := Validate(ctx, repo, RoleClient, &c, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["ports"]; !ok {
+		t.Errorf("expected ports required error, fields=%v", ve.Fields)
 	}
 }
 
@@ -486,30 +532,33 @@ func TestValidate_MultiPort_RejectsTooMany(t *testing.T) {
 	}
 }
 
-func TestValidate_MultiPort_RejectsCanonicalNotInList(t *testing.T) {
-	repo := NewRepo(newTestDB(t))
-	ctx := context.Background()
-	c := sampleClient("mp-canon")
-	// Canonical port 44443 deliberately omitted.
-	c.Ports = []int{8001, 8002}
-	err := Validate(ctx, repo, RoleClient, &c, 0)
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("err = %v, want ValidationError", err)
-	}
-	if _, ok := ve.Fields["ports"]; !ok {
-		t.Errorf("expected ports error when canonical port missing, fields=%v", ve.Fields)
-	}
-}
-
 func TestValidate_MultiPort_HappyRemote(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
 	r := sampleRemote("mp-remote-ok")
-	// Canonical Remote port is forward_target's 5201.
 	r.Ports = []int{5201, 5202, 5203}
 	if err := Validate(ctx, repo, RoleRemote, &r, 0); err != nil {
 		t.Fatalf("valid remote multi-port list should pass: %v", err)
+	}
+}
+
+// On a Remote the application ports are forward DESTINATIONS, so several
+// tunnels may legitimately forward to the same upstream port — this must
+// NOT be rejected (it matches pre-v2.7.0 single-port behaviour).
+func TestValidate_MultiPort_RemoteForwardPortsMayOverlap(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	a := sampleRemote("r-a")
+	a.Ports = []int{5201, 5202}
+	a.UploadListenAddr = sql.NullString{String: "0.0.0.0:55555", Valid: true}
+	if _, err := repo.Create(ctx, a); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	b := sampleRemote("r-b")
+	b.Ports = []int{5201, 5203}                                               // shares forward port 5201 — allowed
+	b.UploadListenAddr = sql.NullString{String: "0.0.0.0:55556", Valid: true} // distinct bind port
+	if err := Validate(ctx, repo, RoleRemote, &b, 0); err != nil {
+		t.Fatalf("remote tunnels may share a forward port: %v", err)
 	}
 }
 
@@ -524,10 +573,9 @@ func TestValidate_MultiPort_CrossTunnelOverlapOnListMember(t *testing.T) {
 		t.Fatalf("create a: %v", err)
 	}
 
-	// Second tunnel uses a different local_listen / receive port so the
-	// ONLY collision is on the shared app-port list member 8002.
+	// Second tunnel uses a different receive port so the ONLY collision is
+	// on the shared app-port list member 8002.
 	b := sampleClient("mp-b")
-	b.LocalListenAddr = sql.NullString{String: "0.0.0.0:44455", Valid: true}
 	b.DownloadReceivePort = sql.NullInt64{Int64: 8455, Valid: true}
 	b.Ports = []int{44455, 8002, 8003}
 	err := Validate(ctx, repo, RoleClient, &b, 0)
@@ -548,9 +596,10 @@ func TestValidate_LocalListenSameAsDownloadReceiveIsRejected(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()
 	t1 := sampleClient("samesame")
-	// Both pointing at the same UDP port — meaningless on a real
-	// kernel and we should refuse before the data plane gets confused.
-	t1.LocalListenAddr = sql.NullString{String: "0.0.0.0:9000", Valid: true}
+	// An application listener and the download-receive socket pointing at
+	// the same UDP port — meaningless on a real kernel and we should refuse
+	// before the data plane gets confused.
+	t1.Ports = []int{9000}
 	t1.DownloadReceivePort = sql.NullInt64{Int64: 9000, Valid: true}
 	err := Validate(ctx, repo, RoleClient, &t1, 0)
 	var ve *ValidationError
