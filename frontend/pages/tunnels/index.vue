@@ -4,12 +4,12 @@ import { onMounted } from 'vue'
 import { useDrawer } from '~/composables/useDrawer'
 import { useMetrics } from '~/composables/useMetrics'
 import { useTunnels } from '~/composables/useTunnels'
-import { useToast } from '~/composables/useToast'
+import { useTunnelActions } from '~/composables/useTunnelActions'
 import { formatBitsPerSecond, formatNumber } from '~/utils/format'
 
 const tunnels = useTunnels()
 const metrics = useMetrics()
-const toast = useToast()
+const actions = useTunnelActions()
 const drawer = useDrawer()
 
 onMounted(async () => {
@@ -19,23 +19,6 @@ onMounted(async () => {
 })
 
 const rates = metrics.rates
-
-async function start(id: number, name: string) {
-  try {
-    await tunnels.start(id)
-    toast.success(`Started ${name}`)
-  } catch (e) {
-    toast.error('Failed to start', (e as Error).message)
-  }
-}
-async function stop(id: number, name: string) {
-  try {
-    await tunnels.stop(id)
-    toast.success(`Stopped ${name}`)
-  } catch (e) {
-    toast.error('Failed to stop', (e as Error).message)
-  }
-}
 </script>
 
 <template>
@@ -104,7 +87,7 @@ async function stop(id: number, name: string) {
               {{ rates.get(t.id) ? formatNumber(rates.get(t.id)!.sessions) : '—' }}
             </td>
             <td class="px-5 py-3.5">
-              <TunnelStatusBadge :status="t.enabled ? (rates.get(t.id)?.status ?? null) : null" />
+              <TunnelStatusBadge :status="t.enabled ? (rates.get(t.id)?.status ?? null) : 'stopped'" />
             </td>
             <td class="px-5 py-3.5 text-right">
               <div class="inline-flex items-center gap-1.5">
@@ -112,18 +95,22 @@ async function stop(id: number, name: string) {
                   v-if="!t.enabled"
                   size="sm"
                   variant="secondary"
-                  @click="start(t.id, t.name)"
+                  :loading="actions.isBusy(t.id)"
+                  :disabled="actions.isBusy(t.id)"
+                  @click="actions.start(t.id, t.name)"
                 >
-                  <Play class="size-3.5" />
+                  <Play v-if="!actions.isBusy(t.id)" class="size-3.5" />
                   Start
                 </AppButton>
                 <AppButton
                   v-else
                   size="sm"
                   variant="secondary"
-                  @click="stop(t.id, t.name)"
+                  :loading="actions.isBusy(t.id)"
+                  :disabled="actions.isBusy(t.id)"
+                  @click="actions.stop(t.id, t.name)"
                 >
-                  <Square class="size-3.5" />
+                  <Square v-if="!actions.isBusy(t.id)" class="size-3.5" />
                   Stop
                 </AppButton>
                 <NuxtLink :to="`/tunnels/${t.id}`">
