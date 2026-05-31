@@ -41,7 +41,8 @@ const validClientBody = `{
   "mtu": 1400,
   "max_connections": 50000,
   "idle_timeout": 300,
-  "local_listen_addr": "0.0.0.0:44443",
+  "local_listen_addr": "0.0.0.0",
+  "ports": [44443],
   "download_receive_port": 8443,
   "upload_target_addr": "198.51.100.10:55555",
   "wireguard_config": "[Interface]\nPrivateKey=...\n[Peer]\nPublicKey=...\nEndpoint=198.51.100.20:81\nAllowedIPs=0.0.0.0/0",
@@ -62,7 +63,8 @@ const validRemoteBody = `{
   "max_connections": 50000,
   "idle_timeout": 300,
   "upload_listen_addr": "0.0.0.0:55555",
-  "forward_target": "127.0.0.1:5201",
+  "forward_target": "127.0.0.1",
+  "ports": [5201],
   "download_send_port": 8443,
   "client_real_ip": "198.51.100.20",
   "enabled": false
@@ -142,10 +144,10 @@ func TestCreateTunnel_PortConflictReported(t *testing.T) {
 		t.Fatalf("seed create: %d %s", first.Status, string(first.Body))
 	}
 
-	// Second tunnel reuses local_listen_addr's port.
+	// Second tunnel reuses the first's application port (44443). Keep the
+	// ports list the same; change the receive port so the conflict comes
+	// from the unified ports list alone.
 	second := strings.Replace(validClientBody, `"name": "tunnel-1"`, `"name": "tunnel-2"`, 1)
-	// keep local_listen_addr the same; change the receive port so the
-	// conflict comes from local_listen_addr alone.
 	second = strings.Replace(second, `"download_receive_port": 8443`, `"download_receive_port": 8444`, 1)
 	res := postJSON(t, panelURL(s, "/api/tunnels"), second, hdr)
 	if res.Status != http.StatusBadRequest {
@@ -158,9 +160,11 @@ func TestCreateTunnel_PortConflictReported(t *testing.T) {
 	if err := json.Unmarshal(res.Body, &body); err != nil {
 		t.Fatalf("decode: %v body=%s", err, string(res.Body))
 	}
-	msg, ok := body.Fields["local_listen_addr"]
+	// v2.7.0: an application-port clash is reported on the unified `ports`
+	// field, naming the colliding port and the owning tunnel.
+	msg, ok := body.Fields["ports"]
 	if !ok {
-		t.Fatalf("expected fields.local_listen_addr, got %+v", body.Fields)
+		t.Fatalf("expected fields.ports, got %+v", body.Fields)
 	}
 	if !strings.Contains(msg, "44443") || !strings.Contains(msg, "tunnel-1") {
 		t.Errorf("conflict message should name the port and the owner; got %q", msg)
@@ -313,7 +317,7 @@ func TestMultiTunnel_DistinctPortsCoexist(t *testing.T) {
 	// Two client tunnels with different ports.
 	idA := mustCreate(t, s.URL, hdr, validClientBody)
 	b := strings.Replace(validClientBody, `"name": "tunnel-1"`, `"name": "tunnel-2"`, 1)
-	b = strings.Replace(b, `"local_listen_addr": "0.0.0.0:44443"`, `"local_listen_addr": "0.0.0.0:44455"`, 1)
+	b = strings.Replace(b, `"ports": [44443]`, `"ports": [44455]`, 1)
 	b = strings.Replace(b, `"download_receive_port": 8443`, `"download_receive_port": 8455`, 1)
 	idB := mustCreate(t, s.URL, hdr, b)
 
@@ -342,7 +346,7 @@ func TestMultiTunnel_DistinctPortsCoexist(t *testing.T) {
 }
 
 // TestMultiTunnel_PortConflictRejected proves §3.5: creating a second
-// tunnel that reuses the first's local_listen port must be refused.
+// tunnel that reuses the first's application port must be refused.
 func TestMultiTunnel_PortConflictRejected(t *testing.T) {
 	f := newTestFixture(t)
 	s := httpServerForFixture(t, f)
@@ -350,15 +354,16 @@ func TestMultiTunnel_PortConflictRejected(t *testing.T) {
 
 	_ = mustCreate(t, s.URL, hdr, validClientBody)
 
-	// Second body collides on local_listen_addr port.
+	// Second body collides on the application port (44443).
 	dup := strings.Replace(validClientBody, `"name": "tunnel-1"`, `"name": "tunnel-2"`, 1)
 	dup = strings.Replace(dup, `"download_receive_port": 8443`, `"download_receive_port": 8444`, 1)
 	res := postJSON(t, panelURL(s, "/api/tunnels"), dup, hdr)
 	if res.Status != http.StatusBadRequest {
 		t.Fatalf("expected 400 conflict, got %d body=%s", res.Status, string(res.Body))
 	}
-	if !strings.Contains(string(res.Body), "local_listen_addr") {
-		t.Fatalf("expected local_listen_addr in error, got %s", string(res.Body))
+	// v2.7.0: the app-port clash surfaces on the unified `ports` field.
+	if !strings.Contains(string(res.Body), "ports") {
+		t.Fatalf("expected ports in error, got %s", string(res.Body))
 	}
 	if !strings.Contains(string(res.Body), "tunnel-1") {
 		t.Fatalf("expected first tunnel name in error, got %s", string(res.Body))
@@ -394,14 +399,16 @@ func TestUpdateTunnel_DisabledTunnelSkipsDataplane(t *testing.T) {
 }
 
 // TestUpdateTunnel_IPv6ListenAcceptedOnCreate covers PRD §8.3 at the
-// API level: an operator can save a tunnel with `[::]:port` and the
-// API accepts it (the dataplane bind respects whichever family parsed).
+// API level: an operator can save a tunnel with an IPv6 listen host and
+// the API accepts it (the dataplane bind respects whichever family
+// parsed). v2.7.0: local_listen_addr is host-only, so the IPv6 form is a
+// bare `::` and the port lives in the ports list.
 func TestUpdateTunnel_IPv6ListenAcceptedOnCreate(t *testing.T) {
 	f := newTestFixture(t)
 	s := httpServerForFixture(t, f)
 	hdr := loginAndTokenHeader(t, s.URL)
-	body := strings.Replace(validClientBody, `"local_listen_addr": "0.0.0.0:44443"`,
-		`"local_listen_addr": "[::]:44443"`, 1)
+	body := strings.Replace(validClientBody, `"local_listen_addr": "0.0.0.0"`,
+		`"local_listen_addr": "::"`, 1)
 	res := postJSON(t, panelURL(s, "/api/tunnels"), body, hdr)
 	if res.Status != http.StatusCreated {
 		t.Fatalf("create with v6 listen = %d body=%s", res.Status, string(res.Body))
@@ -437,8 +444,8 @@ func TestImportTunnel_RoundTrip(t *testing.T) {
 	}
 	// Tweak the name so it doesn't collide.
 	imported := strings.Replace(string(exp.Body), `"name":"tunnel-1"`, `"name":"tunnel-clone"`, 1)
-	// Change the receive port and listen so it doesn't collide.
-	imported = strings.Replace(imported, `"local_listen_addr":"0.0.0.0:44443"`, `"local_listen_addr":"0.0.0.0:44444"`, 1)
+	// Change the app port and receive port so it doesn't collide.
+	imported = strings.Replace(imported, `"ports":[44443]`, `"ports":[44444]`, 1)
 	imported = strings.Replace(imported, `"download_receive_port":8443`, `"download_receive_port":8444`, 1)
 
 	res := postJSON(t, panelURL(s, "/api/tunnels/import"), imported, hdr)
