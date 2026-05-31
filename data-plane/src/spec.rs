@@ -190,7 +190,7 @@ pub struct TunnelSpec {
     /// Multi-port app ports (shared by both roles, 1:1 same-number).
     /// Empty (the default, and what older Go control planes emit) = a
     /// single-port tunnel, wire-identical to before. A list of length
-    /// >= 2 activates the application-port tag: per-port sockets are
+    /// `>= 2` activates the application-port tag: per-port sockets are
     /// bound on the bind host taken from `local_listen_addr` (Client) /
     /// `forward_target` (Remote), and every forwarded datagram is
     /// prefixed with a 2-byte port tag (see [`crate::multiport`]). A
