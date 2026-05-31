@@ -1,5 +1,6 @@
 import { useTunnels } from '~/composables/useTunnels'
 import { useToast } from '~/composables/useToast'
+import type { Tunnel } from '~/types/api'
 
 // useTunnelActions is the single shared home for "start / stop a tunnel
 // from the UI". Both the Tunnels page and the Dashboard tunnel tiles call
@@ -58,5 +59,23 @@ export function useTunnelActions() {
     return enabled ? stop(id, name) : start(id, name)
   }
 
-  return { start, stop, toggle, isBusy }
+  // clone duplicates a tunnel (server-side; lands stopped) and returns the new
+  // tunnel, or null on failure. Reuses the same per-id busy guard + toast
+  // pattern as start/stop so the card button shows a consistent busy state.
+  async function clone(id: number): Promise<Tunnel | null> {
+    if (isBusy(id)) return null
+    setBusy(id, true)
+    try {
+      const created = await tunnels.clone(id)
+      toast.success('Cloned', `Created “${created.name}” (stopped).`)
+      return created
+    } catch (e) {
+      toast.error('Failed to clone', (e as Error).message)
+      return null
+    } finally {
+      setBusy(id, false)
+    }
+  }
+
+  return { start, stop, toggle, clone, isBusy }
 }
