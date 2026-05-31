@@ -219,6 +219,28 @@ Sublyne hardens the SOCKS5 mode beyond the predecessor project:
 
 ---
 
+## Multi-port tunnels
+
+A single tunnel can carry **several application ports** at once (up to
+32), with a fixed 1:1 same-number mapping — Client `:51820` ↔ Remote
+`:51820`, Client `:443` ↔ Remote `:443`, and so on. This lets you run,
+for example, WireGuard on one port, a VLESS/Reality service on another,
+and a third service through the **one** tunnel — one PSK, one session
+table, one download spoof path, one upload egress.
+
+Each forwarded datagram of a multi-port tunnel carries a 2-byte
+app-port tag *inside* the HMAC-authenticated payload, so the receiver
+can demultiplex it to the right service (and drop anything addressed to
+a port not in the configured set). Enter the extra ports in the tunnel
+form; the same list is used on both the Iran and foreign side.
+
+This is **backward compatible**: a single-port tunnel is wire-identical
+to before (no tag), `PROTO_VERSION` is unchanged, and existing tunnels
+need no changes. See [`docs/multiport.md`](docs/multiport.md) for the
+wire design, the all-six-transport matrix, and the migration story.
+
+---
+
 ## Documentation
 
 - [`.claude/CLAUDE.md`](./.claude/CLAUDE.md) — orientation for any
@@ -227,6 +249,9 @@ Sublyne hardens the SOCKS5 mode beyond the predecessor project:
 - [`.claude/skills/`](./.claude/skills/) — per-topic procedural
   references (building, linting, IPC, raw sockets, WireGuard, db
   migrations, web panel components, SOCKS5).
+- [`docs/multiport.md`](./docs/multiport.md) — multi-port tunnels: the
+  2-byte app-port tag, why `PROTO_VERSION` stays 2, and the
+  `tunnels.ports` data model.
 
 ---
 
