@@ -710,7 +710,7 @@ fn select_primary(stripe: bool, rr: &AtomicUsize, session: SessionKey, n: usize)
 
 #[async_trait]
 impl UploadTransport for Socks5Upload {
-    async fn send(&self, session: SessionKey, payload: &[u8]) -> io::Result<()> {
+    async fn send(&self, session: SessionKey, payload: &[u8]) -> io::Result<bool> {
         if payload.len() > u16::MAX as usize {
             // Frame length cap. At MTU 1400 we'll never get close.
             return Err(io::Error::new(
@@ -755,7 +755,7 @@ impl UploadTransport for Socks5Upload {
                 continue;
             }
             match slot.tx.try_send(frame) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(true),
                 Err(mpsc::error::TrySendError::Full(returned)) => {
                     frame = returned;
                     continue;
@@ -769,10 +769,11 @@ impl UploadTransport for Socks5Upload {
 
         // Every slot was unhealthy or its queue full. Drop (UDP is
         // best-effort; the application/WireGuard will retransmit) and
-        // account it. Returning Ok keeps the recv loop hot — the drop is
-        // surfaced via the sampled counter, not a per-packet error.
+        // account it. Returning Ok(false) keeps the recv loop hot — the
+        // drop is surfaced via the sampled counter AND signalled to the
+        // caller so it does not record the frame as a delivered upload.
         self.record_drop();
-        Ok(())
+        Ok(false)
     }
 
     async fn set_parallel_connections(&self, n: u32) -> io::Result<bool> {

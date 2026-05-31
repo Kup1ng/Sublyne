@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -935,6 +936,7 @@ fn spawn_download_pipeline(
             session_id,
             label,
             mutable_config.clone(),
+            metrics.clone(),
             id,
             worker_id,
             name.clone(),
@@ -976,7 +978,18 @@ async fn spawn_download_recv_loop(
     label: &'static str,
     mut stop_rx: watch::Receiver<bool>,
 ) {
-    let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+    // Drain the forward-reply stream with `recvmmsg` (one syscall per
+    // batch) instead of `recv_from` (one syscall per datagram). This is the
+    // busiest socket on the Remote — it both sends to forward_target and
+    // receives the entire reply stream that becomes the spoofed download —
+    // and the old single-datagram loop could not empty SO_RCVBUF fast
+    // enough under a bursty 1 Gbps reply stream, so the kernel silently
+    // dropped the overflow before the dataplane ever saw it. This matches
+    // the already-batched send side and the Client raw-recv loop. The batch
+    // size is the existing `SUBLYNE_RECV_BATCH` knob (default 16); set it to
+    // 1 to recover the historical one-at-a-time drain.
+    let mut batch = batch::RecvBatch::for_udp(crate::perf::recv_batch());
+    let raw_fd = forward_sock.as_raw_fd();
     // Per-task scratch reused for the tagged reply on the multi-port path.
     // Never allocated on the single-port path.
     let mut tagged: Vec<u8> = Vec::new();
@@ -988,72 +1001,88 @@ async fn spawn_download_recv_loop(
                     "remote: download recv stopping");
                 return;
             }
-            res = forward_sock.recv_from(&mut buf) => {
-                let (n, _from) = match res {
-                    Ok(v) => v,
+            ready = forward_sock.readable() => {
+                if let Err(e) = ready {
+                    warn!(tunnel_id = id, err = %e, "remote: forward readable");
+                    continue;
+                }
+                let received = match forward_sock
+                    .try_io(Interest::READABLE, || batch::recvmmsg(raw_fd, &mut batch))
+                {
+                    Ok(n) => n,
+                    // Spurious wake / buffer already drained — re-arm.
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(e) => {
-                        warn!(tunnel_id = id, err = %e, "remote: forward recv");
+                        warn!(tunnel_id = id, err = %e, "remote: forward recvmmsg");
                         continue;
                     }
                 };
-                // Reply from the forward target is an "ingress" event
-                // on the download direction — record it before any
-                // further work so even a drop-by-no-session is counted.
-                metrics.record_download(n, now_unix());
-                // Sample mtu fresh so hot-reload of mtu takes effect
-                // on the next packet.
+                // Sample mtu fresh once per batch so a hot-reload of mtu
+                // takes effect on the next batch.
                 let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
                 let payload_cap = mtu.max(64);
-                if n > payload_cap {
-                    warn!(tunnel_id = id, n, max = payload_cap,
-                        "remote: dropping oversized forward reply (raise tunnel MTU)");
-                    continue;
-                }
-                if session_table.any_session().is_none() {
-                    // Per-packet hot-path log: until the first upload
-                    // establishes a session, every forward-target reply
-                    // hits this branch. trace! (not debug!) so flipping
-                    // the panel to DEBUG doesn't flood the log with one
-                    // line per spoofed download attempt.
-                    trace!(tunnel_id = id, transport = label,
-                        "remote: dropped reply with no live session");
-                    continue;
-                }
-                let seq = seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let icmp_seq16 = icmp_seq_counter
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u16;
-                // Single-port: seal the reply opaque (wire-identical).
-                // Multi-port: prepend the 2-byte application-port tag so
-                // the Client can demux it after HMAC verify. The tag is
-                // inside the sealed payload, so it is authenticated for
-                // free (the seal hashes SHA256(payload)).
-                let payload = if multiport {
-                    multiport::encode_tag(port, &buf[..n], &mut tagged);
-                    tagged.clone()
-                } else {
-                    buf[..n].to_vec()
-                };
-                let job = DownloadSpoofJob {
-                    payload,
-                    hmac_seq: seq,
-                    icmp_seq: icmp_seq16,
-                };
-                // Route by `seq % N` so each seal worker sees a
-                // strictly-monotonic subset of seqs. Combined with the
-                // small `SEAL_WORKER_CHANNEL_CAP`, this bounds the
-                // wire-order skew that reaches Iran's per-worker
-                // `SeqWindow`.
-                let worker = (seq as usize) % n_workers;
-                if let Err(e) = seal_txs[worker].try_send(job) {
-                    match e {
-                        mpsc::error::TrySendError::Full(_) => {
-                            warn!(tunnel_id = id, transport = label, worker,
-                                "remote: seal channel full, dropping spoof reply");
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {
-                            info!(tunnel_id = id, transport = label, worker,
-                                "remote: seal channel closed, recv exiting");
-                            return;
+                for i in 0..received {
+                    let n = batch.slots[i].len;
+                    let data = &batch.slots[i].buf[..n];
+                    // Reply from the forward target is an "ingress" event
+                    // on the download direction — record it before any
+                    // further work so even a drop-by-no-session is counted.
+                    metrics.record_download(n, now_unix());
+                    if n > payload_cap {
+                        warn!(tunnel_id = id, n, max = payload_cap,
+                            "remote: dropping oversized forward reply (raise tunnel MTU)");
+                        continue;
+                    }
+                    if session_table.any_session().is_none() {
+                        // Per-packet hot-path log: until the first upload
+                        // establishes a session, every forward-target reply
+                        // hits this branch. trace! (not debug!) so flipping
+                        // the panel to DEBUG doesn't flood the log with one
+                        // line per spoofed download attempt.
+                        trace!(tunnel_id = id, transport = label,
+                            "remote: dropped reply with no live session");
+                        continue;
+                    }
+                    let seq = seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let icmp_seq16 = icmp_seq_counter
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        as u16;
+                    // Single-port: seal the reply opaque (wire-identical).
+                    // Multi-port: prepend the 2-byte application-port tag so
+                    // the Client can demux it after HMAC verify. The tag is
+                    // inside the sealed payload, so it is authenticated for
+                    // free (the seal hashes SHA256(payload)).
+                    let payload = if multiport {
+                        multiport::encode_tag(port, data, &mut tagged);
+                        tagged.clone()
+                    } else {
+                        data.to_vec()
+                    };
+                    let job = DownloadSpoofJob {
+                        payload,
+                        hmac_seq: seq,
+                        icmp_seq: icmp_seq16,
+                    };
+                    // Route by `seq % N` so each seal worker sees a
+                    // strictly-monotonic subset of seqs. Combined with the
+                    // small `SEAL_WORKER_CHANNEL_CAP`, this bounds the
+                    // wire-order skew that reaches Iran's per-worker
+                    // `SeqWindow`. Batching the recv does not change this:
+                    // seqs are still assigned one-per-datagram in arrival
+                    // order and the single send socket preserves wire FIFO.
+                    let worker = (seq as usize) % n_workers;
+                    if let Err(e) = seal_txs[worker].try_send(job) {
+                        match e {
+                            mpsc::error::TrySendError::Full(_) => {
+                                metrics.record_seal_drop();
+                                warn!(tunnel_id = id, transport = label, worker,
+                                    "remote: seal channel full, dropping spoof reply");
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                info!(tunnel_id = id, transport = label, worker,
+                                    "remote: seal channel closed, recv exiting");
+                                return;
+                            }
                         }
                     }
                 }
@@ -1083,6 +1112,7 @@ async fn download_seal_worker(
     session_id: u64,
     label: &'static str,
     mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
     id: i64,
     worker_id: usize,
     name: Arc<String>,
@@ -1153,6 +1183,7 @@ async fn download_seal_worker(
                 if let Err(e) = sealed_tx.try_send(sealed) {
                     match e {
                         mpsc::error::TrySendError::Full(_) => {
+                            metrics.record_send_drop(1);
                             warn!(tunnel_id = id, worker = worker_id, transport = label,
                                 "remote: send queue full, dropping sealed packet");
                         }
@@ -1250,6 +1281,7 @@ async fn download_send_worker(
                             batch::sendmmsg(fd.get_ref().as_raw_fd(), &mut send_batch, count)
                         }),
                         Err(e) => {
+                            metrics.record_send_drop(count as u64);
                             warn!(tunnel_id = id, err = %e, transport = label, dropped = count,
                                 "remote: raw writable awaiter failed, dropping batch");
                             break;
@@ -1270,6 +1302,7 @@ async fn download_send_worker(
                             count = send_batch.shift_unsent_to_front(n, count);
                         }
                         Ok(Err(e)) => {
+                            metrics.record_send_drop(count as u64);
                             warn!(tunnel_id = id, err = %e, transport = label, dropped = count,
                                 "remote: sendmmsg failed, dropping batch");
                             break;
@@ -1283,6 +1316,7 @@ async fn download_send_worker(
                             // not a busy spin.
                             would_block_retries += 1;
                             if would_block_retries >= MAX_WOULD_BLOCK_RETRIES {
+                                metrics.record_send_drop(count as u64);
                                 warn!(tunnel_id = id, transport = label, dropped = count,
                                     retries = would_block_retries,
                                     "remote: sendmmsg persistently blocked, dropping batch");

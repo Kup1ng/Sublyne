@@ -83,6 +83,14 @@ pub fn open_send_socket() -> io::Result<Socket> {
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "ping-smooth/send");
+    // This IPPROTO_ICMP send fd is never read (only `sendto`), so the kernel
+    // would accumulate a copy of every host ICMP packet in its forced 4 MiB
+    // recv buffer and then drop new arrivals. Attach the same drop-all BPF
+    // filter the spoof ICMP/UDP/TCP send sockets use.
+    if let Err(e) = crate::transport::attach_drop_all_filter(&sock) {
+        tracing::warn!(err = %e,
+            "ping-smooth/send: attach drop-all BPF filter failed; recv queue may accumulate");
+    }
     Ok(sock)
 }
 

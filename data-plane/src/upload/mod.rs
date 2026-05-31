@@ -203,11 +203,16 @@ pub trait UploadTransport: Send + Sync {
     /// Forward one application UDP payload toward the upload target.
     /// `session` carries the routing hint so a pool-based transport
     /// can keep all packets from one end-user on one TCP connection;
-    /// non-pool transports ignore it. Returns Err when the transport
-    /// is permanently broken (e.g. every SOCKS5 connection in the
-    /// pool is down and reconnection failed); the caller logs and
-    /// drops the packet, the next `send` retries.
-    async fn send(&self, session: SessionKey, payload: &[u8]) -> io::Result<()>;
+    /// non-pool transports ignore it.
+    ///
+    /// Returns `Ok(true)` when the payload was handed to the wire (or
+    /// queued for it), `Ok(false)` when it was deliberately dropped
+    /// before the wire (e.g. every SOCKS5 connection in the pool is
+    /// down/full — UDP is best-effort and the inner protocol
+    /// retransmits), and `Err` for a hard transport error. The caller
+    /// meters delivered vs dropped so the dashboard's upload counter
+    /// never counts a dropped frame as sent.
+    async fn send(&self, session: SessionKey, payload: &[u8]) -> io::Result<bool>;
 
     /// Resize the connection pool live to `n`. Called by the manager
     /// on `UpdateTunnel` when `socks5_target.parallel_connections`

@@ -1,13 +1,19 @@
 <script setup lang="ts">
-import { ArrowDown, ArrowUp, Activity, Cable } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, Activity, Cable, Play, Square, Pencil } from 'lucide-vue-next'
 import { computed } from 'vue'
+import { useTunnelActions } from '~/composables/useTunnelActions'
 import type { Tunnel, TunnelRate } from '~/types/api'
 import { formatBitsPerSecond, formatNumber } from '~/utils/format'
 
 const props = defineProps<{ tunnel: Tunnel; rate?: TunnelRate | null }>()
 
+const actions = useTunnelActions()
+
+// A disabled tunnel reads "Stopped" (pairs with the Start button); an
+// enabled one shows its live health badge, or "Unknown" until the first
+// stats frame arrives (≈1 s after Start).
 const status = computed<TunnelRate['status'] | null>(() => {
-  if (!props.tunnel.enabled) return null
+  if (!props.tunnel.enabled) return 'stopped'
   return props.rate?.status ?? null
 })
 
@@ -25,22 +31,26 @@ const portsLabel = computed(() => {
 </script>
 
 <template>
-  <NuxtLink
-    :to="`/tunnels/${tunnel.id}`"
-    class="surface-card group block p-5 transition hover:border-line/100 hover:shadow-glow"
-  >
+  <div class="surface-card group p-5 transition hover:border-line/100">
     <div class="flex items-start justify-between gap-3">
-      <div class="flex min-w-0 items-center gap-3">
+      <NuxtLink
+        :to="`/tunnels/${tunnel.id}`"
+        class="flex min-w-0 items-center gap-3 outline-none"
+      >
         <div class="grid size-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand">
           <Cable class="size-4" />
         </div>
         <div class="min-w-0">
-          <p class="truncate text-[14.5px] font-semibold tracking-[-0.005em] text-ink">{{ tunnel.name }}</p>
+          <p
+            class="truncate text-[14.5px] font-semibold tracking-[-0.005em] text-ink transition group-hover:text-brand"
+          >
+            {{ tunnel.name }}
+          </p>
           <p class="truncate text-[12px] text-subtle">
             {{ tunnel.role === 'client' ? tunnel.local_listen_addr : tunnel.upload_listen_addr }}
           </p>
         </div>
-      </div>
+      </NuxtLink>
       <TunnelStatusBadge :status="status" />
     </div>
 
@@ -68,5 +78,43 @@ const portsLabel = computed(() => {
         <dd class="tabular mt-0.5 text-[13.5px] font-medium text-ink">{{ sessionsLabel }}</dd>
       </div>
     </dl>
-  </NuxtLink>
+
+    <!-- Primary action: Start when stopped, Stop when running. Reuses the
+         exact same handler/API/role-gating as the Tunnels page via
+         useTunnelActions, so the two pages can never drift apart. The
+         button disables + shows a spinner during the transition and the
+         tile reflects the new state from the action's own refresh + the
+         live metrics WebSocket. -->
+    <div class="mt-4 flex items-center gap-2">
+      <AppButton
+        v-if="!tunnel.enabled"
+        class="flex-1"
+        size="sm"
+        variant="secondary"
+        :loading="actions.isBusy(tunnel.id)"
+        :disabled="actions.isBusy(tunnel.id)"
+        @click="actions.start(tunnel.id, tunnel.name)"
+      >
+        <Play v-if="!actions.isBusy(tunnel.id)" class="size-3.5" />
+        Start
+      </AppButton>
+      <AppButton
+        v-else
+        class="flex-1"
+        size="sm"
+        variant="secondary"
+        :loading="actions.isBusy(tunnel.id)"
+        :disabled="actions.isBusy(tunnel.id)"
+        @click="actions.stop(tunnel.id, tunnel.name)"
+      >
+        <Square v-if="!actions.isBusy(tunnel.id)" class="size-3.5" />
+        Stop
+      </AppButton>
+      <NuxtLink :to="`/tunnels/${tunnel.id}`" aria-label="Edit tunnel">
+        <AppButton size="sm" variant="ghost" aria-label="Edit tunnel">
+          <Pencil class="size-3.5" />
+        </AppButton>
+      </NuxtLink>
+    </div>
+  </div>
 </template>

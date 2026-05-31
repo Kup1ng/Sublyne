@@ -571,4 +571,54 @@ mod tests {
         expected.sort();
         assert_eq!(seen, expected);
     }
+
+    /// Drain-efficiency benchmark for the Remote forward-reply ingest fix:
+    /// the recv loop now drives `recvmmsg` instead of one `recv_from` per
+    /// datagram. Queue a burst, then prove `recvmmsg` empties many
+    /// datagrams per syscall — strictly fewer syscalls than the burst size,
+    /// whereas a `recv_from` loop needs exactly one syscall per datagram.
+    /// Amortising the syscall this way is what keeps `SO_RCVBUF` from
+    /// overflowing (and silently dropping) under a bursty reply stream.
+    #[test]
+    fn recvmmsg_drains_a_burst_in_fewer_syscalls_than_per_datagram() {
+        let recv = UdpSocket::bind("127.0.0.1:0").expect("bind recv");
+        let recv_addr = recv.local_addr().expect("recv addr");
+        recv.set_nonblocking(true).expect("nonblocking");
+        let send = UdpSocket::bind("127.0.0.1:0").expect("bind send");
+
+        // 40 small datagrams fit comfortably in a default loopback recv
+        // buffer, so the whole burst is queued before we start draining.
+        const BURST: usize = 40;
+        for i in 0..BURST {
+            send.send_to(&[i as u8; 64], recv_addr).expect("send_to");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let mut batch = RecvBatch::for_udp(16);
+        let mut total = 0usize;
+        let mut syscalls = 0usize;
+        loop {
+            match recvmmsg(recv.as_raw_fd(), &mut batch) {
+                Ok(n) => {
+                    syscalls += 1;
+                    total += n;
+                    if total >= BURST {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("recvmmsg: {e}"),
+            }
+        }
+        assert!(
+            total >= 2,
+            "expected the queued burst to drain, got {total}"
+        );
+        assert!(
+            syscalls < total,
+            "recvmmsg must drain multiple datagrams per syscall \
+             (took {syscalls} syscalls for {total} datagrams); a recv_from \
+             loop would take one syscall each"
+        );
+    }
 }

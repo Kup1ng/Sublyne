@@ -117,8 +117,8 @@ const procRss = computed(() => snapshot.value?.system.proc_rss_bytes ?? 0)
       </div>
       <Sparkline
         :series="[
-          { data: history.bps_up, tone: 'brand' },
-          { data: history.bps_down, tone: 'accent' },
+          { data: history.bps_up, tone: 'brand', label: 'Upload' },
+          { data: history.bps_down, tone: 'accent', label: 'Download' },
         ]"
         :window="30"
         :height="140"
