@@ -1,13 +1,23 @@
 <script setup lang="ts">
-import { ArrowDown, ArrowUp, Activity, Cable, Play, Square, Pencil } from 'lucide-vue-next'
-import { computed } from 'vue'
+import { ArrowDown, ArrowUp, Activity, Cable, Play, Square, Pencil, Download, Copy } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useTunnelActions } from '~/composables/useTunnelActions'
 import type { Tunnel, TunnelRate } from '~/types/api'
 import { formatBitsPerSecond, formatNumber } from '~/utils/format'
+import TunnelExportDialog from '~/components/tunnel/TunnelExportDialog.vue'
 
 const props = defineProps<{ tunnel: Tunnel; rate?: TunnelRate | null }>()
 
+const router = useRouter()
 const actions = useTunnelActions()
+const showExport = ref(false)
+
+async function onClone() {
+  const created = await actions.clone(props.tunnel.id)
+  // Created stopped — open it so the operator can resolve port clashes / edit.
+  if (created) router.push(`/tunnels/${created.id}`)
+}
 
 // A disabled tunnel reads "Stopped" (pairs with the Start button); an
 // enabled one shows its live health badge, or "Unknown" until the first
@@ -111,11 +121,33 @@ const portsLabel = computed(() => {
         <Square v-if="!actions.isBusy(tunnel.id)" class="size-3.5" />
         Stop
       </AppButton>
+      <AppButton
+        size="sm"
+        variant="ghost"
+        aria-label="Export tunnel"
+        title="Export tunnel"
+        @click="showExport = true"
+      >
+        <Download class="size-3.5" />
+      </AppButton>
+      <AppButton
+        size="sm"
+        variant="ghost"
+        aria-label="Clone tunnel"
+        title="Clone tunnel"
+        :loading="actions.isBusy(tunnel.id)"
+        :disabled="actions.isBusy(tunnel.id)"
+        @click="onClone"
+      >
+        <Copy v-if="!actions.isBusy(tunnel.id)" class="size-3.5" />
+      </AppButton>
       <NuxtLink :to="`/tunnels/${tunnel.id}`" aria-label="Edit tunnel">
         <AppButton size="sm" variant="ghost" aria-label="Edit tunnel">
           <Pencil class="size-3.5" />
         </AppButton>
       </NuxtLink>
     </div>
+
+    <TunnelExportDialog v-model:open="showExport" :tunnel="tunnel" />
   </div>
 </template>
