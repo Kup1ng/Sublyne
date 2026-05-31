@@ -247,7 +247,11 @@ pub(super) async fn spawn(
                     continue;
                 }
                 let target = SocketAddr::new(forward_host, port);
-                let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                let bind = if target.is_ipv6() {
+                    "[::]:0"
+                } else {
+                    "0.0.0.0:0"
+                };
                 let sock = UdpSocket::bind(bind).await.map_err(SpawnError::Io)?;
                 crate::perf::tune_socket(&sock, "remote/forward");
                 let sock = Arc::new(sock);
@@ -560,8 +564,10 @@ fn resolve_upload_forward<'a>(
             let (port, body) = match multiport::decode_tag(datagram) {
                 Some(v) => v,
                 None => {
-                    debug!(tunnel_id = id,
-                        "remote: multi-port upload datagram too short for port tag");
+                    debug!(
+                        tunnel_id = id,
+                        "remote: multi-port upload datagram too short for port tag"
+                    );
                     return None;
                 }
             };
@@ -571,10 +577,14 @@ fn resolve_upload_forward<'a>(
                     let prev = UNKNOWN_PORT_UPLOAD_DROPS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if prev % 1000 == 0 {
-                        warn!(tunnel_id = id, port, dropped_total = prev + 1,
+                        warn!(
+                            tunnel_id = id,
+                            port,
+                            dropped_total = prev + 1,
                             "remote: multi-port upload tagged with a port that is not in this \
                              tunnel's configured set — the two sides have different port lists; \
-                             align them");
+                             align them"
+                        );
                     }
                     None
                 }

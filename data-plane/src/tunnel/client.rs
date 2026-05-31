@@ -226,8 +226,10 @@ pub(super) async fn spawn(
             let port_listener = bind_dualstack_udp(addr).map_err(SpawnError::Io)?;
             crate::perf::tune_socket(&port_listener, "client/listen");
             let port_listener = Arc::new(port_listener);
-            let port_sessions =
-                Arc::new(SessionTable::new(spec.max_connections, spec.idle_timeout_sec));
+            let port_sessions = Arc::new(SessionTable::new(
+                spec.max_connections,
+                spec.idle_timeout_sec,
+            ));
             info!(tunnel_id = id, addr = %addr, family = address_family_label(addr),
                 "client: multi-port local_listen bound");
             // One upload task per port: stamps SessionKey.local_port = P
