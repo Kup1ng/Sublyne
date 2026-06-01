@@ -155,7 +155,8 @@ pub fn parse_inbound(packet: &[u8], mode: IcmpEchoMode) -> Option<ParsedInbound<
 /// ICMPv6 messages. `IPV6_HDRINCL` is set so we can write the IPv6
 /// header (and therefore the source address) ourselves.
 pub fn open_raw_icmpv6_send_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))?;
+    let sock = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))
+        .map_err(|e| crate::perf::socket_err(e, "raw-icmpv6/send"))?;
     sock.set_header_included_v6(true)?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
@@ -175,7 +176,8 @@ pub fn open_raw_icmpv6_send_socket() -> io::Result<Socket> {
 /// ICMPv6 messages. The kernel includes the IPv6 header in the received
 /// buffer on Linux 6.8.
 pub fn open_raw_icmpv6_recv_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))?;
+    let sock = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))
+        .map_err(|e| crate::perf::socket_err(e, "raw-icmpv6/recv"))?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "raw-icmpv6/recv");

@@ -188,7 +188,8 @@ pub fn parse_inbound(packet: &[u8], mode: IcmpEchoMode) -> Option<ParsedInbound<
 /// Open the AF_INET raw socket the Remote uses to *send* spoofed
 /// ICMP messages. `IP_HDRINCL` lets us forge the source IP.
 pub fn open_raw_icmp_send_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
+        .map_err(|e| crate::perf::socket_err(e, "raw-icmp/send"))?;
     sock.set_header_included_v4(true)?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
@@ -212,7 +213,8 @@ pub fn open_raw_icmp_send_socket() -> io::Result<Socket> {
 /// (the `crate::icmp_sysctl::EchoIgnore` guard handles that). The raw
 /// socket receives a copy in parallel via `raw_local_deliver`.
 pub fn open_raw_icmp_recv_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
+        .map_err(|e| crate::perf::socket_err(e, "raw-icmp/recv"))?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "raw-icmp/recv");

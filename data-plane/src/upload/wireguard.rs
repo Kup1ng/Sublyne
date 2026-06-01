@@ -180,7 +180,8 @@ impl WireguardUpload {
         } else {
             "0.0.0.0:0"
         };
-        let egress_std = std::net::UdpSocket::bind(bind)?;
+        let egress_std = std::net::UdpSocket::bind(bind)
+            .map_err(|e| crate::perf::socket_err(e, "client/egress"))?;
         egress_std.set_nonblocking(true)?;
         // SO_MARK before connect() so the route the kernel caches at
         // connect time is the fwmark-steered one (the per-tunnel policy

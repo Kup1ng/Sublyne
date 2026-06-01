@@ -181,21 +181,17 @@ pub(super) async fn spawn(
     let id = spec.id;
     let name = Arc::new(spec.name.clone());
 
-    // (1) Upload listener. The bind respects whatever address family
-    // the operator's `local_listen_addr` parsed to. For `[::]:port`
-    // we explicitly clear IPV6_V6ONLY so the socket accepts both v4
-    // and v6 inbound packets — PRD §8.3 ("a single tunnel can carry
-    // dual-stack traffic"). For `0.0.0.0:port` the kernel only ever
-    // delivers v4 packets, so v6 clients would need to use a v6
-    // listen address.
-    let listener = bind_dualstack_udp(local).map_err(SpawnError::Io)?;
-    // Enlarge SO_RCVBUF/SO_SNDBUF beyond the 208 KiB Ubuntu default so
-    // a normal RTT × 200 Mbit/s burst fits without the kernel dropping
-    // packets at the listener queue (see `perf` module for the rationale
-    // and the diagnostic that motivated it).
-    crate::perf::tune_socket(&listener, "client/listen");
-    let listener = Arc::new(listener);
-    info!(tunnel_id = id, addr = %local, family = address_family_label(local), "client: local_listen bound");
+    // The end-user UDP listener(s) are bound per-path in the router match
+    // below: the single-port branch binds ONE socket on `local_listen_addr`;
+    // the multi-port branch binds one socket per configured port. We
+    // deliberately do NOT bind `local` up front. On the multi-port path the
+    // per-port loop already binds every configured port, and the spec
+    // guarantees that set INCLUDES this primary port (see
+    // `spec::TunnelSpec::ports`), so an unconditional `local` bind here would
+    // re-bind a port the loop also binds and fail the whole start with
+    // `PORT_IN_USE` ("bind: Address in use (os error 98)"). The Go control
+    // plane already treats `local_listen_addr` as host-only in multi-port
+    // mode (see `dataplane/addr.go`) — this matches that contract.
 
     // R9a: pick the upload transport based on the spec. WireGuard mode
     // (the default) wraps the historical WG-marked UDP egress socket
@@ -223,7 +219,8 @@ pub(super) async fn spawn(
                 continue;
             }
             let addr = SocketAddr::new(local_host, port);
-            let port_listener = bind_dualstack_udp(addr).map_err(SpawnError::Io)?;
+            let port_listener = bind_dualstack_udp(addr)
+                .map_err(|e| SpawnError::Io(crate::perf::bind_err(e, "client/listen", addr)))?;
             crate::perf::tune_socket(&port_listener, "client/listen");
             let port_listener = Arc::new(port_listener);
             let port_sessions = Arc::new(SessionTable::new(
@@ -265,12 +262,24 @@ pub(super) async fn spawn(
                 },
             );
         }
-        // The primary listener bound on `local` is unused on the multi-
-        // port path (each port has its own listener). Dropping the Arc
-        // here closes it.
-        drop(listener);
         PortRouter::Multi(Arc::new(bindings))
     } else {
+        // (1) Single-port upload listener. Bind ONE regular UDP socket on
+        // `local_listen_addr`. For `[::]:port` we explicitly clear
+        // IPV6_V6ONLY so the socket accepts both v4 and v6 inbound packets
+        // (PRD §8.3); for `0.0.0.0:port` the kernel only delivers v4. This
+        // bind lives in the single-port branch ONLY — see the note above the
+        // router match for why the multi-port path must not also bind `local`.
+        let listener = bind_dualstack_udp(local)
+            .map_err(|e| SpawnError::Io(crate::perf::bind_err(e, "client/listen", local)))?;
+        // Enlarge SO_RCVBUF/SO_SNDBUF beyond the 208 KiB Ubuntu default so a
+        // normal RTT × 200 Mbit/s burst fits without the kernel dropping
+        // packets at the listener queue (see `perf` module).
+        crate::perf::tune_socket(&listener, "client/listen");
+        let listener = Arc::new(listener);
+        info!(tunnel_id = id, addr = %local, family = address_family_label(local),
+            "client: local_listen bound");
+
         // Upload-side task: end-user → forward to upload_target via the
         // selected upload transport (WG-marked UDP or SOCKS5 TCP). The
         // listener port travels into the upload task so it can stamp each
@@ -301,7 +310,7 @@ pub(super) async fn spawn(
         );
 
         PortRouter::Single {
-            listener: listener.clone(),
+            listener,
             sessions: session_table.clone(),
         }
     };
