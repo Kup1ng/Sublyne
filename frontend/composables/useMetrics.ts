@@ -99,6 +99,7 @@ export function useMetrics() {
         bps_down,
         sessions: t.active_sessions,
         status: t.health_badge,
+        enabled: t.enabled,
       })
       totalUp += bps_up
       totalDown += bps_down

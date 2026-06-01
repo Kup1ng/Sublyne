@@ -355,11 +355,21 @@ impl SessionTable {
     }
 
     /// Empty the table. Used on tunnel stop.
+    ///
+    /// Counts removed entries under each shard lock and `fetch_sub`s them
+    /// (rather than a blind `store(0)`), so a concurrent `insert_or_refresh`
+    /// into an already-cleared shard — its `fetch_add(1)` — survives instead
+    /// of being clobbered to a phantom-positive `total`. A blind reset would
+    /// leave `total` permanently undercounting and could let the table grow
+    /// past `max_connections`.
     pub fn clear(&self) {
+        let mut removed: usize = 0;
         for shard in &self.shards {
-            shard.lock().unwrap().clear();
+            let mut g = shard.lock().unwrap();
+            removed += g.len();
+            g.clear();
         }
-        self.total.store(0, Ordering::Relaxed);
+        self.total.fetch_sub(removed, Ordering::Relaxed);
         if let Ok(mut g) = self.current.lock() {
             *g = None;
         }
@@ -582,6 +592,12 @@ mod tests {
 
     #[test]
     fn memory_pressure_rejects_new_sessions_but_refreshes_existing() {
+        // Hold the shared pressure lock for the whole test so our
+        // set_pressure_for_test(true) window can't contaminate another
+        // test's inserts running in parallel.
+        let _g = crate::memory::PRESSURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let t = SessionTable::new(10, 60);
         // First session lands while memory is fine.
         crate::memory::set_pressure_for_test(false);
@@ -653,6 +669,14 @@ mod tests {
         // 4 threads, each insert+touch on a distinct key range,
         // simultaneously. The final `len()` must equal the total number
         // of distinct keys inserted regardless of interleaving.
+        //
+        // Hold the shared pressure lock + force pressure off: the exact
+        // count assertion is invalid if a parallel test flips the global
+        // memory-pressure flag true and our brand-new keys get rejected.
+        let _g = crate::memory::PRESSURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::memory::set_pressure_for_test(false);
         use std::sync::Arc;
         use std::thread;
         let t = Arc::new(SessionTable::new(10_000, 3600));

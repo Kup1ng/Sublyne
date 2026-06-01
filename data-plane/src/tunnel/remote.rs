@@ -60,7 +60,15 @@ use tokio::net::TcpListener;
 use crate::perf::Socks5KeepaliveProfile;
 use crate::upload::Socks5Profile;
 
-use super::{sleep_or_stopped, MutableConfigSlot, ReasonSlot, StateSlot};
+use super::{sampled, sleep_or_stopped, MutableConfigSlot, ReasonSlot, StateSlot};
+
+// Steady-state per-packet upload-path drop counters, sampled via
+// super::sampled so a persistent fault (MTU misconfig, capacity ceiling,
+// downed forward target) doesn't flood the log. Per-tunnel exact counts
+// still flow to the dashboard via the metrics recorder.
+static OVERSIZED_UPLOAD_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SESSION_FULL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FORWARD_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Per-seal-worker input channel cap. Bounds how far a slow seal
 /// worker can fall behind its peers: at most `SEAL_WORKER_CHANNEL_CAP`
@@ -521,20 +529,26 @@ fn spawn_upload_task(
                     let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
                     let payload_cap = mtu.max(64);
                     if body.len() > payload_cap {
-                        warn!(tunnel_id = id, n = body.len(), max = payload_cap,
-                            "remote: dropping oversized upload packet (raise tunnel MTU or shrink app packet)");
+                        if let Some(total) = sampled(&OVERSIZED_UPLOAD_DROPS) {
+                            warn!(tunnel_id = id, n = body.len(), max = payload_cap, dropped_total = total,
+                                "remote: dropping oversized upload packet (raise tunnel MTU or shrink app packet)");
+                        }
                         continue;
                     }
                     let outcome = session_table.insert_or_refresh(src, src);
                     if matches!(outcome, InsertOutcome::Rejected) {
-                        warn!(tunnel_id = id, %src,
-                            "remote: session table full, dropping new session");
+                        if let Some(total) = sampled(&SESSION_FULL_DROPS) {
+                            warn!(tunnel_id = id, %src, dropped_total = total,
+                                "remote: session table full, dropping new session (at max_connections)");
+                        }
                         metrics.record_session_reject();
                         continue;
                     }
                     if let Err(e) = fwd_sock.send_to(body, fwd_target).await {
-                        warn!(tunnel_id = id, target = %fwd_target, err = %e,
-                            "remote: forward to target failed");
+                        if let Some(total) = sampled(&FORWARD_FAILS) {
+                            warn!(tunnel_id = id, target = %fwd_target, err = %e, dropped_total = total,
+                                "remote: forward to target failed");
+                        }
                     } else {
                         // From the Remote's perspective the upstream
                         // direction (toward the forward target) carries
@@ -762,8 +776,10 @@ async fn drive_socks5_upload_connection(
                 let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
                 let payload_cap = mtu.max(64);
                 if body.len() > payload_cap {
-                    warn!(tunnel_id = id, n = body.len(), max = payload_cap,
-                        "remote: dropping oversized socks5_tcp upload frame (raise tunnel MTU)");
+                    if let Some(total) = sampled(&OVERSIZED_UPLOAD_DROPS) {
+                        warn!(tunnel_id = id, n = body.len(), max = payload_cap, dropped_total = total,
+                            "remote: dropping oversized socks5_tcp upload frame (raise tunnel MTU)");
+                    }
                     continue;
                 }
                 // The SOCKS5 upload doesn't carry a real source
@@ -775,14 +791,18 @@ async fn drive_socks5_upload_connection(
                 // the connection drops.
                 let outcome = session_table.insert_or_refresh(peer, peer);
                 if matches!(outcome, InsertOutcome::Rejected) {
-                    warn!(tunnel_id = id, %peer,
-                        "remote: session table full, dropping new socks5 upload session");
+                    if let Some(total) = sampled(&SESSION_FULL_DROPS) {
+                        warn!(tunnel_id = id, %peer, dropped_total = total,
+                            "remote: session table full, dropping new socks5 upload session (at max_connections)");
+                    }
                     metrics.record_session_reject();
                     continue;
                 }
                 if let Err(e) = fwd_sock.send_to(body, fwd_target).await {
-                    warn!(tunnel_id = id, target = %fwd_target, err = %e,
-                        "remote: socks5_tcp forward to target failed");
+                    if let Some(total) = sampled(&FORWARD_FAILS) {
+                        warn!(tunnel_id = id, target = %fwd_target, err = %e, dropped_total = total,
+                            "remote: socks5_tcp forward to target failed");
+                    }
                 } else {
                     metrics.record_upload(body.len(), now_unix());
                 }
@@ -1280,7 +1300,20 @@ async fn download_send_worker(
                 const MAX_WOULD_BLOCK_RETRIES: u32 = 64;
                 let mut would_block_retries: u32 = 0;
                 while count > 0 {
-                    let result = match raw_send.writable().await {
+                    // Abort the drain promptly if a stop arrives mid-batch
+                    // (operator Stop / internal restart) instead of parking on
+                    // a wedged kernel send queue for up to
+                    // MAX_WOULD_BLOCK_RETRIES writable() cycles — which made
+                    // tunnel shutdown appear to hang under a stalled link.
+                    let writable = tokio::select! {
+                        biased;
+                        _ = stop_rx.changed() => {
+                            metrics.record_send_drop(count as u64);
+                            return;
+                        }
+                        w = raw_send.writable() => w,
+                    };
+                    let result = match writable {
                         Ok(mut guard) => guard.try_io(|fd| {
                             batch::sendmmsg(fd.get_ref().as_raw_fd(), &mut send_batch, count)
                         }),

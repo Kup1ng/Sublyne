@@ -157,20 +157,35 @@ async function doBackup() {
 }
 
 async function onRestoreFile(e: Event) {
-  const file = (e.target as HTMLInputElement).files?.[0]
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  // Always clear the picker first so re-selecting the same file still
+  // fires @change, and a cancelled/empty pick leaves no residue.
+  input.value = ''
   if (!file) return
+  // Restore is destructive and irreversible — it replaces every tunnel,
+  // WireGuard config, and SOCKS5 proxy on THIS server. Make the operator
+  // confirm before a misclicked file picker can wipe their work.
+  const ok = window.confirm(
+    `Restore from "${file.name}"?\n\n` +
+      'This REPLACES all tunnels, WireGuard configs, and SOCKS5 proxies on ' +
+      'this server with the ones from the backup. Your login and panel URL ' +
+      'are kept. This cannot be undone.',
+  )
+  if (!ok) return
   restoring.value = true
   try {
     await backup.restore(file)
-    toast.success(
-      'Restore complete',
-      'Tunnels, WG configs, and audit log replaced. Admin credentials and panel URL preserved.',
-    )
+    toast.success('Restore complete', 'Tunnels and resources replaced. Reloading the panel…')
+    // The DB was swapped underneath the running SPA, so every in-memory
+    // store (tunnels list, settings, session) now holds pre-restore data
+    // and would show ghost rows whose ids no longer exist. Reload so the
+    // panel re-reads the restored state. The JWT key is preserved across a
+    // restore, so this reload stays logged in.
+    setTimeout(() => window.location.reload(), 1200)
   } catch (err) {
     toast.error('Restore failed', (err as Error).message)
-  } finally {
     restoring.value = false
-    ;(e.target as HTMLInputElement).value = ''
   }
 }
 </script>

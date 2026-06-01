@@ -50,6 +50,31 @@ func ConsumeBootstrap(ctx context.Context, db *sql.DB, path string, logger *slog
 		return false, fmt.Errorf("auth: read %s: %w", path, err)
 	}
 
+	// If an admin already exists, this bootstrap file is stale — a failed
+	// os.Remove on a prior start, or a data-preserving reinstall that
+	// re-wrote it. Re-consuming it would call Upsert, whose ON CONFLICT
+	// clause overwrites username + password_hash and resets
+	// password_changed_at to NULL, silently reverting any password the
+	// operator changed from the panel back to the install-time value.
+	// Discard the stale file instead of consuming it.
+	exists, err := adminExists(ctx, db)
+	if err != nil {
+		return false, fmt.Errorf("auth: check existing admin: %w", err)
+	}
+	if exists {
+		for i := range data {
+			data[i] = 0
+		}
+		if rmErr := os.Remove(path); rmErr != nil {
+			logger.Warn("bootstrap: admin already provisioned; could not remove stale bootstrap file — REMOVE IT BY HAND",
+				"path", path, "err", rmErr)
+		} else {
+			logger.Info("bootstrap: admin already provisioned; discarded stale bootstrap file",
+				"path", path)
+		}
+		return false, nil
+	}
+
 	var bf BootstrapFile
 	if err := toml.Unmarshal(data, &bf); err != nil {
 		return false, fmt.Errorf("auth: parse %s: %w", path, err)
@@ -84,5 +109,20 @@ func ConsumeBootstrap(ctx context.Context, db *sql.DB, path string, logger *slog
 	}
 	logger.Info("bootstrap: consumed bootstrap-admin.toml and removed plaintext from disk",
 		"path", path, "username", bf.Username)
+	return true, nil
+}
+
+// adminExists reports whether the single admin row (id = 1) is already
+// present. Used to make bootstrap consumption idempotent: once an admin
+// exists, a lingering bootstrap file must never overwrite it.
+func adminExists(ctx context.Context, db *sql.DB) (bool, error) {
+	var one int
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM admin WHERE id = 1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
 	return true, nil
 }

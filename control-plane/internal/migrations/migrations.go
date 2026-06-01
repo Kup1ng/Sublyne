@@ -68,6 +68,20 @@ func Apply(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// MaxEmbeddedVersion returns the highest migration version compiled into
+// this binary, or 0 if none are embedded. The restore path uses it to
+// reject a backup whose schema_version is newer than this build can
+// honour — restoring such a backup would otherwise stamp the live DB
+// with a version that makes this binary skip its own migrations forever.
+func MaxEmbeddedVersion() int {
+	ms, err := load()
+	if err != nil || len(ms) == 0 {
+		return 0
+	}
+	// load() returns versions sorted ascending.
+	return ms[len(ms)-1].version
+}
+
 func currentVersion(ctx context.Context, db *sql.DB) (int, error) {
 	var v sql.NullInt64
 	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil {

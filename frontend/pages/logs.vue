@@ -62,19 +62,38 @@ function lineFor(e: { msg: string; fields?: Record<string, unknown> }) {
   return fieldLine || e.msg
 }
 
+// The subsystem/target rides in fields.target (the Go bus flattens the
+// Rust tracing target into the structured fields map); there is no
+// top-level `target` on the wire, so reading e.target was always blank.
+function targetFor(e: { fields?: Record<string, unknown> }) {
+  return e.fields && typeof e.fields.target === 'string' ? (e.fields.target as string) : ''
+}
+
 function timeFor(ts: string): string {
   // The Logs page tails the most recent buffer; show clock-time only.
   // The full date is preserved in the audit page where it matters.
   return ts.slice(11, 19)
 }
 
+// Level ordering for the "this level and above" filter, mirroring the
+// backend's levelAtLeast() so choosing WARN shows WARN *and* ERROR
+// instead of hiding every more-severe line.
+const LEVEL_ORDER: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 }
+function passesLevel(entry: string, min: string): boolean {
+  if (min === 'ALL') return true
+  const e = LEVEL_ORDER[entry]
+  const m = LEVEL_ORDER[min]
+  if (e === undefined || m === undefined) return true
+  return e >= m
+}
+
 const filtered = computed(() => {
   const lvl = levelFilter.value
   const q = search.value.toLowerCase()
   return metrics.logs.value.filter((e) => {
-    if (lvl !== 'ALL' && e.level !== lvl) return false
+    if (!passesLevel(e.level, lvl)) return false
     if (!q) return true
-    const hay = `${e.msg} ${lineFor(e)} ${e.target ?? ''}`.toLowerCase()
+    const hay = `${e.msg} ${lineFor(e)} ${targetFor(e)}`.toLowerCase()
     return hay.includes(q)
   })
 })
@@ -133,7 +152,7 @@ const toneOf = (l: string) =>
           <AppBadge :tone="toneOf(e.level)">{{ e.level }}</AppBadge>
         </span>
         <span class="break-words text-[13px] leading-snug text-ink">
-          <span v-if="e.target" class="text-subtle">{{ e.target }} · </span>{{ lineFor(e) }}
+          <span v-if="targetFor(e)" class="text-subtle">{{ targetFor(e) }} · </span>{{ lineFor(e) }}
         </span>
       </li>
     </ul>

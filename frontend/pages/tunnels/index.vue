@@ -25,6 +25,17 @@ onMounted(async () => {
 
 const rates = metrics.rates
 
+// Status badge source. Prefer the live WS snapshot's own `enabled` flag
+// over the REST list's `t.enabled`, which is only refreshed by this tab's
+// own actions — so a tunnel stopped from another tab (or the dashboard)
+// reflects as "stopped" here instead of lingering as healthy/idle.
+function badgeStatus(t: { id: number; enabled: boolean }) {
+  const live = rates.value.get(t.id)
+  const enabled = live ? live.enabled : t.enabled
+  if (!enabled) return 'stopped'
+  return live?.status ?? null
+}
+
 const showImport = ref(false)
 // One export dialog for the whole table; the row buttons set its target.
 const exportTarget = ref<Tunnel | null>(null)
@@ -116,7 +127,7 @@ async function onImported(tunnel: Tunnel) {
               {{ rates.get(t.id) ? formatNumber(rates.get(t.id)!.sessions) : '—' }}
             </td>
             <td class="px-5 py-3.5">
-              <TunnelStatusBadge :status="t.enabled ? (rates.get(t.id)?.status ?? null) : 'stopped'" />
+              <TunnelStatusBadge :status="badgeStatus(t)" />
             </td>
             <td class="px-5 py-3.5 text-right">
               <div class="inline-flex items-center gap-1.5">

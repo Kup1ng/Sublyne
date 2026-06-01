@@ -610,6 +610,27 @@ fn panic_reason(err: &JoinError) -> String {
 
 // Shared role-agnostic helpers ----------------------------------------------
 
+/// LOG_SAMPLE_EVERY is the sampling rate for steady-state, per-packet
+/// warnings (oversized frames, session-table-full, forward failures,
+/// HMAC/replay drops). At even modest packet rates an unsampled per-packet
+/// `warn!` floods journald, churns the in-memory log ring, and rotates
+/// app.log through its backups in seconds — blinding the operator exactly
+/// when the fault is active. The dashboard metric still counts EVERY
+/// occurrence; only the log line is sampled.
+pub(crate) const LOG_SAMPLE_EVERY: u64 = 1000;
+
+/// sampled bumps `counter` and returns `Some(new_total)` once every
+/// LOG_SAMPLE_EVERY calls (including the first), else None — so a caller
+/// can write `if let Some(total) = sampled(&COUNTER) { warn!(..., dropped_total = total) }`.
+pub(crate) fn sampled(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    let prev = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if prev % LOG_SAMPLE_EVERY == 0 {
+        Some(prev + 1)
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn sleep_or_stopped(
     duration: std::time::Duration,
     stop_rx: &mut watch::Receiver<bool>,

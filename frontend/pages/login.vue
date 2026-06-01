@@ -25,6 +25,12 @@ async function submit() {
     }
     const next = (route.query.next as string) || '/dashboard'
     router.push(next)
+  } catch (e) {
+    // auth.login re-throws non-ApiError failures (a dropped connection,
+    // or a non-401 on the post-login /session refresh). Without this
+    // catch the spinner would just stop with no message, leaving the
+    // operator clicking Sign in with no feedback.
+    error.value = (e as Error)?.message || 'Sign in failed — check the connection and try again.'
   } finally {
     submitting.value = false
   }

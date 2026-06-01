@@ -137,6 +137,19 @@ enum PortRouter {
 /// counter so a wholesale-misconfigured peer doesn't flood the app log.
 static UNKNOWN_PORT_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// Steady-state per-packet upload-path drop counters, sampled via
+// super::sampled so a persistent fault (MTU misconfig, capacity ceiling,
+// downed forward target) doesn't flood the log. Per-tunnel exact counts
+// still flow to the dashboard via the metrics recorder.
+static OVERSIZED_UPLOAD_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SESSION_FULL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UPLOAD_FORWARD_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Download-path verify-failure counters (wrong PSK / replayed seq),
+// sampled like VERSION_MISMATCH_DROPS so a mismatched peer or a replay
+// flood can't saturate the log.
+static AUTH_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REPLAY_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Parser function pointer for an IPv4 raw-socket download transport.
 /// Each transport supplies an implementation that peels its specific
 /// L4 header (UDP, TCP-SYN, or ICMP) off the IPv4 packet. UDP and
@@ -442,14 +455,18 @@ fn spawn_upload_task_tagged(
                     let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
                     let upload_payload_cap = mtu.max(64);
                     if n > upload_payload_cap {
-                        warn!(tunnel_id = id, n, max = upload_payload_cap,
-                            "client: dropping oversized upload packet (raise tunnel MTU or shrink app packet)");
+                        if let Some(total) = super::sampled(&OVERSIZED_UPLOAD_DROPS) {
+                            warn!(tunnel_id = id, n, max = upload_payload_cap, dropped_total = total,
+                                "client: dropping oversized upload packet (raise tunnel MTU or shrink app packet)");
+                        }
                         continue;
                     }
                     let outcome = session_table.insert_or_refresh(src, src);
                     if matches!(outcome, InsertOutcome::Rejected) {
-                        warn!(tunnel_id = id, %src,
-                            "client: session table full, dropping new session");
+                        if let Some(total) = super::sampled(&SESSION_FULL_DROPS) {
+                            warn!(tunnel_id = id, %src, dropped_total = total,
+                                "client: session table full, dropping new session (at max_connections)");
+                        }
                         metrics.record_session_reject();
                         continue;
                     }
@@ -473,8 +490,10 @@ fn spawn_upload_task_tagged(
                         // count the drop, do NOT count it as a sent upload.
                         Ok(false) => metrics.record_upload_drop(),
                         Err(e) => {
-                            warn!(tunnel_id = id, err = %e,
-                                "client: upload forward failed");
+                            if let Some(total) = super::sampled(&UPLOAD_FORWARD_FAILS) {
+                                warn!(tunnel_id = id, err = %e, dropped_total = total,
+                                    "client: upload forward failed");
+                            }
                             metrics.record_upload_drop();
                         }
                     }
@@ -1051,19 +1070,29 @@ async fn deliver_verified_job(
             metrics.record_auth_drop();
         }
         Err(OpenError::Auth) => {
-            warn!(
-                tunnel_id = id,
-                transport = transport_label,
-                "client: HMAC verification failed (wrong PSK or tampered packet)"
-            );
+            // Sampled: a wrong-PSK peer or a spoofed-packet sprayer would
+            // otherwise emit one WARN per packet. The metric counts each one.
+            if let Some(total) = super::sampled(&AUTH_DROPS) {
+                warn!(
+                    tunnel_id = id,
+                    transport = transport_label,
+                    dropped_total = total,
+                    "client: HMAC verification failed (wrong PSK or tampered packet)"
+                );
+            }
             metrics.record_auth_drop();
         }
         Err(OpenError::Replay) => {
-            warn!(
-                tunnel_id = id,
-                transport = transport_label,
-                "client: dropped replayed download packet (seq window)"
-            );
+            // Sampled: heavy reordering past the 1024-slot seq window or a
+            // replay flood would otherwise emit one WARN per packet.
+            if let Some(total) = super::sampled(&REPLAY_DROPS) {
+                warn!(
+                    tunnel_id = id,
+                    transport = transport_label,
+                    dropped_total = total,
+                    "client: dropped replayed download packet (seq window)"
+                );
+            }
             metrics.record_auth_drop();
         }
     }

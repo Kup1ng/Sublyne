@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,11 +14,20 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Kup1ng/Sublyne/control-plane/internal/dataplaneasset"
 	"github.com/Kup1ng/Sublyne/control-plane/internal/logging"
 )
+
+// shutdownGrace is how long the supervisor lets the dataplane child run
+// its SIGTERM handler (stop_all → drop the per-tunnel iptables
+// RST-suppression chain and icmp_echo_ignore_all sysctl guards) on a
+// graceful shutdown before falling back to SIGKILL. Without this grace
+// window a `systemctl stop/restart` SIGKILLs the child and orphans that
+// kernel state.
+const shutdownGrace = 5 * time.Second
 
 // SupervisorConfig configures the per-process dataplane supervisor.
 type SupervisorConfig struct {
@@ -234,8 +244,21 @@ func (s *Supervisor) startOnce(ctx context.Context) error {
 	// but the value here is trusted.
 	cmd := exec.CommandContext(ctx, s.cfg.BinaryPath, //nolint:gosec // trusted internal path
 		"--ipc-socket", s.cfg.SocketPath)
-	cmd.Stdout = supervisorLogWriter{logger: s.cfg.Logger, level: slog.LevelInfo}
-	cmd.Stderr = supervisorLogWriter{logger: s.cfg.Logger, level: slog.LevelWarn}
+	cmd.Stdout = &supervisorLogWriter{logger: s.cfg.Logger, level: slog.LevelInfo}
+	cmd.Stderr = &supervisorLogWriter{logger: s.cfg.Logger, level: slog.LevelWarn}
+	// On context cancellation (systemctl stop/restart) send SIGTERM, not
+	// SIGKILL, so the Rust child runs its signal handler and tears down
+	// the iptables RST chain + icmp sysctl guards. WaitDelay bounds the
+	// grace window before exec falls back to SIGKILL. (Without an explicit
+	// Cancel, exec.CommandContext SIGKILLs on ctx-done, orphaning that
+	// kernel state.)
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = shutdownGrace
 	// On Unix systems we want the child to die with the parent — set
 	// PR_SET_PDEATHSIG via syscall.SysProcAttr.Pdeathsig. The struct
 	// is Linux-only; gate via build tags would normally be the answer
@@ -365,8 +388,12 @@ func (s *Supervisor) startOnce(ctx context.Context) error {
 		<-exitCh
 		return errors.New("dataplane IPC client closed; respawning")
 	case <-ctx.Done():
+		// Graceful shutdown (systemctl stop/restart). ctx cancellation
+		// triggers cmd.Cancel (SIGTERM) + WaitDelay grace + SIGKILL
+		// fallback wired in startOnce, so the Rust child runs its SIGTERM
+		// handler (stop_all → drop the iptables RST chain and the
+		// icmp_echo_ignore_all sysctl guards) before it dies. Just reap.
 		_ = client.Close()
-		_ = cmd.Process.Kill()
 		<-exitCh
 		return ctx.Err()
 	}
@@ -468,46 +495,71 @@ func dialWithRetry(ctx context.Context, path string, total time.Duration) (net.C
 type supervisorLogWriter struct {
 	logger *slog.Logger
 	level  slog.Level
+	// buf carries bytes after the last newline across Write calls so a
+	// log line split across two pipe-read chunks (a long line, a JSON
+	// record, or a panic backtrace exceeding the pipe buffer) is
+	// reassembled before parsing. Without this a split JSON line fails
+	// json.Unmarshal and falls back to text at the wrong level, losing
+	// its structured target/tunnel_id/transport fields.
+	buf []byte
 }
 
-func (w supervisorLogWriter) Write(p []byte) (int, error) {
+// supervisorLineCap bounds an unterminated line so a child that never
+// emits a newline can't grow the carry buffer without limit.
+const supervisorLineCap = 1 << 20 // 1 MiB
+
+func (w *supervisorLogWriter) Write(p []byte) (int, error) {
 	if w.logger == nil {
 		return len(p), nil
 	}
-	for _, line := range splitLines(p) {
-		if line == "" {
-			continue
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
 		}
-		// SUBLYNE_LOG_FORMAT=json: tracing-subscriber's .json() formatter
-		// emits one self-describing object per line. The cheap leading-
-		// brace check keeps the text-mode hot path zero-overhead.
-		if line[0] == '{' && w.emitJSON(line) {
-			continue
-		}
-		// Plain text: defensively strip any ANSI escape that snuck in
-		// before forwarding so journald, the rotating file, and the
-		// panel never see raw `\x1b[...m` bytes.
-		clean := stripANSI(line)
-		// Honor the dataplane's OWN level. tracing-subscriber's text
-		// format places the level right after the timestamp
-		// ("<ts>  DEBUG target: msg …"); parse it so a DEBUG / WARN /
-		// ERROR line reaches journald, the rotating file, and the panel
-		// tagged with its real level instead of this writer's fixed
-		// fallback. Without this, EVERY text-mode dataplane line was
-		// logged at the hard-coded fallback (INFO for stdout, WARN for
-		// stderr), so after an operator set the panel log level to DEBUG
-		// the dataplane's debug lines either never surfaced or showed as
-		// INFO — the runtime log-level toggle looked broken for dataplane
-		// output. (The JSON path already preserves the level via
-		// emitJSON/parseRustLevel.) A line with no recognisable level
-		// token — e.g. a panic backtrace on stderr — keeps the fallback.
-		lvl := w.level
-		if parsed, ok := parseTextLevel(clean); ok {
-			lvl = parsed
-		}
-		w.logger.Log(context.Background(), lvl, "dataplane", "line", clean)
+		w.emitLine(string(w.buf[:i]))
+		w.buf = w.buf[i+1:]
+	}
+	// Safety valve: never let an unterminated line grow without bound.
+	if len(w.buf) > supervisorLineCap {
+		w.emitLine(string(w.buf))
+		w.buf = w.buf[:0]
+	}
+	// Release a large backing array once the carry is drained.
+	if len(w.buf) == 0 && cap(w.buf) > 4096 {
+		w.buf = nil
 	}
 	return len(p), nil
+}
+
+// emitLine forwards one complete (newline-stripped) dataplane log line to
+// slog, honoring the line's own level and stripping any stray ANSI.
+func (w *supervisorLogWriter) emitLine(line string) {
+	if line == "" {
+		return
+	}
+	// SUBLYNE_LOG_FORMAT=json: tracing-subscriber's .json() formatter
+	// emits one self-describing object per line. The cheap leading-brace
+	// check keeps the text-mode hot path zero-overhead.
+	if line[0] == '{' && w.emitJSON(line) {
+		return
+	}
+	// Plain text: defensively strip any ANSI escape that snuck in before
+	// forwarding so journald, the rotating file, and the panel never see
+	// raw `\x1b[...m` bytes.
+	clean := stripANSI(line)
+	// Honor the dataplane's OWN level. tracing-subscriber's text format
+	// places the level right after the timestamp ("<ts>  DEBUG target:
+	// msg …"); parse it so a DEBUG / WARN / ERROR line reaches journald,
+	// the rotating file, and the panel tagged with its real level instead
+	// of this writer's fixed fallback. A line with no recognisable level
+	// token — e.g. a panic backtrace on stderr — keeps the fallback.
+	lvl := w.level
+	if parsed, ok := parseTextLevel(clean); ok {
+		lvl = parsed
+	}
+	w.logger.Log(context.Background(), lvl, "dataplane", "line", clean)
 }
 
 // rustTracingRecord mirrors the JSON object tracing-subscriber's
@@ -526,7 +578,7 @@ type rustTracingRecord struct {
 // JSON record and emits it via slog with structured attrs preserved.
 // Returns true if the record was recognised; false otherwise so the
 // caller can fall back to plain-text handling.
-func (w supervisorLogWriter) emitJSON(line string) bool {
+func (w *supervisorLogWriter) emitJSON(line string) bool {
 	var rec rustTracingRecord
 	if err := json.Unmarshal([]byte(line), &rec); err != nil {
 		return false
@@ -625,19 +677,4 @@ func stripANSI(s string) string {
 		return s
 	}
 	return ansiEscapeRE.ReplaceAllString(s, "")
-}
-
-func splitLines(p []byte) []string {
-	var out []string
-	start := 0
-	for i, b := range p {
-		if b == '\n' {
-			out = append(out, string(p[start:i]))
-			start = i + 1
-		}
-	}
-	if start < len(p) {
-		out = append(out, string(p[start:]))
-	}
-	return out
 }

@@ -221,6 +221,10 @@ export interface TunnelRate {
   bps_down: number
   sessions: number
   status: 'healthy' | 'idle' | 'down' | 'stopped'
+  // The authoritative enabled flag from the live snapshot, so a tunnel
+  // stopped in another tab reflects here without waiting for this tab to
+  // refresh its REST list (or for health_badge to age to "stopped").
+  enabled: boolean
 }
 
 export interface HandshakeRow {

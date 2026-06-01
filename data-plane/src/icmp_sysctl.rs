@@ -192,13 +192,33 @@ pub fn install(transport: Transport, mode: crate::spec::IcmpEchoMode) -> EchoIgn
                         installed: false,
                     };
                 }
+                // Defensive: if the knob is ALREADY "1" before we touch it,
+                // it is almost certainly an orphan from a previous unclean
+                // dataplane exit (SIGKILL / OOM / panic-abort) where the Drop
+                // guard never ran — NOT a value the operator chose. Trusting
+                // it as the restore target would make every future clean Stop
+                // restore "1", permanently suppressing ping replies on the
+                // host. Restore the kernel default "0" (replies on) instead,
+                // which is the safe failure direction, and warn loudly.
+                let restore_target = if orig.trim() == "1" {
+                    warn!(
+                        path,
+                        family = label,
+                        "icmp-sysctl: echo_ignore_all was already 1 before this tunnel started \
+                         (likely orphaned by a prior unclean exit); on stop it will be restored \
+                         to 0 (replies on), not 1"
+                    );
+                    "0\n".to_string()
+                } else {
+                    orig.clone()
+                };
                 info!(
                     path,
                     family = label,
                     previous = %orig.trim(),
                     "icmp-sysctl: echo_ignore_all=1 — kernel will NOT reply to incoming pings while this tunnel runs"
                 );
-                state.original = Some(orig);
+                state.original = Some(restore_target);
                 state.count = 1;
                 EchoIgnoreGuard {
                     kind,
