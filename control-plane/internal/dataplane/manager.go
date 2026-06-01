@@ -218,10 +218,12 @@ func (m *Manager) Stop(ctx context.Context, id int64) error {
 }
 
 // SetLogLevel pushes a `SetLogLevel` IPC command at the dataplane.
-// Called by the LevelControl OnChange hook installed in main when an
-// operator flips the panel's log-level dropdown. A nil manager or a
-// not-yet-connected supervisor is a soft no-op — the next reconnect
-// will pick up the level via main's initial replay of cfg.LogLevel.
+// Called both by the LevelControl OnChange hook (when an operator flips
+// the panel's log-level dropdown) and by main's reconcile loop on every
+// dataplane (re)connect. A nil manager or a not-yet-connected supervisor
+// is a soft no-op — the reconcile loop re-pushes the current level the
+// moment the next child reaches Ready, so a respawned dataplane always
+// converges on the operator's chosen level.
 func (m *Manager) SetLogLevel(ctx context.Context, level string) error {
 	if m == nil {
 		return nil

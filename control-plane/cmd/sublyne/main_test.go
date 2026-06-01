@@ -25,7 +25,9 @@ func TestVersionIsSet(t *testing.T) {
 
 func TestParseLogLevel(t *testing.T) {
 	cases := map[string]slog.Level{
-		"trace":  slog.LevelDebug,
+		// "trace" maps below DEBUG (matching logging.ParseLevel / the bus
+		// handler) so TRACE-tagged records aren't silently dropped.
+		"trace":  slog.LevelDebug - 4,
 		"debug":  slog.LevelDebug,
 		"info":   slog.LevelInfo,
 		"warn":   slog.LevelWarn,

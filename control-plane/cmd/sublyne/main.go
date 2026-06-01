@@ -321,6 +321,21 @@ func run(args []string) int {
 					}
 					continue
 				}
+				// Push the operator's current log level to the freshly-ready
+				// child. The dataplane boots at its compile-time default
+				// (info); without this re-push a panel-set DEBUG/TRACE is lost
+				// on every (re)spawn, and on first startup the level restored
+				// into the Go plane never reached the dataplane because the
+				// OnChange hook is installed later. Done on every WaitReady so
+				// it covers both startup and post-crash respawn.
+				if logSetup.Level != nil {
+					lvlStr := logging.LevelString(logSetup.Level.Get())
+					pushCtx, pushCancel := context.WithTimeout(ctx, 2*time.Second)
+					if err := dpManager.SetLogLevel(pushCtx, lvlStr); err != nil {
+						slog.Warn("dataplane: log-level push on (re)connect failed", "level", lvlStr, "err", err)
+					}
+					pushCancel()
+				}
 				all, err := tunnelRepo.List(ctx)
 				if err != nil {
 					slog.Warn("dataplane: list tunnels for sync failed", "err", err)
@@ -529,19 +544,13 @@ func run(args []string) int {
 	return 0
 }
 
+// parseLogLevel maps a config-file log level string onto an slog.Level.
+// It delegates to logging.ParseLevel so "trace" resolves to the same
+// sub-debug level the runtime-restore path and the bus handler use —
+// otherwise a config-file log_level="trace" would silently run the
+// process at DEBUG and drop every TRACE-tagged record.
 func parseLogLevel(s string) slog.Level {
-	switch s {
-	case "trace", "debug":
-		return slog.LevelDebug
-	case "info":
-		return slog.LevelInfo
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
+	return logging.ParseLevel(s)
 }
 
 // runTearDown removes every sub-wg-* interface, every project-owned
