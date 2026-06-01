@@ -212,6 +212,58 @@ func TestSupervisorLogWriter_NonTracingJSONFallsBack(t *testing.T) {
 	}
 }
 
+// TestSupervisorLogWriter_TextLevelHonored is the regression test for the
+// runtime log-level bug. In text mode (the default) every dataplane line
+// used to be logged at the writer's fixed fallback level, so a dataplane
+// DEBUG line surfaced as INFO and the panel's Logs-page filter could never
+// reach it after an operator switched to DEBUG. The writer now parses the
+// level out of tracing-subscriber's text format so each line carries its
+// real level all the way to journald, the rotating file, and the panel.
+func TestSupervisorLogWriter_TextLevelHonored(t *testing.T) {
+	cases := []struct {
+		name, line, want string
+	}{
+		// Note the second token (after the RFC3339 timestamp) is the
+		// tracing level — exactly where tracing-subscriber puts it.
+		{"debug", "2026-06-01T00:00:00.000000Z DEBUG sublyne_dataplane::tunnel::client: evicted=2\n", "level=DEBUG"},
+		{"warn", "2026-06-01T00:00:00.000000Z  WARN sublyne_dataplane::manager: start failed\n", "level=WARN"},
+		{"error", "2026-06-01T00:00:00.000000Z ERROR sublyne_dataplane::ipc: boom\n", "level=ERROR"},
+		// slog has no native TRACE; the JSON path already maps it to
+		// Debug-4, which the text handler renders as "DEBUG-4".
+		{"trace", "2026-06-01T00:00:00.000000Z TRACE sublyne_dataplane::tunnel::client: t\n", "level=DEBUG-4"},
+		// An INFO line still resolves to INFO (the fallback would also be
+		// INFO here, but this proves the parse, not the fallback).
+		{"info", "2026-06-01T00:00:00.000000Z  INFO sublyne_dataplane::tunnel::client: bound\n", "level=INFO"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w, buf := newCapturingWriter(t)
+			if _, err := w.Write([]byte(c.line)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if got := buf.String(); !strings.Contains(got, c.want) {
+				t.Errorf("text-mode line should be tagged %q, got %q", c.want, got)
+			}
+		})
+	}
+}
+
+// TestSupervisorLogWriter_NoLevelFallsBack confirms a line with no tracing
+// level token (e.g. a Rust panic backtrace on stderr) keeps the writer's
+// configured fallback level rather than being mis-tagged or dropped.
+func TestSupervisorLogWriter_NoLevelFallsBack(t *testing.T) {
+	buf := new(bytes.Buffer)
+	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug - 4})
+	// The stderr writer uses a WARN fallback in production (see startOnce).
+	w := supervisorLogWriter{logger: slog.New(handler), level: slog.LevelWarn}
+	if _, err := w.Write([]byte("thread 'main' panicked at src/main.rs:42:1\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := buf.String(); !strings.Contains(got, "level=WARN") {
+		t.Errorf("no-level line should keep the WARN fallback, got %q", got)
+	}
+}
+
 func TestStripANSI(t *testing.T) {
 	cases := []struct {
 		name, in, want string

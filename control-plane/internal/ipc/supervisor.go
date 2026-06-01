@@ -488,7 +488,24 @@ func (w supervisorLogWriter) Write(p []byte) (int, error) {
 		// before forwarding so journald, the rotating file, and the
 		// panel never see raw `\x1b[...m` bytes.
 		clean := stripANSI(line)
-		w.logger.Log(context.Background(), w.level, "dataplane", "line", clean)
+		// Honor the dataplane's OWN level. tracing-subscriber's text
+		// format places the level right after the timestamp
+		// ("<ts>  DEBUG target: msg …"); parse it so a DEBUG / WARN /
+		// ERROR line reaches journald, the rotating file, and the panel
+		// tagged with its real level instead of this writer's fixed
+		// fallback. Without this, EVERY text-mode dataplane line was
+		// logged at the hard-coded fallback (INFO for stdout, WARN for
+		// stderr), so after an operator set the panel log level to DEBUG
+		// the dataplane's debug lines either never surfaced or showed as
+		// INFO — the runtime log-level toggle looked broken for dataplane
+		// output. (The JSON path already preserves the level via
+		// emitJSON/parseRustLevel.) A line with no recognisable level
+		// token — e.g. a panic backtrace on stderr — keeps the fallback.
+		lvl := w.level
+		if parsed, ok := parseTextLevel(clean); ok {
+			lvl = parsed
+		}
+		w.logger.Log(context.Background(), lvl, "dataplane", "line", clean)
 	}
 	return len(p), nil
 }
@@ -560,6 +577,36 @@ func parseRustLevel(s string, fallback slog.Level) slog.Level {
 		return slog.LevelDebug - 4
 	}
 	return fallback
+}
+
+// parseTextLevel extracts the level from a tracing-subscriber TEXT-format
+// line ("<timestamp>  LEVEL  <target>: <message> <fields>"). The level
+// token sits among the first few whitespace-separated fields, right after
+// the RFC3339 timestamp, so we scan only the leading fields — a level word
+// that happens to appear inside a message body can't be mistaken for the
+// record's level. Returns false when no level token is present (e.g. a
+// panic backtrace on stderr), so the caller keeps its fallback level.
+func parseTextLevel(line string) (slog.Level, bool) {
+	fields := strings.Fields(line)
+	n := len(fields)
+	if n > 4 {
+		n = 4
+	}
+	for i := 0; i < n; i++ {
+		switch fields[i] {
+		case "TRACE":
+			return slog.LevelDebug - 4, true
+		case "DEBUG":
+			return slog.LevelDebug, true
+		case "INFO":
+			return slog.LevelInfo, true
+		case "WARN", "WARNING":
+			return slog.LevelWarn, true
+		case "ERROR":
+			return slog.LevelError, true
+		}
+	}
+	return 0, false
 }
 
 // ansiEscapeRE matches the CSI / SGR escape sequences tracing-subscriber

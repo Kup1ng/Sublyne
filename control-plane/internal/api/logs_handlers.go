@@ -270,7 +270,17 @@ func SetLogLevelHandler(deps LogsDeps) http.HandlerFunc {
 			return
 		}
 		previous := logging.LevelString(deps.Level.Get())
-		deps.Level.Set(logging.ParseLevel(level))
+		newLevel := logging.ParseLevel(level)
+		deps.Level.Set(newLevel)
+
+		// Emit a confirmation AT THE NEW LEVEL so it is always visible
+		// right after the change — both in journald and the panel's Logs
+		// page — no matter which level the operator picked (a record at
+		// exactly the active threshold passes the filter). On a quiet box
+		// there may be no other lines at the new level for a while, so this
+		// is the operator's instant proof the toggle took effect.
+		deps.logger().Log(r.Context(), newLevel, "log level changed",
+			"from", previous, "to", level)
 
 		// Persist so the operator's choice survives a service restart.
 		// Failure here is non-fatal: the live runtime is already
