@@ -47,13 +47,15 @@ const procRss = computed(() => snapshot.value?.system.proc_rss_bytes ?? 0)
 </script>
 
 <template>
-  <Topbar
-    title="Dashboard"
-    subtitle="Live view of every tunnel on this server."
-    @open-menu="drawer.show"
-  />
+  <!-- No page header on desktop: the persistent sidebar already names the
+       current page, so the dashboard leads straight with the stat tiles. On
+       mobile the sidebar is hidden, so the Topbar is kept solely to host the
+       nav-drawer button (title/subtitle dropped). -->
+  <div class="md:hidden">
+    <Topbar @open-menu="drawer.show" />
+  </div>
 
-  <section class="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+  <section class="grid gap-5 md:grid-cols-2 xl:grid-cols-4 md:pt-10">
     <StatCard
       label="Upload"
       :value="formatBitsPerSecond(totalUp)"
