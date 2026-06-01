@@ -3,6 +3,17 @@ import type { Tunnel } from '~/types/api'
 import { pickAllowed } from '~/utils/pick'
 import { sanitizeTunnelFilename } from '~/utils/clientFile'
 
+// TunnelUpdateResult is the PUT /tunnels/:id response: the saved Tunnel
+// plus a small envelope. restart_required (+ message) is set when the
+// change only takes effect after a Stop/Start of the running tunnel;
+// dataplane_error is set when a live hot-reload was attempted and failed.
+// Both are omitted (undefined) on a clean hot-applied save.
+export type TunnelUpdateResult = Tunnel & {
+  restart_required?: boolean
+  restart_required_message?: string
+  dataplane_error?: string
+}
+
 // TunnelExportEnvelope is the versioned wrapper the backend produces on export
 // and accepts on import (see control-plane tunnelExportEnvelope). It is its OWN
 // strict shape — NOT the tunnel-input whitelist — so every field is forwarded
@@ -86,7 +97,10 @@ export function useTunnels() {
     // brick the paired tunnel.
     const body = pickAllowed(input, TUNNEL_INPUT_FIELDS) as Partial<Tunnel>
     if (body.psk === '***') delete body.psk
-    const t = await api.put<Tunnel>(`/tunnels/${id}`, body)
+    // Keep the restart_required / dataplane_error envelope so the edit
+    // page can tell the operator when a change needs a Stop/Start or a
+    // hot-reload failed, instead of always reporting a bare "Saved".
+    const t = await api.put<TunnelUpdateResult>(`/tunnels/${id}`, body)
     await refresh()
     return t
   }

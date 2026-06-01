@@ -50,7 +50,20 @@ async function onSubmit(value: Partial<Tunnel>) {
         return
       }
     }
-    toast.success('Saved')
+    // Surface the backend's hot-reload envelope so a change that needs a
+    // Stop/Start (e.g. a listen-address edit on a running tunnel) isn't
+    // silently reported as a plain "Saved", and a failed live reload is
+    // not swallowed.
+    if (t.dataplane_error) {
+      toast.error('Saved, but the live update failed', t.dataplane_error)
+    } else if (t.restart_required) {
+      toast.info(
+        'Saved — restart needed to apply',
+        t.restart_required_message || 'Stop and Start this tunnel for the change to take effect.',
+      )
+    } else {
+      toast.success('Saved')
+    }
   } catch (e) {
     if (e instanceof ApiError) {
       errors.value = e.fields

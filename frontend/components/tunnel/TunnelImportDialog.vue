@@ -72,17 +72,26 @@ function applyApiError(err: ApiError) {
   if (fields.psk) errors.value.psk = fields.psk
   if (fields.name) errors.value.name = fields.name
 
-  // Any remaining tunnel-field validation errors render inline too.
+  // This dialog only renders the name + psk inputs inline, so any OTHER
+  // tunnel-field validation error (ports, upload_target_addr, forward_target,
+  // …) would be stored but never shown — a silent import failure. Collect
+  // them into the banner so the operator always learns why it failed.
+  const extra: string[] = []
   for (const [k, v] of Object.entries(fields)) {
     if (
-      k !== 'file' &&
-      k !== 'psk' &&
-      k !== 'name' &&
-      k !== 'wireguard_config_name' &&
-      k !== 'socks5_proxy_name'
+      k === 'file' ||
+      k === 'psk' ||
+      k === 'name' ||
+      k === 'wireguard_config_name' ||
+      k === 'socks5_proxy_name'
     ) {
-      errors.value[k] = v
+      continue
     }
+    errors.value[k] = v
+    extra.push(`${k.replace(/_/g, ' ')}: ${v}`)
+  }
+  if (extra.length && !banner.value) {
+    banner.value = 'This tunnel needs fixes before it can be imported here — ' + extra.join('; ')
   }
 
   // Name clash (409) carries no fields — guide the operator to rename.
