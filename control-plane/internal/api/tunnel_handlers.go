@@ -668,6 +668,7 @@ func StartTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 		// host/port/credentials/parallel-count it needs, and we skip
 		// WG bring-up — the SOCKS5 path replaces it.
 		var socks5Proxy *socks5.Proxy
+		wgBroughtUp := false
 		if t.Role == tunnels.RoleClient && t.UploadMode == tunnels.UploadModeSocks5 {
 			p, err := resolveSOCKS5Proxy(r.Context(), deps, t)
 			if err != nil {
@@ -680,9 +681,20 @@ func StartTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 				writeJSONError(w, http.StatusBadGateway, "could not bring up WireGuard interface: "+err.Error())
 				return
 			}
+			wgBroughtUp = true
 		}
 		out, err := deps.Repo.SetEnabled(r.Context(), id, true)
 		if err != nil {
+			// The WG interface, ip rule, and route are already up, but the
+			// DB row stays disabled — and reconcile only touches enabled
+			// rows, so it would never tear them down. Roll the bring-up back
+			// before returning so we don't leak an orphan kernel interface.
+			if wgBroughtUp && deps.WGManager != nil {
+				if derr := deps.WGManager.Down(r.Context(), t.ID); derr != nil && !errors.Is(derr, wg.ErrManagerUnsupported) {
+					deps.logger().Warn("tunnel start: WG rollback after enable failure failed",
+						"tunnel_id", t.ID, "err", derr)
+				}
+			}
 			writeJSONError(w, http.StatusInternalServerError, "could not enable tunnel")
 			return
 		}
@@ -1239,6 +1251,18 @@ func ImportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 		}
 
 		body := envelope.Tunnel
+		// A box hosts exactly one role. If the export was taken on the
+		// other role, reject it with one clear message rather than coercing
+		// the role to this server's and then failing validation with a
+		// scattered set of unrelated client/remote field errors.
+		if body.Role != "" && deps.ServerRole != "" && body.Role != string(deps.ServerRole) {
+			writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
+				"file": fmt.Sprintf(
+					"This export is for a %q server; this one is configured as %q. Import it on the matching box.",
+					body.Role, deps.ServerRole),
+			}})
+			return
+		}
 		in := tunnelInput{
 			Name:                    body.Name,
 			Enabled:                 false,

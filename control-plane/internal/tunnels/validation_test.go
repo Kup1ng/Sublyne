@@ -610,3 +610,73 @@ func TestValidate_LocalListenSameAsDownloadReceiveIsRejected(t *testing.T) {
 		t.Errorf("expected self-conflict error, fields=%v", ve.Fields)
 	}
 }
+
+// --- v3.0.0 hardening: IP-family vs transport + literal-IP upload addrs ---
+
+func TestValidate_RejectsIPv6SpoofWithIPv4Transport(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	t1 := sampleClient("v6-on-udp")
+	t1.DownloadTransport = TransportUDP
+	t1.DownloadSpoofSourceIP = "2001:db8::1"
+	err := Validate(context.Background(), repo, RoleClient, &t1, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["download_spoof_source_ip"]; !ok {
+		t.Errorf("expected download_spoof_source_ip family error, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_RejectsIPv4SpoofWithICMPv6(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	t1 := sampleClient("v4-on-icmpv6")
+	t1.DownloadTransport = TransportICMPv6
+	// sampleClient's spoof IP is IPv4 (203.0.113.5) — mismatched.
+	err := Validate(context.Background(), repo, RoleClient, &t1, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["download_spoof_source_ip"]; !ok {
+		t.Errorf("expected download_spoof_source_ip family error, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_AcceptsIPv6SpoofWithICMPv6(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	t1 := sampleClient("v6-on-icmpv6")
+	t1.DownloadTransport = TransportICMPv6
+	t1.DownloadSpoofSourceIP = "2001:db8::1"
+	if err := Validate(context.Background(), repo, RoleClient, &t1, 0); err != nil {
+		t.Fatalf("icmpv6 + IPv6 spoof IP should validate, got: %v", err)
+	}
+}
+
+func TestValidate_RejectsHostnameUploadTarget(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	t1 := sampleClient("hostname-target")
+	t1.UploadTargetAddr = sql.NullString{String: "proxy.example.com:55555", Valid: true}
+	err := Validate(context.Background(), repo, RoleClient, &t1, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["upload_target_addr"]; !ok {
+		t.Errorf("expected upload_target_addr literal-IP error, fields=%v", ve.Fields)
+	}
+}
+
+func TestValidate_RejectsHostnameUploadListen(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	t1 := sampleRemote("hostname-listen")
+	t1.UploadListenAddr = sql.NullString{String: "listen.example.com:55555", Valid: true}
+	err := Validate(context.Background(), repo, RoleRemote, &t1, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["upload_listen_addr"]; !ok {
+		t.Errorf("expected upload_listen_addr literal-IP error, fields=%v", ve.Fields)
+	}
+}

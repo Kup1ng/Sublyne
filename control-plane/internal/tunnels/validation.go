@@ -97,6 +97,10 @@ func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, exist
 	}
 	if err := checkIP(t.DownloadSpoofSourceIP); err != nil {
 		ve.Fields["download_spoof_source_ip"] = "Spoof source IP " + err.Error()
+	} else if t.DownloadTransport.IsValid() {
+		if err := checkIPFamily(t.DownloadSpoofSourceIP, t.DownloadTransport); err != nil {
+			ve.Fields["download_spoof_source_ip"] = "Spoof source IP " + err.Error()
+		}
 	}
 	if t.DownloadSpoofSourcePort < 1 || t.DownloadSpoofSourcePort > 65535 {
 		ve.Fields["download_spoof_source_port"] = "Spoof source port must be between 1 and 65535."
@@ -168,8 +172,13 @@ func validateClientFields(t *Tunnel, ve *ValidationError) {
 
 	if !t.UploadTargetAddr.Valid || strings.TrimSpace(t.UploadTargetAddr.String) == "" {
 		ve.Fields["upload_target_addr"] = "Upload target address is required for client tunnels (the Remote server's host:port)."
-	} else if _, _, err := splitHostPort(t.UploadTargetAddr.String); err != nil {
+	} else if host, _, err := splitHostPort(t.UploadTargetAddr.String); err != nil {
 		ve.Fields["upload_target_addr"] = "Upload target address must be host:port, e.g. 198.51.100.10:55555."
+	} else if _, perr := netip.ParseAddr(host); perr != nil {
+		// The dataplane parses this with a numeric SocketAddr, so a DNS
+		// hostname (which net.SplitHostPort accepts) would pass here then
+		// fail opaquely in Rust. Require a literal IP up front.
+		ve.Fields["upload_target_addr"] = "Upload target address must use a literal IP (resolve any hostname and paste the IP), e.g. 198.51.100.10:55555."
 	}
 
 	// Upload-mode mutual exclusion (Phase R8). A Client tunnel uploads
@@ -240,8 +249,10 @@ func validateClientFields(t *Tunnel, ve *ValidationError) {
 func validateRemoteFields(t *Tunnel, ve *ValidationError) {
 	if !t.UploadListenAddr.Valid || strings.TrimSpace(t.UploadListenAddr.String) == "" {
 		ve.Fields["upload_listen_addr"] = "Upload listen address is required for remote tunnels (e.g. 0.0.0.0:55555)."
-	} else if _, _, err := splitHostPort(t.UploadListenAddr.String); err != nil {
+	} else if host, _, err := splitHostPort(t.UploadListenAddr.String); err != nil {
 		ve.Fields["upload_listen_addr"] = "Upload listen address must be host:port, e.g. 0.0.0.0:55555."
+	} else if _, perr := netip.ParseAddr(host); perr != nil {
+		ve.Fields["upload_listen_addr"] = "Upload listen address must use a literal IP host, e.g. 0.0.0.0:55555."
 	}
 
 	if !t.ForwardTarget.Valid || strings.TrimSpace(t.ForwardTarget.String) == "" {
@@ -260,6 +271,10 @@ func validateRemoteFields(t *Tunnel, ve *ValidationError) {
 		ve.Fields["client_real_ip"] = "Client real IP is required (the public IP of the Iran-side Client server)."
 	} else if err := checkIP(t.ClientRealIP.String); err != nil {
 		ve.Fields["client_real_ip"] = "Client real IP " + err.Error()
+	} else if t.DownloadTransport.IsValid() {
+		if err := checkIPFamily(t.ClientRealIP.String, t.DownloadTransport); err != nil {
+			ve.Fields["client_real_ip"] = "Client real IP " + err.Error()
+		}
 	}
 
 	// Upload-listen mode (Phase R9a). 'udp' is the historical default
@@ -444,6 +459,30 @@ func checkIP(s string) error {
 	}
 	if _, err := netip.ParseAddr(s); err != nil {
 		return errors.New("must be a valid IPv4 or IPv6 address.")
+	}
+	return nil
+}
+
+// checkIPFamily enforces that an IP's address family matches the download
+// transport: icmpv6 rides IPv6, every other transport (udp / tcp_syn /
+// icmp) rides an IPv4 spoof envelope. Without this guard an IPv6 spoof IP
+// on a udp tunnel (or an IPv4 IP on icmpv6) passes validation and then
+// silently fails to build a valid spoofed packet in the dataplane. The
+// caller only invokes this once checkIP has confirmed the string parses.
+func checkIPFamily(s string, transport Transport) error {
+	addr, err := netip.ParseAddr(strings.TrimSpace(s))
+	if err != nil {
+		return nil // checkIP already reported the parse error
+	}
+	isV6 := addr.Is6() && !addr.Is4In6()
+	if transport == TransportICMPv6 {
+		if !isV6 {
+			return errors.New("must be an IPv6 address for the icmpv6 transport.")
+		}
+		return nil
+	}
+	if isV6 {
+		return errors.New("must be an IPv4 address for this transport (use the icmpv6 transport for IPv6).")
 	}
 	return nil
 }

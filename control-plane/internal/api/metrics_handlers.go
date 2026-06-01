@@ -269,9 +269,12 @@ func formatAge(d time.Duration) string {
 func MetricsWebSocketHandler(deps MetricsDeps, logsDeps LogsDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			// Panel + WS share the same origin; reject mismatches.
+			// Panel + WS share the same origin. Leaving OriginPatterns
+			// unset (was ["*"], which disabled the check entirely) makes
+			// coder/websocket enforce that the Origin header's host equals
+			// the request Host — rejecting a cross-origin upgrade at the WS
+			// layer, in addition to the SameSite=Strict auth cookie.
 			InsecureSkipVerify: false,
-			OriginPatterns:     []string{"*"},
 		})
 		if err != nil {
 			deps.logger().Debug("ws: accept failed", "err", err)
