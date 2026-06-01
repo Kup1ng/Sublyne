@@ -35,6 +35,14 @@ static PRESSURE: AtomicBool = AtomicBool::new(false);
 static LAST_RSS_BYTES: AtomicU64 = AtomicU64::new(0);
 static LAST_TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Serialises every test that reads or writes the process-global
+/// PRESSURE flag — here and in the session module — so cargo's parallel
+/// test runner can't let one test's `set_pressure_for_test(true)` leak
+/// into another test's inserts. That cross-test race is the root cause of
+/// the previously-flaky `concurrent_inserts_stay_consistent`.
+#[cfg(test)]
+pub(crate) static PRESSURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Returns true if the dataplane is currently in memory-pressure mode.
 /// Cheap atomic load on every new-session path.
 #[inline]
@@ -170,6 +178,7 @@ mod tests {
 
     #[test]
     fn pressure_starts_false() {
+        let _g = PRESSURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Reset to a known state — other tests in this module mutate
         // the static.
         set_pressure_for_test(false);
@@ -178,6 +187,7 @@ mod tests {
 
     #[test]
     fn set_for_test_round_trips() {
+        let _g = PRESSURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_pressure_for_test(true);
         assert!(pressure_active());
         set_pressure_for_test(false);
