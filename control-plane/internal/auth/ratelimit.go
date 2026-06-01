@@ -156,20 +156,18 @@ func (l *Limiter) Check(ctx context.Context, ip string) (LockoutDecision, error)
 	if err != nil {
 		return LockoutDecision{}, fmt.Errorf("auth: query failures: %w", err)
 	}
+	defer func() { _ = rows.Close() }()
 	var fails []int64
 	for rows.Next() {
 		var ts int64
 		if err := rows.Scan(&ts); err != nil {
-			_ = rows.Close()
 			return LockoutDecision{}, fmt.Errorf("auth: scan failure ts: %w", err)
 		}
 		fails = append(fails, ts)
 	}
 	if cerr := rows.Err(); cerr != nil {
-		_ = rows.Close()
 		return LockoutDecision{}, fmt.Errorf("auth: iterate failures: %w", cerr)
 	}
-	_ = rows.Close()
 
 	windowSec := int64(l.cfg.Window / time.Second)
 	durSec := int64(l.cfg.LockoutDuration / time.Second)

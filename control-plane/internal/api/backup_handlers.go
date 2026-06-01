@@ -168,7 +168,10 @@ func scrubBackupSnapshot(ctx context.Context, snapPath string) error {
 		return fmt.Errorf("scrub login_attempts: %w", err)
 	}
 	ph, args := settingsKeyPlaceholders()
-	if _, err := db.ExecContext(ctx, "DELETE FROM settings WHERE key IN ("+ph+")", args...); err != nil {
+	// The interpolated part is only literal "?" placeholders; the keys
+	// themselves are bound as args, so there is no injection surface.
+	delIdentity := "DELETE FROM settings WHERE key IN (" + ph + ")" //nolint:gosec // placeholders only, keys bound as args
+	if _, err := db.ExecContext(ctx, delIdentity, args...); err != nil {
 		return fmt.Errorf("scrub panel-identity settings: %w", err)
 	}
 	// VACUUM rewrites the file from scratch so the deleted secret bytes
@@ -869,13 +872,15 @@ func swapTablesFromBackup(ctx context.Context, db *sql.DB, srcPath string, prese
 	//     silently ignored by the same NOT IN filter (per the v3.0.0
 	//     contract: don't fail, just don't apply it).
 	settingsPH, settingsArgs := settingsKeyPlaceholders()
-	if _, err := tx.ExecContext(ctx,
-		"DELETE FROM main.settings WHERE key NOT IN ("+settingsPH+")", settingsArgs...); err != nil {
+	// The interpolated part is only literal "?" placeholders; the keys are
+	// bound as args, so there is no injection surface.
+	clearPortable := "DELETE FROM main.settings WHERE key NOT IN (" + settingsPH + ")"                                                                         //nolint:gosec // placeholders only, keys bound as args
+	copyPortable := "INSERT INTO main.settings (key, value, updated_at) SELECT key, value, updated_at FROM src.settings WHERE key NOT IN (" + settingsPH + ")" //nolint:gosec // placeholders only, keys bound as args
+	if _, err := tx.ExecContext(ctx, clearPortable, settingsArgs...); err != nil {
 		detach()
 		return fmt.Errorf("clear portable settings: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO main.settings (key, value, updated_at) SELECT key, value, updated_at FROM src.settings WHERE key NOT IN ("+settingsPH+")", settingsArgs...); err != nil {
+	if _, err := tx.ExecContext(ctx, copyPortable, settingsArgs...); err != nil {
 		detach()
 		return fmt.Errorf("copy portable settings: %w", err)
 	}
