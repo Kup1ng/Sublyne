@@ -207,7 +207,6 @@ async function onRestoreFile(e: Event) {
             <span class="font-mono text-[13.5px] text-ink">
               {{ settings.view.value?.panel_port ?? '—' }}
             </span>
-            <AppBadge tone="warn" :soft="true">restart required</AppBadge>
           </dd>
         </div>
         <div class="min-w-0">
@@ -216,7 +215,6 @@ async function onRestoreFile(e: Event) {
             <span class="truncate font-mono text-[13.5px] text-ink">
               /{{ settings.view.value?.web_path ?? '—' }}/
             </span>
-            <AppBadge tone="warn" :soft="true">restart required</AppBadge>
           </dd>
         </div>
       </dl>
