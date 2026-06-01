@@ -459,6 +459,8 @@ func run(args []string) int {
 		Logger:      slog.Default(),
 		Audit:       auditRecorder,
 		TunnelCache: tunnelCache,
+		ServerRole:  tunnels.Role(cfg.Role),
+		Level:       logSetup.Level,
 	}
 
 	// Propagate every operator-driven log-level change to the Rust

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -474,4 +476,291 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// buildBackupWithSettings builds a raw VACUUM INTO backup (NOT scrubbed,
+// so it deliberately still carries any panel-identity settings rows —
+// the "legacy v2.x backup" case the restore guard must silently ignore)
+// containing an admin row, the given tunnels, and the given settings.
+func buildBackupWithSettings(t *testing.T, admin, pw string, tunnelNames []string, settings map[string]string) []byte {
+	t.Helper()
+	db, _ := newFileBackedDB(t)
+	seedAdmin(t, db, admin, pw)
+	for _, n := range tunnelNames {
+		seedBackupClientTunnel(t, db, n)
+	}
+	for k, v := range settings {
+		if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+			t.Fatalf("seed setting %s: %v", k, err)
+		}
+	}
+	snapPath := filepath.Join(t.TempDir(), "snap.db")
+	quoted := "'" + strings.ReplaceAll(snapPath, "'", "''") + "'"
+	if _, err := db.Exec(`VACUUM INTO ` + quoted); err != nil {
+		t.Fatalf("vacuum into: %v", err)
+	}
+	out, err := os.ReadFile(snapPath)
+	if err != nil {
+		t.Fatalf("read snap: %v", err)
+	}
+	return out
+}
+
+// TestBackupHandler_ScrubsPanelIdentity proves the downloaded backup
+// carries the operator's portable work (tunnels, tunables, runtime log
+// level) but NONE of this box's panel identity (admin row, JWT signing
+// key, lockout state) — and that the secret bytes are physically gone.
+func TestBackupHandler_ScrubsPanelIdentity(t *testing.T) {
+	db, path := newFileBackedDB(t)
+	seedAdmin(t, db, "box-admin", "box-pw")
+	seedBackupClientTunnel(t, db, "tunnel-a")
+	if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES
+		('jwt_signing_key', 'BOX-SECRET-KEY'),
+		('tunable_socket_buf_bytes', '8388608'),
+		('log_level_runtime', 'debug')`); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO login_attempts (ip, ts, success) VALUES ('1.2.3.4', 1, 0)`); err != nil {
+		t.Fatalf("seed login_attempts: %v", err)
+	}
+
+	deps := BackupRestoreDeps{DB: db, DBPath: path, Logger: slog.Default()}
+	srv := httptest.NewServer(backupTestRouter(t, deps))
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/api/settings/backup")
+	if err != nil {
+		t.Fatalf("GET backup: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d want 200", res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if cl := res.Header.Get("Content-Length"); cl != strconv.Itoa(len(body)) {
+		t.Errorf("Content-Length %q != streamed length %d", cl, len(body))
+	}
+
+	tmpPath := filepath.Join(t.TempDir(), "snap.db")
+	if err := os.WriteFile(tmpPath, body, 0o600); err != nil {
+		t.Fatalf("write snap: %v", err)
+	}
+	checkDB, err := sql.Open("sqlite", "file:"+tmpPath+"?_pragma=foreign_keys(on)")
+	if err != nil {
+		t.Fatalf("open snap: %v", err)
+	}
+	defer func() { _ = checkDB.Close() }()
+
+	assertCount := func(query string, want int, label string) {
+		t.Helper()
+		var n int
+		if err := checkDB.QueryRow(query).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		if n != want {
+			t.Errorf("%s: got %d want %d", label, n, want)
+		}
+	}
+	// Panel identity scrubbed.
+	assertCount(`SELECT COUNT(*) FROM admin`, 0, "admin rows in backup")
+	assertCount(`SELECT COUNT(*) FROM settings WHERE key = 'jwt_signing_key'`, 0, "jwt key in backup")
+	assertCount(`SELECT COUNT(*) FROM login_attempts`, 0, "login_attempts in backup")
+	// Portable operator work survives.
+	assertCount(`SELECT COUNT(*) FROM tunnels`, 1, "tunnels in backup")
+	assertCount(`SELECT COUNT(*) FROM settings WHERE key = 'tunable_socket_buf_bytes'`, 1, "tunable in backup")
+	assertCount(`SELECT COUNT(*) FROM settings WHERE key = 'log_level_runtime'`, 1, "log level in backup")
+
+	// VACUUM should have physically dropped the freed pages, so the
+	// secret key bytes must not survive anywhere in the file.
+	if bytes.Contains(body, []byte("BOX-SECRET-KEY")) {
+		t.Errorf("scrubbed JWT key bytes still present in backup file")
+	}
+}
+
+// TestRestoreHandler_PreservesJWTAndImportsTunables is the core v3.0.0
+// round-trip: restoring CLIENT-1's backup onto CLIENT-2 must keep
+// CLIENT-2's JWT key + admin (no cross-box session bleed) while bringing
+// CLIENT-1's tunnels + tunables + runtime log level across.
+func TestRestoreHandler_PreservesJWTAndImportsTunables(t *testing.T) {
+	runDB, runPath := newFileBackedDB(t)
+	runHash := seedAdmin(t, runDB, "target-admin", "target-pw")
+	if _, err := runDB.Exec(`INSERT INTO settings (key, value) VALUES
+		('jwt_signing_key', 'TARGET-KEY'),
+		('tunable_socket_buf_bytes', '262144')`); err != nil {
+		t.Fatalf("seed target settings: %v", err)
+	}
+	seedBackupClientTunnel(t, runDB, "target-tunnel")
+
+	backupBytes := buildBackupWithSettings(t, "source-admin", "source-pw",
+		[]string{"source-tunnel"},
+		map[string]string{
+			"jwt_signing_key":          "SOURCE-KEY",
+			"tunable_socket_buf_bytes": "8388608",
+			"log_level_runtime":        "debug",
+		})
+
+	deps := BackupRestoreDeps{
+		DB:         runDB,
+		DBPath:     runPath,
+		TunnelRepo: tunnels.NewRepo(runDB),
+		WGRepo:     wg.NewRepo(runDB),
+		Logger:     slog.Default(),
+	}
+	srv := httptest.NewServer(backupTestRouter(t, deps))
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "backup", "source.db", backupBytes)
+	res, err := http.Post(srv.URL+"/api/settings/restore", ct, body)
+	if err != nil {
+		t.Fatalf("POST restore: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		t.Fatalf("status: got %d want 200 (body=%s)", res.StatusCode, string(respBody))
+	}
+
+	getSetting := func(key string) (string, bool) {
+		var v string
+		err := runDB.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false
+		}
+		if err != nil {
+			t.Fatalf("query setting %s: %v", key, err)
+		}
+		return v, true
+	}
+
+	// JWT key preserved (NOT overwritten by the backup's SOURCE-KEY).
+	if v, _ := getSetting("jwt_signing_key"); v != "TARGET-KEY" {
+		t.Errorf("jwt_signing_key: got %q want TARGET-KEY (cross-box panel-identity bleed!)", v)
+	}
+	// Admin preserved + still verifies.
+	var who, hash string
+	if err := runDB.QueryRow(`SELECT username, password_hash FROM admin WHERE id = 1`).Scan(&who, &hash); err != nil {
+		t.Fatalf("query admin: %v", err)
+	}
+	if who != "target-admin" || hash != runHash {
+		t.Errorf("admin not preserved: got user=%q", who)
+	}
+	if err := auth.VerifyPassword(hash, "target-pw"); err != nil {
+		t.Errorf("preserved password no longer verifies: %v", err)
+	}
+	// Portable operator work imported from the backup.
+	if v, _ := getSetting("tunable_socket_buf_bytes"); v != "8388608" {
+		t.Errorf("tunable not imported from backup: got %q want 8388608", v)
+	}
+	if v, ok := getSetting("log_level_runtime"); !ok || v != "debug" {
+		t.Errorf("log_level_runtime not imported: got %q ok=%v", v, ok)
+	}
+	// Tunnels replaced by the backup's set.
+	var names []string
+	rows, err := runDB.Query(`SELECT name FROM tunnels ORDER BY name`)
+	if err != nil {
+		t.Fatalf("query tunnels: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		names = append(names, n)
+	}
+	if len(names) != 1 || names[0] != "source-tunnel" {
+		t.Errorf("post-restore tunnels: got %v want [source-tunnel]", names)
+	}
+}
+
+// TestRestoreHandler_RejectsForeignRoleBackup proves a Client backup is
+// refused on a Remote box (and that the box is not torn down).
+func TestRestoreHandler_RejectsForeignRoleBackup(t *testing.T) {
+	runDB, runPath := newFileBackedDB(t)
+	seedAdmin(t, runDB, "remote-admin", "remote-pw")
+
+	// buildBackupBytes seeds a client tunnel.
+	backupBytes := buildBackupBytes(t, "src-admin", "src-pw", []string{"client-tunnel"})
+
+	deps := BackupRestoreDeps{
+		DB:         runDB,
+		DBPath:     runPath,
+		TunnelRepo: tunnels.NewRepo(runDB),
+		WGRepo:     wg.NewRepo(runDB),
+		ServerRole: tunnels.RoleRemote,
+		Logger:     slog.Default(),
+	}
+	srv := httptest.NewServer(backupTestRouter(t, deps))
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "backup", "client.db", backupBytes)
+	res, err := http.Post(srv.URL+"/api/settings/restore", ct, body)
+	if err != nil {
+		t.Fatalf("POST restore: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusBadRequest {
+		respBody, _ := io.ReadAll(res.Body)
+		t.Fatalf("status: got %d want 400 (body=%s)", res.StatusCode, string(respBody))
+	}
+}
+
+// TestRestoreHandler_RejectsNewerSchemaVersion proves a backup whose
+// schema_version exceeds this binary's head is refused with a clear
+// error before any teardown.
+func TestRestoreHandler_RejectsNewerSchemaVersion(t *testing.T) {
+	backupBytes := buildBackupBytes(t, "future-admin", "future-pw", []string{"future-tunnel"})
+	// Bump the backup's schema_version far past anything this binary ships.
+	futurePath := filepath.Join(t.TempDir(), "future.db")
+	if err := os.WriteFile(futurePath, backupBytes, 0o600); err != nil {
+		t.Fatalf("write future backup: %v", err)
+	}
+	fdb, err := sql.Open("sqlite", "file:"+futurePath+"?_pragma=journal_mode(DELETE)")
+	if err != nil {
+		t.Fatalf("open future backup: %v", err)
+	}
+	if _, err := fdb.Exec(`INSERT INTO schema_version (version) VALUES (9999)`); err != nil {
+		t.Fatalf("bump schema_version: %v", err)
+	}
+	_ = fdb.Close()
+	bumped, err := os.ReadFile(futurePath)
+	if err != nil {
+		t.Fatalf("read bumped: %v", err)
+	}
+
+	runDB, runPath := newFileBackedDB(t)
+	seedAdmin(t, runDB, "current-admin", "current-pw")
+	seedBackupClientTunnel(t, runDB, "live")
+	deps := BackupRestoreDeps{
+		DB:         runDB,
+		DBPath:     runPath,
+		TunnelRepo: tunnels.NewRepo(runDB),
+		WGRepo:     wg.NewRepo(runDB),
+		Logger:     slog.Default(),
+	}
+	srv := httptest.NewServer(backupTestRouter(t, deps))
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "backup", "future.db", bumped)
+	res, err := http.Post(srv.URL+"/api/settings/restore", ct, body)
+	if err != nil {
+		t.Fatalf("POST restore: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusBadRequest {
+		respBody, _ := io.ReadAll(res.Body)
+		t.Fatalf("status: got %d want 400 (body=%s)", res.StatusCode, string(respBody))
+	}
+	// The live tunnel must survive (rejected before any teardown/swap).
+	var n int
+	if err := runDB.QueryRow(`SELECT COUNT(*) FROM tunnels WHERE name = 'live'`).Scan(&n); err != nil {
+		t.Fatalf("count live tunnel: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("live tunnel was disturbed by a rejected restore: got %d want 1", n)
+	}
 }

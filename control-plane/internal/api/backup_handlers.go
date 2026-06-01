@@ -18,6 +18,7 @@ import (
 
 	"github.com/Kup1ng/Sublyne/control-plane/internal/audit"
 	"github.com/Kup1ng/Sublyne/control-plane/internal/dataplane"
+	"github.com/Kup1ng/Sublyne/control-plane/internal/logging"
 	"github.com/Kup1ng/Sublyne/control-plane/internal/migrations"
 	"github.com/Kup1ng/Sublyne/control-plane/internal/socks5"
 	"github.com/Kup1ng/Sublyne/control-plane/internal/tunnels"
@@ -54,6 +55,18 @@ type BackupRestoreDeps struct {
 	// the new tunnel set on the next refresh. May be nil — restore
 	// still works without the cache wired.
 	TunnelCache *tunnels.Cache
+	// ServerRole is this box's configured role (client/remote). Restore
+	// rejects a backup whose tunnels were authored for the other role,
+	// since a box hosts exactly one role and starting cross-role tunnels
+	// would mis-bind listeners and confuse the operator. Empty disables
+	// the check (used by older tests that don't wire a role).
+	ServerRole tunnels.Role
+	// Level, when set, is re-applied from the restored DB's
+	// log_level_runtime row after a successful restore so the live
+	// process (and, via its OnChange hook, the Rust dataplane) tracks the
+	// log level the backup carried instead of silently diverging until
+	// the next service restart. May be nil.
+	Level *logging.LevelControl
 }
 
 // logger returns d.Logger or slog.Default() so call sites don't need
@@ -87,6 +100,85 @@ var sqliteMagic = []byte("SQLite format 3\x00")
 // request handler's memory budget.
 const maxBackupBytes = 100 << 20
 
+// panelIdentitySettingKeys names the `settings` rows that identify THIS
+// box's panel + login and must therefore NEVER travel inside a backup
+// nor overwrite the target box on restore. Everything else in
+// `settings` — the tunable_* performance knobs and log_level_runtime —
+// is portable operator tunnel work and rides along with a backup as the
+// operator expects.
+//
+// v3.0.0 contract: a backup moves the operator's tunnels + resources to
+// another panel WITHOUT touching that panel's login or addressing.
+//   - jwt_signing_key is the load-bearing one. If a backup carried it,
+//     restoring CLIENT-1's backup onto CLIENT-2 would make CLIENT-2
+//     validate session cookies with CLIENT-1's key — cross-box session
+//     survival, exactly what the contract forbids.
+//   - panel_port / web_path / role live in /etc/sublyne/config.toml
+//     today (so the file-only DB swap already preserves them), but the
+//     0001 schema reserves settings rows for them, so we exclude them
+//     here too as belt-and-braces against a future phase persisting an
+//     override into the DB.
+//
+// Keep jwt_signing_key in sync with auth.settingsKeyJWTSigningKey.
+var panelIdentitySettingKeys = []string{
+	"jwt_signing_key",
+	"panel_port",
+	"web_path",
+	"role",
+}
+
+// settingsKeyPlaceholders builds the "?,?,?,…" placeholder list and the
+// matching []any args for panelIdentitySettingKeys, so the IN / NOT IN
+// filters bind the keys instead of splicing them into SQL.
+func settingsKeyPlaceholders() (string, []any) {
+	ph := make([]byte, 0, len(panelIdentitySettingKeys)*2)
+	args := make([]any, len(panelIdentitySettingKeys))
+	for i, k := range panelIdentitySettingKeys {
+		if i > 0 {
+			ph = append(ph, ',')
+		}
+		ph = append(ph, '?')
+		args[i] = k
+	}
+	return string(ph), args
+}
+
+// scrubBackupSnapshot strips this box's panel identity + live login
+// state out of a VACUUM INTO snapshot before it streams to the operator,
+// then VACUUMs so the freed pages — which physically still hold the
+// secret bytes — are dropped from the file rather than merely marked
+// reusable. A backup must carry the operator's tunnels + resources, but
+// NEVER the admin credentials, the JWT signing key, or the brute-force
+// lockout counters.
+//
+// journal_mode=DELETE (not WAL) keeps the snapshot a single self-
+// contained file with no -wal/-shm sidecars to clean up after.
+func scrubBackupSnapshot(ctx context.Context, snapPath string) error {
+	dsn := "file:" + snapPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=synchronous(FULL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open snapshot for scrub: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, "DELETE FROM admin"); err != nil {
+		return fmt.Errorf("scrub admin: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM login_attempts"); err != nil {
+		return fmt.Errorf("scrub login_attempts: %w", err)
+	}
+	ph, args := settingsKeyPlaceholders()
+	if _, err := db.ExecContext(ctx, "DELETE FROM settings WHERE key IN ("+ph+")", args...); err != nil {
+		return fmt.Errorf("scrub panel-identity settings: %w", err)
+	}
+	// VACUUM rewrites the file from scratch so the deleted secret bytes
+	// are gone, not just unlinked from the b-tree.
+	if _, err := db.ExecContext(ctx, "VACUUM"); err != nil {
+		return fmt.Errorf("compact scrubbed snapshot: %w", err)
+	}
+	return nil
+}
+
 // BackupHandler streams a consistent snapshot of the SQLite DB to the
 // operator. We use `VACUUM INTO` so the snapshot reflects every
 // committed write up to the call moment and excludes any WAL pages
@@ -119,7 +211,15 @@ func BackupHandler(deps BackupRestoreDeps) http.HandlerFunc {
 		// empty placeholder first (CreateTemp + Close already left the
 		// inode there). The defer cleans up after we're done streaming.
 		_ = os.Remove(snapPath)
-		defer func() { _ = os.Remove(snapPath) }()
+		defer func() {
+			_ = os.Remove(snapPath)
+			// Defensive: scrubBackupSnapshot uses journal_mode=DELETE so
+			// these shouldn't exist, but remove any sidecars just in case a
+			// future change reintroduces WAL.
+			_ = os.Remove(snapPath + "-wal")
+			_ = os.Remove(snapPath + "-shm")
+			_ = os.Remove(snapPath + "-journal")
+		}()
 
 		// `?` parameters don't substitute into VACUUM INTO's literal —
 		// the file path goes inline. Quote with SQLite's string-literal
@@ -131,6 +231,16 @@ func BackupHandler(deps BackupRestoreDeps) http.HandlerFunc {
 		if _, err := deps.DB.ExecContext(r.Context(), stmt); err != nil {
 			deps.logger().Error("backup: vacuum into", "err", err)
 			writeJSONError(w, http.StatusInternalServerError, "could not snapshot database")
+			return
+		}
+
+		// Strip this box's panel identity (admin creds, JWT signing key,
+		// lockout state) out of the snapshot BEFORE we size or stream it,
+		// so Content-Length matches the bytes we actually send and the
+		// secret bytes are physically gone from the file.
+		if err := scrubBackupSnapshot(r.Context(), snapPath); err != nil {
+			deps.logger().Error("backup: scrub snapshot", "err", err)
+			writeJSONError(w, http.StatusInternalServerError, "could not prepare backup")
 			return
 		}
 
@@ -178,15 +288,22 @@ type restoreResult struct {
 // RestoreHandler accepts a multipart upload of a previous backup file
 // and atomically swaps the running install's tables in from that file.
 //
-// PRD §4.4 pins the safety contract: everything is replaced EXCEPT the
-// admin username, admin password hash, panel port, and web path —
-// preserved from the *running* DB so the operator can't lock themselves
-// out by uploading a backup taken before the credentials rotated.
+// PRD §4.4 / v3.0.0 contract: a restore brings the operator's tunnels
+// and resources onto another panel but NEVER overwrites that panel's
+// own login or addressing. Concretely, the following are preserved from
+// the *running* DB rather than taken from the backup:
+//   - the admin row (username + Argon2id password hash);
+//   - the JWT signing key and the other panel-identity settings rows
+//     (see panelIdentitySettingKeys) — so old sessions from the box the
+//     backup came from can never validate here, and the operator on
+//     THIS box stays logged in across the restore;
+//   - panel port + web path, which live in /etc/sublyne/config.toml
+//     (not SQLite) and so survive the file-only DB swap for free.
 //
-// In this project the panel port and web path live in
-// /etc/sublyne/config.toml (not in SQLite), so they are naturally
-// preserved by the file-only DB swap. The admin row is the one piece
-// of DB state we explicitly carry over.
+// Everything else — tunnels, WireGuard configs, SOCKS5 proxies,
+// per-tunnel settings, the performance tunables, and the runtime log
+// level — is the operator's portable work and is replaced from the
+// backup.
 //
 // Order of operations:
 //
@@ -208,10 +325,9 @@ type restoreResult struct {
 //  7. Re-write the preserved admin row.
 //  8. DETACH the temp DB.
 //  9. Re-sync the dataplane from the restored DB.
-//  10. Return 200 with counts. Existing JWT cookies were signed with the
-//     pre-restore signing key and now fail at the next request; the
-//     panel logs the operator out and they re-login with the
-//     preserved username + password.
+//  10. Return 200 with counts. The JWT signing key is preserved from the
+//     running box, so the operator's current session stays valid and
+//     they are NOT logged out by the restore.
 func RestoreHandler(deps BackupRestoreDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if deps.DB == nil || deps.TunnelRepo == nil {
@@ -316,12 +432,53 @@ func RestoreHandler(deps BackupRestoreDeps) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, "the uploaded file is not a usable sublyne backup: "+err.Error())
 			return
 		}
+
+		// Reject a backup created by a NEWER Sublyne build BEFORE we tear
+		// anything down. migrations.Apply only moves forward, so a backup
+		// whose schema_version exceeds this binary's highest embedded
+		// migration would otherwise be a no-op here and then either fail
+		// deep in the table swap with a cryptic SQLite column-count error
+		// (after the box is already dark) or, worse, succeed and stamp the
+		// live DB with a version that makes this binary skip its own
+		// migrations forever.
+		backupVer, verr := maxSchemaVersion(r.Context(), tempDB)
+		if verr != nil {
+			_ = tempDB.Close()
+			writeJSONError(w, http.StatusBadRequest, "could not read the backup's schema version: "+verr.Error())
+			return
+		}
+		if head := migrations.MaxEmbeddedVersion(); backupVer > head {
+			_ = tempDB.Close()
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(
+				"this backup was created by a newer version of Sublyne (database schema v%d; this server supports up to v%d). Upgrade this server before restoring.",
+				backupVer, head))
+			return
+		}
+
 		if err := migrations.Apply(r.Context(), tempDB); err != nil {
 			_ = tempDB.Close()
 			deps.logger().Error("restore: migrate temp DB", "err", err)
 			writeJSONError(w, http.StatusBadRequest, "could not bring the uploaded backup up to the current schema: "+err.Error())
 			return
 		}
+
+		// Refuse a cross-role backup before any teardown: a box hosts
+		// exactly one role, so importing the other role's tunnels would
+		// mis-bind listeners and surface a pile of confusing start
+		// failures. The check is skipped when ServerRole is unset.
+		if deps.ServerRole != "" {
+			mismatch, foreign, merr := backupHasForeignRole(r.Context(), tempDB, deps.ServerRole)
+			if merr != nil {
+				deps.logger().Warn("restore: role check failed (continuing)", "err", merr)
+			} else if mismatch {
+				_ = tempDB.Close()
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(
+					"this backup was taken on a %q server; this one is configured as %q. Restore it on a matching box.",
+					foreign, deps.ServerRole))
+				return
+			}
+		}
+
 		if err := tempDB.Close(); err != nil {
 			deps.logger().Warn("restore: close temp DB after migrate", "err", err)
 		}
@@ -378,6 +535,16 @@ func RestoreHandler(deps BackupRestoreDeps) http.HandlerFunc {
 		}
 		active := startEnabledTunnels(r.Context(), deps, restoredTunnels)
 
+		// Re-apply the restored runtime log level so the live process — and
+		// the Rust dataplane via the LevelControl OnChange hook — tracks the
+		// level the backup carried instead of silently diverging until the
+		// next service restart.
+		if deps.Level != nil {
+			if lvl := ReadRuntimeLogLevel(r.Context(), deps.DB); lvl != "" {
+				deps.Level.Set(logging.ParseLevel(lvl))
+			}
+		}
+
 		if deps.Audit != nil {
 			deps.Audit.Record(r.Context(), audit.ActionRestoreUpload, deps.actorOf(r), ClientIP(r), fh.Filename, map[string]any{
 				"bytes":          fh.Size,
@@ -418,6 +585,40 @@ func capturePreservedAdmin(ctx context.Context, db *sql.DB) (preservedAdmin, err
 		return p, nil
 	}
 	return p, err
+}
+
+// maxSchemaVersion returns the highest version recorded in the supplied
+// DB's schema_version table (0 if empty). Used to reject a backup taken
+// under a newer Sublyne build before any teardown happens.
+func maxSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var v sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil {
+		return 0, err
+	}
+	return int(v.Int64), nil
+}
+
+// backupHasForeignRole reports whether the uploaded backup contains any
+// tunnel whose role differs from this server's role. A box hosts exactly
+// one role, so a Client backup on a Remote box (or vice versa) is a
+// restore-on-the-wrong-machine mistake we reject up front rather than
+// importing tunnels that can never start here.
+func backupHasForeignRole(ctx context.Context, db *sql.DB, want tunnels.Role) (bool, tunnels.Role, error) {
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT role FROM tunnels`)
+	if err != nil {
+		return false, "", err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var role string
+		if err := rows.Scan(&role); err != nil {
+			return false, "", err
+		}
+		if role != "" && tunnels.Role(role) != want {
+			return true, tunnels.Role(role), nil
+		}
+	}
+	return false, "", rows.Err()
 }
 
 // openTempBackup opens the uploaded file as a writeable *sql.DB so we
@@ -567,12 +768,24 @@ func startEnabledTunnels(ctx context.Context, deps BackupRestoreDeps, ts []tunne
 // this slice symmetrically (DELETE in reverse, INSERT forward), so
 // dropping the entry leaves the live login_attempts table untouched
 // rather than half-swapped.
+//
+// `settings` is ALSO not in this list — it gets bespoke handling in
+// swapTablesFromBackup (copy the operator's portable tunable_* /
+// log_level_runtime rows, but never the panel-identity keys; see
+// panelIdentitySettingKeys). It has no foreign-key ties, so handling it
+// outside this ordered slice is safe.
+//
+// `audit_log` is ALSO deliberately excluded (v3.0.0). It is per-box
+// forensic state — who logged in here, from which IP, when. Swapping it
+// in from a backup would erase THIS box's login/operational trail and
+// stamp another box's IPs and timestamps onto it as if they happened
+// locally. Like login_attempts, it stays untouched by a restore: the
+// live box keeps its own audit history (including the restore event
+// itself, recorded just below).
 var restoreTables = []string{
-	"settings",
 	"wireguard_configs",
 	"socks5_proxies",
 	"tunnels",
-	"audit_log",
 }
 
 // swapTablesFromBackup is the core of the restore path. Steps:
@@ -641,6 +854,30 @@ func swapTablesFromBackup(ctx context.Context, db *sql.DB, srcPath string, prese
 		"INSERT INTO main.schema_version (version, applied_at) SELECT version, applied_at FROM src.schema_version"); err != nil {
 		detach()
 		return fmt.Errorf("copy schema_version: %w", err)
+	}
+
+	// settings is the one mixed table: the operator's PORTABLE tunnel
+	// work (tunable_* perf knobs + log_level_runtime) sits next to THIS
+	// box's panel identity (jwt_signing_key + the panel_port/web_path/
+	// role reserves). Copy only the portable rows from the backup and
+	// never touch the target's identity rows. Effect:
+	//   - restoring CLIENT-1's backup onto CLIENT-2 imports CLIENT-1's
+	//     tunables but keeps CLIENT-2's own JWT key (so CLIENT-1's
+	//     sessions can't validate on CLIENT-2, and CLIENT-2's operator
+	//     stays logged in);
+	//   - a legacy v2.x backup that still carries jwt_signing_key is
+	//     silently ignored by the same NOT IN filter (per the v3.0.0
+	//     contract: don't fail, just don't apply it).
+	settingsPH, settingsArgs := settingsKeyPlaceholders()
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM main.settings WHERE key NOT IN ("+settingsPH+")", settingsArgs...); err != nil {
+		detach()
+		return fmt.Errorf("clear portable settings: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO main.settings (key, value, updated_at) SELECT key, value, updated_at FROM src.settings WHERE key NOT IN ("+settingsPH+")", settingsArgs...); err != nil {
+		detach()
+		return fmt.Errorf("copy portable settings: %w", err)
 	}
 
 	// Copy the domain tables parents-first. We SELECT * which depends
