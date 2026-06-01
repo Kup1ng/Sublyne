@@ -220,7 +220,7 @@ pub(super) async fn spawn(
     };
     let forward_sock = UdpSocket::bind(forward_bind)
         .await
-        .map_err(SpawnError::Io)?;
+        .map_err(|e| SpawnError::Io(crate::perf::bind_err(e, "remote/forward", forward_target)))?;
     // The forward socket is the busiest one on the Remote — it both
     // sends to forward_target and receives the reply stream. Tune it
     // so a momentary spike doesn't lose reply packets at the kernel.
@@ -253,7 +253,9 @@ pub(super) async fn spawn(
                 } else {
                     "0.0.0.0:0"
                 };
-                let sock = UdpSocket::bind(bind).await.map_err(SpawnError::Io)?;
+                let sock = UdpSocket::bind(bind).await.map_err(|e| {
+                    SpawnError::Io(crate::perf::bind_err(e, "remote/forward", target))
+                })?;
                 crate::perf::tune_socket(&sock, "remote/forward");
                 let sock = Arc::new(sock);
                 info!(tunnel_id = id, target = %target,
@@ -279,7 +281,9 @@ pub(super) async fn spawn(
     // and forwards them to forward_target through `forward_sock`.
     match spec.upload_listen_mode {
         UploadListenMode::Udp => {
-            let upload_sock = bind_dualstack_udp(upload_listen).map_err(SpawnError::Io)?;
+            let upload_sock = bind_dualstack_udp(upload_listen).map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "remote/upload", upload_listen))
+            })?;
             // Enlarge SO_RCVBUF/SO_SNDBUF beyond the 208 KiB Ubuntu
             // default so the upload listener doesn't drop packets at
             // the kernel queue when a tunnel pushes hundreds of
@@ -303,9 +307,9 @@ pub(super) async fn spawn(
             );
         }
         UploadListenMode::Socks5Tcp => {
-            let tcp_listener = TcpListener::bind(upload_listen)
-                .await
-                .map_err(SpawnError::Io)?;
+            let tcp_listener = TcpListener::bind(upload_listen).await.map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "remote/upload", upload_listen))
+            })?;
             // v2.2.0: force-size the LISTENER's buffers BEFORE it accepts.
             // On Linux an accepted socket inherits the listener's
             // SO_RCVBUF/SO_SNDBUF, and — critically — the receive window

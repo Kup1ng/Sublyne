@@ -542,4 +542,88 @@ mod tests {
         mgr.stop_tunnel(1).await.expect("stop");
         assert!(mgr.list_tunnels().is_empty());
     }
+
+    /// Two distinct free UDP ports, held simultaneously so they can't
+    /// collide, then released for the tunnel under test to bind.
+    fn two_free_udp_ports() -> (u16, u16) {
+        let s1 = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral #1");
+        let s2 = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral #2");
+        let p1 = s1.local_addr().expect("local_addr #1").port();
+        let p2 = s2.local_addr().expect("local_addr #2").port();
+        // `s1`/`s2` drop here, freeing both ports for the tunnel to bind.
+        (p1, p2)
+    }
+
+    /// Regression for the multi-port `PORT_IN_USE` start bug: the client
+    /// used to bind `local_listen_addr` up front AND then re-bind that same
+    /// port inside the per-port loop (the spec guarantees the primary port
+    /// is also in `ports`), so the first loop iteration hit
+    /// `EADDRINUSE` → `PORT_IN_USE` and the tunnel never started.
+    ///
+    /// The fix binds each configured port exactly once and never binds
+    /// `local` separately. The listener binds happen BEFORE the raw
+    /// download socket is opened, so this test catches the regression on
+    /// BOTH privileged and unprivileged CI:
+    ///
+    /// - Fixed code, with CAP_NET_RAW → `Ok(())` (we tear it back down).
+    /// - Fixed code, no CAP_NET_RAW → `PermissionDenied` from the raw
+    ///   socket (the listeners bound fine — no `PORT_IN_USE`).
+    /// - Buggy code, either way → `PORT_IN_USE` from the bind collision,
+    ///   which fails the test below.
+    #[tokio::test]
+    async fn multiport_start_does_not_collide_on_primary_port() {
+        let (p_a, p_b) = two_free_udp_ports();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mgr = TunnelManager::new(tx, None);
+        let spec = TunnelSpec {
+            id: 1,
+            role: crate::spec::Role::Client,
+            name: "mp".into(),
+            mtu: 1400,
+            psk: "psk".into(),
+            max_connections: 10,
+            idle_timeout_sec: 60,
+            download_transport: crate::spec::Transport::Udp,
+            icmp_echo_mode: crate::spec::IcmpEchoMode::Reply,
+            download_spoof_source_ip: "203.0.113.5".into(),
+            download_spoof_source_port: 443,
+            // The primary listen port (p_a) is ALSO the first entry of the
+            // unified ports list — exactly the shape the v2.7.0 unified-ports
+            // import produces, and the shape that triggered the live bug.
+            local_listen_addr: Some(format!("127.0.0.1:{p_a}")),
+            download_receive_port: Some(18443),
+            upload_target_addr: Some("127.0.0.1:9".into()),
+            wireguard_fwmark: 0,
+            upload_listen_addr: None,
+            forward_target: None,
+            download_send_port: None,
+            client_real_ip: None,
+            ping_smoothing_enabled: false,
+            ping_smoothing_target_ms: 60,
+            pacing_enabled: false,
+            pacing_target_ms: 100,
+            socks5_target: None,
+            upload_listen_mode: crate::spec::UploadListenMode::Udp,
+            ports: vec![p_a, p_b],
+        };
+        match mgr.start_tunnel(spec).await {
+            Ok(()) => {
+                // Runner has CAP_NET_RAW — the multi-port tunnel came up
+                // cleanly. Tear it back down.
+                mgr.stop_tunnel(1).await.expect("stop");
+            }
+            Err(SpawnError::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                // No CAP_NET_RAW: the per-port listeners bound fine (no
+                // PORT_IN_USE) and only the raw download socket was refused.
+                // That is the pass signal on unprivileged CI.
+                eprintln!(
+                    "multiport_start: no CAP_NET_RAW, listeners bound OK (raw socket refused)"
+                );
+            }
+            Err(e) => panic!(
+                "multi-port start must not fail with a bind error; \
+                 the primary-port double-bind regressed: {e:?}"
+            ),
+        }
+    }
 }

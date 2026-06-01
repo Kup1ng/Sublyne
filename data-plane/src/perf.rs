@@ -156,6 +156,32 @@ fn resolve_coalesce_bytes() -> usize {
     }
 }
 
+/// Wrap a socket **bind** error so the operator-facing message names the
+/// socket's purpose AND the exact address that failed, while preserving
+/// the original [`std::io::ErrorKind`]. Preserving the kind is what keeps
+/// the downstream classification in `manager.rs` intact: `AddrInUse` still
+/// maps to `PORT_IN_USE` and `PermissionDenied` to `RAW_SOCKET_FORBIDDEN`.
+///
+/// Before this helper a bind collision surfaced only as
+/// `"PORT_IN_USE: bind: Address in use (os error 98)"` — with no hint of
+/// which port or which socket — which made the multi-port start collision
+/// (a primary listener vs. a per-port listener on the same port) hard to
+/// diagnose. With it, `manager.rs`'s `"bind: "` prefix plus this label
+/// reads e.g.
+/// `"PORT_IN_USE: bind: client/listen 0.0.0.0:51821: Address in use (os error 98)"`.
+pub fn bind_err(e: std::io::Error, purpose: &str, addr: std::net::SocketAddr) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{purpose} {addr}: {e}"))
+}
+
+/// Wrap a raw-**socket open** error (raw sockets are not bound to an
+/// address) with a purpose label, preserving the [`std::io::ErrorKind`] so
+/// a `PermissionDenied` still classifies as `RAW_SOCKET_FORBIDDEN`. Lets a
+/// "no CAP_NET_RAW" failure say which transport's socket was refused
+/// instead of a bare `"raw socket: Permission denied"`.
+pub fn socket_err(e: std::io::Error, purpose: &str) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{purpose}: {e}"))
+}
+
 /// Whether to stripe a single bulk (TCP-SOCKS5) flow across all N proxy
 /// connections (default `true`). Read once per process. `0`/`false`/`off`/
 /// `no` disable it (revert to per-flow sticky routing); anything else —

@@ -181,7 +181,8 @@ pub fn parse_inbound(packet: &[u8]) -> Option<ParsedInbound<'_>> {
 /// `perf::tune_socket` so a burst of spoofed downloads doesn't block
 /// on a full kernel send queue.
 pub fn open_raw_udp_send_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP))
+        .map_err(|e| crate::perf::socket_err(e, "raw-udp/send"))?;
     sock.set_header_included_v4(true)?;
     sock.set_nonblocking(true)?;
     // SO_REUSEPORT is harmless when only one socket is open and
@@ -205,7 +206,8 @@ pub fn open_raw_udp_send_socket() -> io::Result<Socket> {
 /// parses through `parse_inbound`. The receive buffer is enlarged via
 /// `perf::tune_socket` (uses `SO_RCVBUFFORCE` to bypass `rmem_max`).
 pub fn open_raw_udp_recv_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP))
+        .map_err(|e| crate::perf::socket_err(e, "raw-udp/recv"))?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "raw-udp/recv");

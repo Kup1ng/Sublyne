@@ -207,7 +207,8 @@ pub fn parse_inbound(packet: &[u8]) -> Option<ParsedInbound<'_>> {
 /// sizes are tuned via `perf::tune_socket` so a burst of spoofed SYNs
 /// doesn't stall on a full kernel send queue.
 pub fn open_raw_tcp_send_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP))
+        .map_err(|e| crate::perf::socket_err(e, "raw-tcp/send"))?;
     sock.set_header_included_v4(true)?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
@@ -228,7 +229,8 @@ pub fn open_raw_tcp_send_socket() -> io::Result<Socket> {
 /// outgoing RSTs to the spoof source IP so that side channel doesn't
 /// fire.
 pub fn open_raw_tcp_recv_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP))
+        .map_err(|e| crate::perf::socket_err(e, "raw-tcp/recv"))?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "raw-tcp/recv");

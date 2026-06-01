@@ -66,7 +66,8 @@ const ICMP_HDR_LEN: usize = 8;
 /// here via `raw_local_deliver`, ahead of the kernel's own protocol
 /// stack.
 pub fn open_recv_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
+        .map_err(|e| crate::perf::socket_err(e, "ping-smooth/recv"))?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
     crate::perf::tune_socket(&sock, "ping-smooth/recv");
@@ -78,7 +79,8 @@ pub fn open_recv_socket() -> io::Result<Socket> {
 /// responder is enough — `sendto` is non-blocking and the responder
 /// only issues a couple of bytes per packet.
 pub fn open_send_socket() -> io::Result<Socket> {
-    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+    let sock = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
+        .map_err(|e| crate::perf::socket_err(e, "ping-smooth/send"))?;
     sock.set_header_included_v4(true)?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_reuse_port(true);
