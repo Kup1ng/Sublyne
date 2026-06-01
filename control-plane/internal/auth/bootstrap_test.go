@@ -78,3 +78,54 @@ func TestConsumeBootstrap_RejectsMalformed(t *testing.T) {
 		t.Fatal("expected error for malformed TOML")
 	}
 }
+
+// TestConsumeBootstrap_DoesNotRevertChangedPassword guards the
+// idempotency fix: once an admin exists, a lingering bootstrap file (a
+// failed os.Remove on a prior start, or a data-preserving reinstall)
+// must NOT re-provision the admin and clobber a panel-changed password.
+func TestConsumeBootstrap_DoesNotRevertChangedPassword(t *testing.T) {
+	db := newTestDB(t)
+	body := "username = \"admin\"\npassword = \"install-pw\"\n"
+	path := writeBootstrap(t, body)
+
+	// First start: provision the admin from the bootstrap file.
+	if _, err := ConsumeBootstrap(context.Background(), db, path, nil); err != nil {
+		t.Fatalf("first consume: %v", err)
+	}
+
+	// Operator changes the password via the panel.
+	newHash, err := HashPassword("panel-pw")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	if err := NewAdminStore(db).UpdatePassword(context.Background(), newHash); err != nil {
+		t.Fatalf("UpdatePassword: %v", err)
+	}
+
+	// Simulate the file lingering (prior os.Remove failure / reinstall).
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("rewrite bootstrap: %v", err)
+	}
+
+	consumed, err := ConsumeBootstrap(context.Background(), db, path, nil)
+	if err != nil {
+		t.Fatalf("second consume: %v", err)
+	}
+	if consumed {
+		t.Error("second consume must NOT re-provision an existing admin")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("stale bootstrap file should have been removed, err=%v", err)
+	}
+
+	admin, err := NewAdminStore(db).Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get admin: %v", err)
+	}
+	if err := VerifyPassword(admin.PasswordHash, "panel-pw"); err != nil {
+		t.Errorf("panel-changed password was reverted by stale bootstrap: %v", err)
+	}
+	if VerifyPassword(admin.PasswordHash, "install-pw") == nil {
+		t.Error("install-time password was wrongly restored from a stale bootstrap file")
+	}
+}

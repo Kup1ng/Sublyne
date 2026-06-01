@@ -91,29 +91,39 @@ func TestLimiter_LocksOutAtThreshold(t *testing.T) {
 	}
 }
 
-func TestLimiter_LockoutExpiresAfterDuration(t *testing.T) {
+func TestLimiter_LockoutLastsFullDuration(t *testing.T) {
 	clock := newFakeClock(time.Now())
 	lim := newTestLimiter(t, clock)
 
-	// Trip the lockout.
+	// Trip the lockout (Threshold failures inside the window).
 	for i := 0; i < DefaultLockoutThreshold; i++ {
 		if err := lim.Record(context.Background(), "5.5.5.5", false); err != nil {
 			t.Fatalf("Record: %v", err)
 		}
 	}
-	d, _ := lim.Check(context.Background(), "5.5.5.5")
-	if d.Allowed {
+	if d, _ := lim.Check(context.Background(), "5.5.5.5"); d.Allowed {
 		t.Fatal("expected lockout immediately after threshold")
 	}
 
-	// Advance past the lockout duration AND past the failure window.
+	// REGRESSION GUARD: after the COUNTING WINDOW elapses (the failing
+	// rows age out of Window) the IP must STILL be locked. Previously the
+	// gate counted only within Window, so an attacker who waited 5 min was
+	// freed — making the real lockout 5 min, not the configured 15.
 	clock.Advance(DefaultLockoutWindow + time.Second)
-	d, err := lim.Check(context.Background(), "5.5.5.5")
-	if err != nil {
+	if d, err := lim.Check(context.Background(), "5.5.5.5"); err != nil {
 		t.Fatalf("Check: %v", err)
+	} else if d.Allowed {
+		t.Errorf("IP unlocked after only the %v counting window; lockout must last %v",
+			DefaultLockoutWindow, DefaultLockoutDuration)
 	}
-	if !d.Allowed {
-		t.Errorf("expected lockout to expire after window, got %+v", d)
+
+	// After the full lockout duration past the last failure, the IP is
+	// allowed again.
+	clock.Advance(DefaultLockoutDuration)
+	if d, err := lim.Check(context.Background(), "5.5.5.5"); err != nil {
+		t.Fatalf("Check: %v", err)
+	} else if !d.Allowed {
+		t.Errorf("lockout should have expired after %v, got %+v", DefaultLockoutDuration, d)
 	}
 }
 

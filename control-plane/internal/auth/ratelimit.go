@@ -136,45 +136,57 @@ func (l *Limiter) Check(ctx context.Context, ip string) (LockoutDecision, error)
 		}, nil
 	}
 
-	// Per-window failures.
-	failSince := now.Add(-l.cfg.Window).Unix()
-	var failureCount int
-	if err := l.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM login_attempts WHERE ip = ? AND success = 0 AND ts >= ?`,
-		ip, failSince,
-	).Scan(&failureCount); err != nil {
-		return LockoutDecision{}, fmt.Errorf("auth: query failure count: %w", err)
+	// Lockout detection. PRD §4.2: "Threshold failures within Window →
+	// LockoutDuration lockout." The lockout must hold for the FULL
+	// LockoutDuration measured from the triggering failure, EVEN AFTER the
+	// failing rows age out of Window. Counting failures only inside Window
+	// (the previous approach) let an attacker simply wait out the 5-minute
+	// window and retry, making the effective lockout equal to Window (5
+	// min) instead of LockoutDuration (15 min) — a brute-force bypass.
+	//
+	// So we look back over the whole LockoutDuration, pull the recent
+	// failures (bounded by the global cap + 24 h pruner), and slide a
+	// Window-wide frame over them: any frame holding Threshold failures
+	// arms a lockout that lasts until that frame's Threshold-th failure +
+	// LockoutDuration.
+	lookbackSince := now.Add(-l.cfg.LockoutDuration).Unix()
+	rows, err := l.db.QueryContext(ctx,
+		`SELECT ts FROM login_attempts WHERE ip = ? AND success = 0 AND ts >= ? ORDER BY ts ASC`,
+		ip, lookbackSince)
+	if err != nil {
+		return LockoutDecision{}, fmt.Errorf("auth: query failures: %w", err)
 	}
-	if failureCount >= l.cfg.Threshold {
-		// Find the timestamp at which the run started; the lockout
-		// duration is measured from that latest failure.
-		var lastFailTS int64
-		err := l.db.QueryRowContext(ctx,
-			`SELECT MAX(ts) FROM login_attempts WHERE ip = ? AND success = 0 AND ts >= ?`,
-			ip, failSince,
-		).Scan(&lastFailTS)
-		retryAfter := l.cfg.LockoutDuration
-		if err == nil && lastFailTS > 0 {
-			if d := time.Until(time.Unix(lastFailTS, 0).Add(l.cfg.LockoutDuration)); d > 0 {
-				retryAfter = d
-			} else {
-				// The lockout has already expired — purge those rows
-				// so the next request flows. We don't fail the request
-				// on a pruner error, but we also don't lock out longer
-				// than configured.
-				if _, derr := l.db.ExecContext(ctx,
-					`DELETE FROM login_attempts WHERE ip = ? AND success = 0 AND ts < ?`,
-					ip, now.Add(-l.cfg.Window).Unix(),
-				); derr != nil {
-					l.logger.Warn("ratelimit: prune stale failures", "err", derr)
-				}
-				return LockoutDecision{Allowed: true}, nil
+	var fails []int64
+	for rows.Next() {
+		var ts int64
+		if err := rows.Scan(&ts); err != nil {
+			_ = rows.Close()
+			return LockoutDecision{}, fmt.Errorf("auth: scan failure ts: %w", err)
+		}
+		fails = append(fails, ts)
+	}
+	if cerr := rows.Err(); cerr != nil {
+		_ = rows.Close()
+		return LockoutDecision{}, fmt.Errorf("auth: iterate failures: %w", cerr)
+	}
+	_ = rows.Close()
+
+	windowSec := int64(l.cfg.Window / time.Second)
+	durSec := int64(l.cfg.LockoutDuration / time.Second)
+	var lockUntil int64
+	for i := 0; i+l.cfg.Threshold-1 < len(fails); i++ {
+		j := i + l.cfg.Threshold - 1
+		if fails[j]-fails[i] <= windowSec {
+			if u := fails[j] + durSec; u > lockUntil {
+				lockUntil = u
 			}
 		}
+	}
+	if lockUntil > now.Unix() {
 		return LockoutDecision{
 			Allowed:    false,
 			Reason:     "ip locked out after repeated failures",
-			RetryAfter: retryAfter,
+			RetryAfter: time.Until(time.Unix(lockUntil, 0)),
 		}, nil
 	}
 
