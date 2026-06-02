@@ -132,6 +132,10 @@ async fn socks5_upload_round_trip_through_microsocks() {
         socks5_target: None,
         upload_listen_mode: UploadListenMode::Socks5Tcp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     };
 
     // Client tunnel: end-user UDP listener on 127.0.0.1:14504, uploads
@@ -172,6 +176,10 @@ async fn socks5_upload_round_trip_through_microsocks() {
         }),
         upload_listen_mode: UploadListenMode::Udp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     };
 
     // Bring up Remote first so the TCP listener is ready before the
@@ -306,6 +314,10 @@ async fn socks5_pool_of_4_round_trip_through_microsocks() {
         socks5_target: None,
         upload_listen_mode: UploadListenMode::Socks5Tcp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     };
 
     let end_user_listen: SocketAddr = "127.0.0.1:14604".parse().unwrap();
@@ -343,6 +355,10 @@ async fn socks5_pool_of_4_round_trip_through_microsocks() {
         }),
         upload_listen_mode: UploadListenMode::Udp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     };
 
     mgr.start_tunnel(remote_spec)

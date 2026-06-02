@@ -679,6 +679,10 @@ mod classification_tests {
             socks5_target: None,
             upload_listen_mode: crate::spec::UploadListenMode::Udp,
             ports: Vec::new(),
+            forward_protocol: crate::spec::ForwardProtocol::Udp,
+            tcp_reliability_engine: crate::spec::TcpReliabilityEngine::Kcp,
+            forward_kcp: None,
+            forward_quic: None,
         }
     }
 

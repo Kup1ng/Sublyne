@@ -524,6 +524,10 @@ mod tests {
             pacing_target_ms: 100,
             socks5_target: None,
             upload_listen_mode: crate::spec::UploadListenMode::Udp,
+            forward_protocol: crate::spec::ForwardProtocol::Udp,
+            tcp_reliability_engine: crate::spec::TcpReliabilityEngine::Kcp,
+            forward_kcp: None,
+            forward_quic: None,
             ports: Vec::new(),
         };
         // This test requires CAP_NET_RAW for the raw socket open;
@@ -604,6 +608,10 @@ mod tests {
             pacing_target_ms: 100,
             socks5_target: None,
             upload_listen_mode: crate::spec::UploadListenMode::Udp,
+            forward_protocol: crate::spec::ForwardProtocol::Udp,
+            tcp_reliability_engine: crate::spec::TcpReliabilityEngine::Kcp,
+            forward_kcp: None,
+            forward_quic: None,
             ports: vec![p_a, p_b],
         };
         match mgr.start_tunnel(spec).await {

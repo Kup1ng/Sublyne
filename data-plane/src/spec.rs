@@ -101,6 +101,87 @@ fn default_min_ready_slots() -> u32 {
     1
 }
 
+/// How a tunnel forwards application traffic (v4.0.0). `Udp` (the
+/// default and the only pre-v4 behaviour) relays UDP datagrams
+/// unchanged. `Tcp` terminates the user's TCP connection and carries it
+/// reliably over the best-effort spoof/upload channel using a
+/// reliability engine ([`TcpReliabilityEngine`]). Shared by both roles —
+/// the Client and Remote must agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProtocol {
+    #[default]
+    Udp,
+    Tcp,
+}
+
+/// The reliable transport carrying a `forward_protocol=tcp` tunnel's
+/// byte stream over the lossy datagram channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TcpReliabilityEngine {
+    #[default]
+    Kcp,
+    Quic,
+}
+
+/// Concrete KCP parameters resolved by the Go control plane (preset +
+/// Advanced overrides). The dataplane applies these via
+/// `ikcp_nodelay` / `ikcp_wndsize`; the engine MTU is derived from the
+/// tunnel MTU, not carried here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KcpTuning {
+    pub nodelay: u32,
+    pub interval: u32,
+    pub resend: u32,
+    pub nc: u32,
+    pub snd_wnd: u32,
+    pub rcv_wnd: u32,
+}
+
+impl Default for KcpTuning {
+    /// The "balanced" preset — used when the IPC payload omits the
+    /// tuning block (an older Go peer or a hand-crafted spec).
+    fn default() -> Self {
+        KcpTuning {
+            nodelay: 1,
+            interval: 20,
+            resend: 2,
+            nc: 0,
+            snd_wnd: 1024,
+            rcv_wnd: 1024,
+        }
+    }
+}
+
+/// Concrete QUIC parameters resolved by the Go control plane. Windows
+/// are bytes; timings milliseconds; `congestion` is `cubic` | `newreno`
+/// | `bbr`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuicTuning {
+    pub congestion: String,
+    pub initial_rtt_ms: u32,
+    pub max_idle_ms: u32,
+    pub keep_alive_ms: u32,
+    pub stream_recv_window: u64,
+    pub conn_recv_window: u64,
+}
+
+impl Default for QuicTuning {
+    /// The "balanced" preset — used when the IPC payload omits the
+    /// tuning block.
+    fn default() -> Self {
+        QuicTuning {
+            congestion: "cubic".to_string(),
+            initial_rtt_ms: 200,
+            max_idle_ms: 60_000,
+            keep_alive_ms: 20_000,
+            stream_recv_window: 8 * 1024 * 1024,
+            conn_recv_window: 32 * 1024 * 1024,
+        }
+    }
+}
+
 /// Tunnel specification carried across IPC. Mirrors the schema in
 /// `.claude/skills/rust-go-ipc/SKILL.md` §"Tunnel spec schema".
 ///
@@ -134,6 +215,23 @@ pub struct TunnelSpec {
     /// Default = Reply for back-compat with Phase 8b.
     #[serde(default)]
     pub icmp_echo_mode: IcmpEchoMode,
+
+    /// TCP forwarding (v4.0.0). Shared by both roles. `Udp` (default)
+    /// is the historical UDP relay; `Tcp` layers a reliability engine
+    /// over the spoof/upload channel. The engine + its tuning are wired
+    /// in follow-up commits; until then `validate()` refuses a `Tcp`
+    /// spec rather than silently relaying as UDP.
+    #[serde(default)]
+    pub forward_protocol: ForwardProtocol,
+    #[serde(default)]
+    pub tcp_reliability_engine: TcpReliabilityEngine,
+    /// Concrete tuning for the chosen engine. Exactly one is set when
+    /// `forward_protocol=tcp`; `None` ⇒ the dataplane's built-in
+    /// balanced defaults ([`KcpTuning::default`] / [`QuicTuning::default`]).
+    #[serde(default, rename = "forward_kcp")]
+    pub forward_kcp: Option<KcpTuning>,
+    #[serde(default, rename = "forward_quic")]
+    pub forward_quic: Option<QuicTuning>,
 
     // Spoof envelope (applies to both roles — the Client uses it to
     // validate the source of incoming spoofed packets; the Remote uses
@@ -243,6 +341,12 @@ pub enum SpecError {
     InvalidSpoofIp(String),
     #[error("mtu {0} is below the HMAC envelope overhead")]
     MtuTooSmall(u32),
+    /// `forward_protocol=tcp` reached a build whose reliability engine
+    /// isn't compiled in yet. Replaced per-engine as KCP and QUIC land
+    /// (KCP first, then QUIC). Refusing here beats silently relaying the
+    /// TCP stream as best-effort UDP, which would corrupt it.
+    #[error("forward_protocol=tcp with engine {0:?} is not available in this build")]
+    ForwardEngineUnavailable(TcpReliabilityEngine),
     /// A client tunnel spec carried both `wireguard_fwmark != 0` and a
     /// `socks5_target` block. The two upload paths are mutually
     /// exclusive — the Go control plane never sets both, but the
@@ -284,6 +388,16 @@ impl TunnelSpec {
             .map_err(|_| SpecError::InvalidSpoofIp(self.download_spoof_source_ip.clone()))?;
         if self.mtu < crate::hmac::OVERHEAD as u32 + 40 {
             return Err(SpecError::MtuTooSmall(self.mtu));
+        }
+
+        // v4.0.0: TCP forwarding. The KCP and QUIC engines are wired in
+        // follow-up commits; until then a `tcp` spec is refused with a
+        // clear error rather than silently relaying the byte stream as
+        // best-effort UDP (which would corrupt it on the first loss).
+        if self.forward_protocol == ForwardProtocol::Tcp {
+            return Err(SpecError::ForwardEngineUnavailable(
+                self.tcp_reliability_engine,
+            ));
         }
 
         match self.role {
@@ -346,6 +460,10 @@ impl TunnelSpec {
                     download_send_port: None,
                     client_real_ip: None,
                     ports: self.ports.clone(),
+                    forward_protocol: self.forward_protocol,
+                    tcp_reliability_engine: self.tcp_reliability_engine,
+                    forward_kcp: self.forward_kcp,
+                    forward_quic: self.forward_quic.clone(),
                 })
             }
             Role::Remote => {
@@ -381,6 +499,10 @@ impl TunnelSpec {
                     download_send_port: Some(send_port),
                     client_real_ip: Some(client_ip),
                     ports: self.ports.clone(),
+                    forward_protocol: self.forward_protocol,
+                    tcp_reliability_engine: self.tcp_reliability_engine,
+                    forward_kcp: self.forward_kcp,
+                    forward_quic: self.forward_quic.clone(),
                 })
             }
         }
@@ -411,6 +533,15 @@ pub struct ResolvedSpec {
     /// single-port legacy path; length >= 2 activates the per-port
     /// sockets + application-port tag (see [`ResolvedSpec::multiport`]).
     pub ports: Vec<u16>,
+
+    /// TCP forwarding (v4.0.0), carried through so the spawn path can
+    /// branch into the reliability engine. `forward_kcp` / `forward_quic`
+    /// hold the resolved tuning (one is `Some` when the engine matches),
+    /// falling back to the engine's balanced default when `None`.
+    pub forward_protocol: ForwardProtocol,
+    pub tcp_reliability_engine: TcpReliabilityEngine,
+    pub forward_kcp: Option<KcpTuning>,
+    pub forward_quic: Option<QuicTuning>,
 }
 
 impl ResolvedSpec {
@@ -454,6 +585,10 @@ mod tests {
             socks5_target: None,
             upload_listen_mode: UploadListenMode::Udp,
             ports: Vec::new(),
+            forward_protocol: ForwardProtocol::Udp,
+            tcp_reliability_engine: TcpReliabilityEngine::Kcp,
+            forward_kcp: None,
+            forward_quic: None,
         }
     }
 
@@ -485,6 +620,10 @@ mod tests {
             socks5_target: None,
             upload_listen_mode: UploadListenMode::Udp,
             ports: Vec::new(),
+            forward_protocol: ForwardProtocol::Udp,
+            tcp_reliability_engine: TcpReliabilityEngine::Kcp,
+            forward_kcp: None,
+            forward_quic: None,
         }
     }
 
@@ -494,6 +633,23 @@ mod tests {
         assert!(r.local_listen_addr.is_some());
         assert!(r.upload_target_addr.is_some());
         assert_eq!(r.download_receive_port, Some(8443));
+        // Default forward protocol round-trips as UDP.
+        assert_eq!(r.forward_protocol, ForwardProtocol::Udp);
+    }
+
+    #[test]
+    fn forward_tcp_rejected_until_engine_lands() {
+        // PR1 carries the field but refuses a tcp spec rather than
+        // silently relaying as UDP. Replaced per-engine in PR2/PR3.
+        let mut s = base_client();
+        s.forward_protocol = ForwardProtocol::Tcp;
+        s.tcp_reliability_engine = TcpReliabilityEngine::Kcp;
+        assert!(matches!(
+            s.validate(),
+            Err(SpecError::ForwardEngineUnavailable(
+                TcpReliabilityEngine::Kcp
+            ))
+        ));
     }
 
     #[test]
