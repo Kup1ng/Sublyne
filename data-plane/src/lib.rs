@@ -6,6 +6,7 @@
 // touch must be `pub`.
 
 pub mod batch;
+pub mod forward;
 pub mod hmac;
 pub mod icmp_id;
 pub mod icmp_sysctl;

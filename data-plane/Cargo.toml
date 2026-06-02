@@ -60,6 +60,15 @@ anyhow = "1"
 thiserror = "2"
 bytes = "1"
 
+# KCP reliable transport for forward_protocol=tcp (v4.0.0). The `kcp`
+# crate is the transport-agnostic core port of ikcp: `Kcp::new_stream`
+# takes an `impl std::io::Write` output sink, so we drive it over our
+# own opaque-datagram channel (the spoof/upload pipe) instead of a real
+# UDP socket. Pure Rust (bytes + log + thiserror), so it stays musl-clean
+# with no C toolchain. We supply the timer loop, conv multiplexing, and
+# TCP bridging ourselves in src/forward/.
+kcp = "0.6"
+
 # `async fn` in traits via the standard proc-macro shim. Rust 1.83
 # supports native async fn in traits, but the trait-object form
 # (`Arc<dyn UploadTransport>`) still needs the `async_trait` adapter
