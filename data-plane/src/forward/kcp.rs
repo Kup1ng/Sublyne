@@ -122,6 +122,10 @@ impl Write for OutSink {
 
 type SharedKcp = Arc<Mutex<Kcp<OutSink>>>;
 
+/// A snapshot of one conv's driver-facing handles, taken under the map
+/// lock so the per-conv KCP work runs without holding it.
+type ConvHandle = (SharedKcp, mpsc::Sender<Vec<u8>>, Arc<Notify>, usize);
+
 /// Per-conversation state held in the driver's conv map.
 struct Conv {
     kcp: SharedKcp,
@@ -431,7 +435,7 @@ fn feed_conv(
 /// read pumps whose window has room.
 fn drive_all(now: u64, convs: &Arc<Mutex<HashMap<u32, Conv>>>, recv_buf: &mut [u8]) {
     // Snapshot handles so the map lock isn't held across per-conv work.
-    let handles: Vec<(SharedKcp, mpsc::Sender<Vec<u8>>, Arc<Notify>, usize)> = {
+    let handles: Vec<ConvHandle> = {
         let map = convs.lock().expect("conv map");
         map.values()
             .map(|c| (c.kcp.clone(), c.app_tx.clone(), c.window.clone(), c.snd_wnd))

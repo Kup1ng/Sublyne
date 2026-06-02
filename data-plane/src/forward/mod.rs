@@ -4,9 +4,10 @@
 //! Client and re-originates it to `forward_target` on the Remote, carrying
 //! the byte stream reliably over Sublyne's best-effort spoof/upload
 //! datagram channel. The engine sits entirely at the forward-payload
-//! layer: it consumes/produces opaque datagrams via [`channel::DatagramSink`]
-//! + an inbound queue, and never touches the seal/HMAC/anti-replay/spoof
-//! machinery (which keeps treating those datagrams as opaque ≤MTU payloads).
+//! layer: it consumes and produces opaque datagrams via the
+//! [`channel::DatagramSink`] trait and a bounded inbound queue, and never
+//! touches the seal/HMAC/anti-replay/spoof machinery (which keeps treating
+//! those datagrams as opaque MTU-sized payloads).
 //!
 //! [`kcp`] is the KCP engine; the QUIC engine lands alongside it. Both
 //! implement the same boundary so the Client/Remote integration is
