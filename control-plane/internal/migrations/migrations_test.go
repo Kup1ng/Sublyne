@@ -56,12 +56,11 @@ func TestApply_RecordsVersionRow(t *testing.T) {
 	if err := conn.QueryRowContext(ctx, "SELECT MAX(version) FROM schema_version").Scan(&max); err != nil {
 		t.Fatalf("query schema_version: %v", err)
 	}
-	// Bumped to 11 when v2.7.0 unified the application-port list and
-	// stripped the port off local_listen_addr / forward_target
-	// (0011_unified_ports.sql). Future phases that add a migration should
-	// bump this in lockstep.
-	if !max.Valid || max.Int64 != 11 {
-		t.Errorf("max(version) = %v valid=%v, want 11", max.Int64, max.Valid)
+	// Bumped to 12 when v4.0.0 added the per-tunnel TCP-forwarding columns
+	// (0012_forward_protocol.sql). Future phases that add a migration
+	// should bump this in lockstep.
+	if !max.Valid || max.Int64 != 12 {
+		t.Errorf("max(version) = %v valid=%v, want 12", max.Int64, max.Valid)
 	}
 }
 

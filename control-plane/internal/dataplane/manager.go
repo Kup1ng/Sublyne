@@ -411,6 +411,50 @@ func buildSpec(t tunnels.Tunnel, proxy *socks5.Proxy) (ipc.TunnelSpec, error) {
 		PacingEnabled:           t.PacingEnabled,
 		PacingTargetMS:          uint32(t.PacingTargetMS), //nolint:gosec // bounded above
 	}
+	// TCP forwarding (v4.0.0). Default to UDP for any row that predates
+	// v4 or omits the field. When TCP, resolve the preset + Advanced
+	// overrides into the concrete tuning the dataplane consumes (the Rust
+	// side has no preset table). A bad override is a hard build error —
+	// the validator already accepted it on save, so this only fires on a
+	// hand-crafted DB.
+	forwardProto := t.ForwardProtocol
+	if forwardProto == "" {
+		forwardProto = tunnels.ForwardProtocolUDP
+	}
+	spec.ForwardProtocol = string(forwardProto)
+	engine := t.TCPReliabilityEngine
+	if engine == "" {
+		engine = tunnels.TCPEngineKCP
+	}
+	spec.TCPReliabilityEngine = string(engine)
+	if forwardProto == tunnels.ForwardProtocolTCP {
+		preset := tunnels.ForwardEnginePreset(t.ForwardEnginePreset)
+		if preset == "" {
+			preset = tunnels.PresetBalanced
+		}
+		switch engine {
+		case tunnels.TCPEngineKCP:
+			kt, err := tunnels.ResolveKcpTuning(preset, t.ForwardEngineTuning)
+			if err != nil {
+				return spec, fmt.Errorf("resolve KCP tuning: %w", err)
+			}
+			spec.KcpTuning = &ipc.KcpTuning{
+				NoDelay: kt.NoDelay, Interval: kt.Interval, Resend: kt.Resend,
+				NC: kt.NC, SndWnd: kt.SndWnd, RcvWnd: kt.RcvWnd,
+			}
+		case tunnels.TCPEngineQUIC:
+			qt, err := tunnels.ResolveQuicTuning(preset, t.ForwardEngineTuning)
+			if err != nil {
+				return spec, fmt.Errorf("resolve QUIC tuning: %w", err)
+			}
+			spec.QuicTuning = &ipc.QuicTuning{
+				Congestion: qt.Congestion, InitialRTTMs: qt.InitialRTTMs,
+				MaxIdleMs: qt.MaxIdleMs, KeepAliveMs: qt.KeepAliveMs,
+				StreamRecvWindow: qt.StreamRecvWindow, ConnRecvWindow: qt.ConnRecvWindow,
+			}
+		}
+	}
+
 	// Multi-port (v2.5.0): carry the app-port list to the dataplane only
 	// when the tunnel is genuinely multi-port (>= 2 ports). A 0- or
 	// 1-element list is single-port — leave spec.Ports empty so the

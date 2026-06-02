@@ -614,14 +614,17 @@ func TestImport_RejectsWrongSchemaVersion(t *testing.T) {
 	f := newTestFixture(t)
 	s := httpServerForFixture(t, f)
 	hdr := loginAndTokenHeader(t, s.URL)
-	body := `{"type":"sublyne-tunnel-export","schema_version":2,"secrets_included":false,"tunnel":{"name":"x","role":"client"}}`
+	// Schema 99 is newer than this build understands (v4.0.0 reads
+	// schemas 1-2). Schemas 1 and 2 are both accepted, so the rejected
+	// version must be out of that range.
+	body := `{"type":"sublyne-tunnel-export","schema_version":99,"secrets_included":false,"tunnel":{"name":"x","role":"client"}}`
 	res := postJSON(t, panelURL(s, "/api/tunnels/import"), body, hdr)
 	if res.Status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 body=%s", res.Status, string(res.Body))
 	}
 	if !strings.Contains(string(res.Body), `"file"`) ||
-		!strings.Contains(string(res.Body), "schema 2") {
-		t.Errorf("expected a `file` field error naming schema 2, got %s", string(res.Body))
+		!strings.Contains(string(res.Body), "schema 99") {
+		t.Errorf("expected a `file` field error naming schema 99, got %s", string(res.Body))
 	}
 }
 

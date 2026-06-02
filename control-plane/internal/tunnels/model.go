@@ -230,6 +230,19 @@ type Tunnel struct {
 	IdleTimeout             int
 	IcmpEchoMode            IcmpEchoMode
 
+	// TCP forwarding (v4.0.0). Shared by both roles — the Client and
+	// Remote must agree on protocol + engine + tuning. ForwardProtocol
+	// 'udp' (default) is the historical UDP-relay behaviour and leaves
+	// the other three fields inert. 'tcp' selects a reliability engine
+	// (TCPReliabilityEngine: 'kcp' default or 'quic') tuned by
+	// ForwardEnginePreset ('interactive' | 'balanced' | 'lossy') with
+	// optional per-field overrides in ForwardEngineTuning (a JSON blob;
+	// "" = pure preset). See forward.go for the concrete numbers.
+	ForwardProtocol      ForwardProtocol
+	TCPReliabilityEngine TCPEngine
+	ForwardEnginePreset  string
+	ForwardEngineTuning  string
+
 	// Ports is the full list of application ports this tunnel carries
 	// through the one secure download-spoof / upload pipeline, with a fixed
 	// 1:1 same-number mapping between Client and Remote (client :8000 <->

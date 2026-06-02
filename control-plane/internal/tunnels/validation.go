@@ -126,6 +126,11 @@ func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, exist
 		t.UploadListenMode = DefaultListenMode(t.DownloadTransport)
 	}
 
+	// Forward protocol (v4.0.0). Shared across both roles; validated
+	// before the role split so a Client and its paired Remote enforce the
+	// identical rules.
+	validateForward(t, ve)
+
 	switch t.Role {
 	case RoleClient:
 		validateClientFields(t, ve)
@@ -323,6 +328,56 @@ func listenMatrixMessage(t Transport) string {
 		return "TCP-SYN download requires the SOCKS5-TCP upload-listen mode. Switch the listen mode to SOCKS5-TCP, or change the download transport."
 	default:
 		return "This upload-listen mode isn't valid for the selected download transport."
+	}
+}
+
+// validateForward enforces the v4.0.0 TCP-forwarding rules. It defaults
+// the four shared fields so a row that omits them lands on UDP forwarding
+// (the historical behaviour) and, when forward_protocol='tcp', confirms
+// the engine + preset enums and that the resolved tuning is in range.
+// The engine/preset/tuning fields are kept at valid values even for a
+// 'udp' tunnel so the DB CHECK constraints hold.
+func validateForward(t *Tunnel, ve *ValidationError) {
+	if t.ForwardProtocol == "" {
+		t.ForwardProtocol = ForwardProtocolUDP
+	}
+	if !t.ForwardProtocol.IsValid() {
+		ve.Fields["forward_protocol"] = "Forward protocol must be either 'udp' or 'tcp'."
+	}
+	if t.TCPReliabilityEngine == "" {
+		t.TCPReliabilityEngine = TCPEngineKCP
+	}
+	if t.ForwardEnginePreset == "" {
+		t.ForwardEnginePreset = string(PresetBalanced)
+	}
+
+	// Engine/preset enums are always CHECK'd (even for udp) so an
+	// imported or hand-crafted row can't smuggle an invalid value past
+	// the column constraint.
+	if !t.TCPReliabilityEngine.IsValid() {
+		ve.Fields["tcp_reliability_engine"] = "Reliability engine must be either 'kcp' or 'quic'."
+	}
+	if !ForwardEnginePreset(t.ForwardEnginePreset).IsValid() {
+		ve.Fields["forward_engine_preset"] = "Tuning preset must be one of 'interactive', 'balanced', or 'lossy'."
+	}
+
+	// The tuning blob only matters for a TCP tunnel. Resolve it against
+	// the chosen engine + preset so a malformed override or out-of-range
+	// value surfaces as a per-field error the operator can fix.
+	if t.ForwardProtocol == ForwardProtocolTCP &&
+		t.TCPReliabilityEngine.IsValid() &&
+		ForwardEnginePreset(t.ForwardEnginePreset).IsValid() {
+		preset := ForwardEnginePreset(t.ForwardEnginePreset)
+		var err error
+		switch t.TCPReliabilityEngine {
+		case TCPEngineKCP:
+			_, err = ResolveKcpTuning(preset, t.ForwardEngineTuning)
+		case TCPEngineQUIC:
+			_, err = ResolveQuicTuning(preset, t.ForwardEngineTuning)
+		}
+		if err != nil {
+			ve.Fields["forward_engine_tuning"] = err.Error()
+		}
 	}
 }
 

@@ -60,7 +60,11 @@ forward_target,
 download_send_port,
 client_real_ip,
 upload_listen_mode,
-ports
+ports,
+forward_protocol,
+tcp_reliability_engine,
+forward_engine_preset,
+forward_engine_tuning
 `
 
 // scanTunnel reads one row in the order the SELECT above lays them out.
@@ -101,6 +105,10 @@ func scanTunnel(row interface {
 		&t.ClientRealIP,
 		&t.UploadListenMode,
 		&portsCSV,
+		&t.ForwardProtocol,
+		&t.TCPReliabilityEngine,
+		&t.ForwardEnginePreset,
+		&t.ForwardEngineTuning,
 	)
 	if err != nil {
 		return Tunnel{}, err
@@ -168,6 +176,7 @@ func (r *Repo) Create(ctx context.Context, t Tunnel) (Tunnel, error) {
 	if uploadListenMode == "" {
 		uploadListenMode = string(UploadListenModeUDP)
 	}
+	forwardProto, engine, preset := forwardDefaults(t)
 	res, err := r.db.ExecContext(ctx, `
 INSERT INTO tunnels (
   name, role, enabled, psk,
@@ -180,7 +189,8 @@ INSERT INTO tunnels (
   pacing_enabled, pacing_target_ms,
   upload_listen_addr, forward_target, download_send_port, client_real_ip,
   upload_listen_mode,
-  ports
+  ports,
+  forward_protocol, tcp_reliability_engine, forward_engine_preset, forward_engine_tuning
 ) VALUES (
   ?, ?, ?, ?,
   ?, ?, ?,
@@ -192,7 +202,8 @@ INSERT INTO tunnels (
   ?, ?,
   ?, ?, ?, ?,
   ?,
-  ?
+  ?,
+  ?, ?, ?, ?
 )`,
 		t.Name, string(t.Role), boolToInt(t.Enabled), t.PSK,
 		t.DownloadSpoofSourceIP, t.DownloadSpoofSourcePort, string(t.DownloadTransport),
@@ -205,6 +216,7 @@ INSERT INTO tunnels (
 		t.UploadListenAddr, t.ForwardTarget, t.DownloadSendPort, t.ClientRealIP,
 		uploadListenMode,
 		PortsToCSV(t.Ports),
+		forwardProto, engine, preset, t.ForwardEngineTuning,
 	)
 	if err != nil {
 		if isUniqueConstraint(err, "tunnels.name") {
@@ -254,6 +266,7 @@ func (r *Repo) Update(ctx context.Context, t Tunnel, keepPSK bool) (Tunnel, erro
 	if uploadListenMode == "" {
 		uploadListenMode = string(UploadListenModeUDP)
 	}
+	forwardProto, engine, preset := forwardDefaults(t)
 	res, err := r.db.ExecContext(ctx, `
 UPDATE tunnels SET
   name = ?, enabled = ?,
@@ -267,6 +280,7 @@ UPDATE tunnels SET
   upload_listen_addr = ?, forward_target = ?, download_send_port = ?, client_real_ip = ?,
   upload_listen_mode = ?,
   ports = ?,
+  forward_protocol = ?, tcp_reliability_engine = ?, forward_engine_preset = ?, forward_engine_tuning = ?,
   psk = ?,
   updated_at = CURRENT_TIMESTAMP
 WHERE id = ?`,
@@ -281,6 +295,7 @@ WHERE id = ?`,
 		t.UploadListenAddr, t.ForwardTarget, t.DownloadSendPort, t.ClientRealIP,
 		uploadListenMode,
 		PortsToCSV(t.Ports),
+		forwardProto, engine, preset, t.ForwardEngineTuning,
 		psk,
 		t.ID,
 	)
@@ -350,6 +365,26 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// forwardDefaults coerces the three enum-backed TCP-forwarding columns to
+// valid non-empty values so the 0012 CHECK constraints hold even when the
+// caller left them blank (an older API body, an import, a clone of a
+// pre-v4 row). The tuning blob defaults to "" and needs no coercion.
+func forwardDefaults(t Tunnel) (forwardProto, engine, preset string) {
+	forwardProto = string(t.ForwardProtocol)
+	if forwardProto == "" {
+		forwardProto = string(ForwardProtocolUDP)
+	}
+	engine = string(t.TCPReliabilityEngine)
+	if engine == "" {
+		engine = string(TCPEngineKCP)
+	}
+	preset = t.ForwardEnginePreset
+	if preset == "" {
+		preset = string(PresetBalanced)
+	}
+	return forwardProto, engine, preset
 }
 
 // isUniqueConstraint reports whether err is a SQLite UNIQUE
