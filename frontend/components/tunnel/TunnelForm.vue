@@ -38,8 +38,15 @@ const props = defineProps<{
   submitting?: boolean
   onDelete?: (() => void) | null
   errors?: Record<string, string>
+  // When hosted in the modal, the form drops its own sticky footer — the
+  // modal renders the Cancel / Save / Delete bar and calls submit() via the
+  // exposed method below.
+  inModal?: boolean
 }>()
-const emit = defineEmits<{ (e: 'submit', value: Partial<Tunnel>): void }>()
+const emit = defineEmits<{
+  (e: 'submit', value: Partial<Tunnel>): void
+  (e: 'cancel'): void
+}>()
 
 const auth = useAuth()
 const wg = useWireguard()
@@ -282,6 +289,10 @@ function submit() {
   if (parsed.error || parsed.ports.length === 0) return
   emit('submit', { ...draft.value, ports: buildPorts(parsed.ports) })
 }
+
+// Exposed so the modal host's footer Save button can trigger the same
+// validated submit the in-page footer does.
+defineExpose({ submit })
 </script>
 
 <template>
@@ -752,6 +763,7 @@ function submit() {
     </AppCard>
 
     <div
+      v-if="!inModal"
       class="sticky bottom-0 -mx-6 flex items-center justify-between gap-2 border-t border-line/70 bg-bg/90 px-6 py-4 backdrop-blur-md md:-mx-10 md:px-10"
     >
       <AppButton v-if="onDelete" type="button" variant="ghost" @click="onDelete">
@@ -760,14 +772,15 @@ function submit() {
       </AppButton>
       <span v-else />
       <div class="flex items-center gap-2">
-        <NuxtLink to="/tunnels">
-          <AppButton type="button" variant="secondary">Cancel</AppButton>
-        </NuxtLink>
+        <AppButton type="button" variant="secondary" @click="emit('cancel')">Cancel</AppButton>
         <AppButton type="submit" :loading="submitting">
           <Save class="size-4" />
           Save tunnel
         </AppButton>
       </div>
     </div>
+    <!-- A hidden submit input lets Enter still submit the form when the
+         visible footer is provided by the modal host instead. -->
+    <input v-if="inModal" type="submit" class="hidden" aria-hidden="true" tabindex="-1" />
   </form>
 </template>

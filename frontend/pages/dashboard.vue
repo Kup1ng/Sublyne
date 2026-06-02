@@ -150,7 +150,7 @@ const procRss = computed(() => snapshot.value?.system.proc_rss_bytes ?? 0)
       description="Add a matching pair on this and the other server to start forwarding traffic."
     >
       <template #actions>
-        <NuxtLink to="/tunnels/new">
+        <NuxtLink to="/tunnels?new=1">
           <AppButton>Create your first tunnel</AppButton>
         </NuxtLink>
       </template>
