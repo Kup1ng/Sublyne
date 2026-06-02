@@ -3,6 +3,8 @@ import { Save, Trash2 } from 'lucide-vue-next'
 import { computed, ref, watch, watchEffect } from 'vue'
 import type {
   DownloadTransport,
+  ForwardEnginePreset,
+  ForwardProtocol,
   IcmpEchoMode,
   Tunnel,
   UploadMode,
@@ -11,6 +13,14 @@ import type {
 import { useAuth } from '~/composables/useAuth'
 import { useWireguard } from '~/composables/useWireguard'
 import { useSocks5 } from '~/composables/useSocks5'
+import {
+  ENGINE_OPTIONS,
+  PRESET_OPTIONS,
+  kcpPreset,
+  quicPreset,
+  type KcpTuning,
+  type QuicTuning,
+} from '~/utils/forwardPresets'
 import {
   MATRIX_HELP,
   allowedListenModes,
@@ -50,6 +60,10 @@ const draft = ref<Partial<Tunnel>>({
   pacing_enabled: false,
   pacing_target_ms: 60,
   upload_listen_mode: 'udp',
+  forward_protocol: 'udp',
+  tcp_reliability_engine: 'kcp',
+  forward_engine_preset: 'balanced',
+  forward_engine_tuning: '',
   ...props.initial,
 })
 
@@ -173,6 +187,89 @@ const portsParsed = computed(() => parsePorts(portsInput.value))
 // A red error shows only for a genuine mistake, not for an empty field.
 const portsError = computed(() => portsParsed.value.error)
 const portsCount = computed(() => portsParsed.value.ports.length)
+
+// --- v4.0.0 TCP forwarding ----------------------------------------------
+const isTcpForward = computed(() => draft.value.forward_protocol === 'tcp')
+
+const forwardProtocolOptions: { value: ForwardProtocol; label: string }[] = [
+  { value: 'udp', label: 'UDP — default (hand users WireGuard / Hysteria)' },
+  { value: 'tcp', label: 'TCP — reliable (hand users VLESS-TCP / VLESS-WS)' },
+]
+const congestionOptions = [
+  { value: 'cubic', label: 'CUBIC' },
+  { value: 'newreno', label: 'NewReno' },
+  { value: 'bbr', label: 'BBR (experimental)' },
+]
+const KCP_FIELDS: { key: keyof KcpTuning; label: string }[] = [
+  { key: 'nodelay', label: 'nodelay (0 or 1)' },
+  { key: 'interval', label: 'interval (ms)' },
+  { key: 'resend', label: 'fast resend' },
+  { key: 'nc', label: 'no-congestion (0 or 1)' },
+  { key: 'snd_wnd', label: 'send window (pkts)' },
+  { key: 'rcv_wnd', label: 'recv window (pkts)' },
+]
+const QUIC_NUM_FIELDS: {
+  key: 'initial_rtt_ms' | 'max_idle_ms' | 'keep_alive_ms' | 'stream_recv_window' | 'conn_recv_window'
+  label: string
+}[] = [
+  { key: 'initial_rtt_ms', label: 'initial RTT (ms)' },
+  { key: 'max_idle_ms', label: 'max idle (ms)' },
+  { key: 'keep_alive_ms', label: 'keep-alive (ms)' },
+  { key: 'stream_recv_window', label: 'stream window (bytes)' },
+  { key: 'conn_recv_window', label: 'conn window (bytes)' },
+]
+
+// Advanced overrides. Source of truth is draft.forward_engine_tuning (a
+// JSON blob; '' = pure preset). The edit form is v-if-gated on a loaded
+// tunnel, so props.initial is stable at setup — Advanced simply starts
+// open iff a saved override is present, with no async race to manage.
+const forwardAdvanced = ref(
+  !!(draft.value.forward_engine_tuning && draft.value.forward_engine_tuning.trim()),
+)
+
+function readOverride(): Record<string, number | string> {
+  const raw = draft.value.forward_engine_tuning
+  if (!raw || !raw.trim()) return {}
+  try {
+    const o = JSON.parse(raw)
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {}
+  } catch {
+    return {}
+  }
+}
+// Set or clear one override key. An empty/NaN value reverts that field to
+// the preset; an empty override object resets the blob to '' (pure preset).
+function writeOverride(key: string, val: number | string | null | undefined) {
+  const o = readOverride()
+  if (val === undefined || val === null || (typeof val === 'number' && Number.isNaN(val))) {
+    delete o[key]
+  } else {
+    o[key] = val
+  }
+  draft.value.forward_engine_tuning = Object.keys(o).length ? JSON.stringify(o) : ''
+}
+function presetOf(): ForwardEnginePreset {
+  return (draft.value.forward_engine_preset ?? 'balanced') as ForwardEnginePreset
+}
+const effKcp = computed<KcpTuning>(() => ({
+  ...kcpPreset(presetOf()),
+  ...(readOverride() as Partial<KcpTuning>),
+}))
+const effQuic = computed<QuicTuning>(() => ({
+  ...quicPreset(presetOf()),
+  ...(readOverride() as Partial<QuicTuning>),
+}))
+
+// Changing the preset or engine starts from that baseline (drop stale
+// overrides). Non-immediate watch → fires only on a real user change, so a
+// loaded override survives the initial render.
+watch([() => draft.value.forward_engine_preset, () => draft.value.tcp_reliability_engine], () => {
+  draft.value.forward_engine_tuning = ''
+})
+// Closing Advanced reverts to the pure preset.
+watch(forwardAdvanced, (on) => {
+  if (!on) draft.value.forward_engine_tuning = ''
+})
 
 function err(field: string) {
   return props.errors?.[field] ?? null
@@ -452,6 +549,97 @@ function submit() {
         </FieldGroup>
         <FieldGroup label="MTU" help="Default 1400 — leaves headroom for WG + HMAC overhead.">
           <AppInput v-model="draft.mtu" type="number" placeholder="1400" monospace />
+        </FieldGroup>
+      </div>
+    </AppCard>
+
+    <AppCard
+      title="Forward protocol"
+      description="UDP forwards datagrams as before. TCP carries the user's TCP stream reliably over the spoof channel (KCP or QUIC) so you can hand out VLESS-TCP / VLESS-WS configs. Both sides must use the same setting."
+    >
+      <div class="grid gap-5 md:grid-cols-2">
+        <FieldGroup
+          label="Forward protocol"
+          help="UDP is the historical default. TCP wraps the user's TCP connection in a reliability engine that survives the lossy download path."
+          :error="err('forward_protocol')"
+        >
+          <AppSelect v-model="draft.forward_protocol" :options="forwardProtocolOptions" />
+        </FieldGroup>
+        <FieldGroup
+          v-if="isTcpForward"
+          label="Reliability engine"
+          help="KCP is simpler and best on lossy / ICMP paths. QUIC adds native multiplexing and built-in encryption (heavier handshake)."
+          :error="err('tcp_reliability_engine')"
+        >
+          <AppSelect v-model="draft.tcp_reliability_engine" :options="ENGINE_OPTIONS" />
+        </FieldGroup>
+      </div>
+
+      <div v-if="isTcpForward" class="mt-5 grid gap-5 md:grid-cols-2">
+        <FieldGroup
+          label="Tuning preset"
+          help="Proven defaults for the chosen engine. Open Advanced to override individual fields."
+          :error="err('forward_engine_preset')"
+        >
+          <AppSelect v-model="draft.forward_engine_preset" :options="PRESET_OPTIONS" />
+        </FieldGroup>
+        <FieldGroup label="Advanced overrides" help="Off uses the preset as-is. On lets you tune each field; cleared fields fall back to the preset.">
+          <div class="flex h-10 items-center gap-2.5">
+            <AppSwitch v-model="forwardAdvanced" />
+            <span class="text-[13px] text-subtle">
+              {{ forwardAdvanced ? 'Editing individual fields' : 'Using preset defaults' }}
+            </span>
+          </div>
+        </FieldGroup>
+      </div>
+
+      <!-- KCP tuning fields -->
+      <div
+        v-if="isTcpForward && draft.tcp_reliability_engine === 'kcp'"
+        class="mt-5 grid gap-4 md:grid-cols-3"
+      >
+        <FieldGroup
+          v-for="f in KCP_FIELDS"
+          :key="f.key"
+          :label="f.label"
+          :error="err('forward_engine_tuning')"
+        >
+          <AppInput
+            type="number"
+            monospace
+            :disabled="!forwardAdvanced"
+            :model-value="effKcp[f.key]"
+            @update:model-value="(v) => writeOverride(f.key, v)"
+          />
+        </FieldGroup>
+      </div>
+
+      <!-- QUIC tuning fields -->
+      <div
+        v-if="isTcpForward && draft.tcp_reliability_engine === 'quic'"
+        class="mt-5 grid gap-4 md:grid-cols-3"
+      >
+        <FieldGroup label="congestion" :error="err('forward_engine_tuning')">
+          <AppSelect
+            :disabled="!forwardAdvanced"
+            :model-value="effQuic.congestion"
+            :options="congestionOptions"
+            @update:model-value="(v) => writeOverride('congestion', v)"
+          />
+        </FieldGroup>
+        <FieldGroup
+          v-for="f in QUIC_NUM_FIELDS"
+          :key="f.key"
+          :label="f.label"
+          :error="err('forward_engine_tuning')"
+        >
+          <AppInput
+            type="number"
+            monospace
+            :disabled="!forwardAdvanced"
+            :model-value="effQuic[f.key]"
+            @update:model-value="(v) => writeOverride(f.key, v)"
+          />
         </FieldGroup>
       </div>
     </AppCard>

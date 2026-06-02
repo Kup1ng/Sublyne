@@ -56,6 +56,12 @@ export type DownloadTransport = 'udp' | 'tcp_syn' | 'icmp' | 'icmpv6'
 export type IcmpEchoMode = 'reply' | 'request'
 export type UploadMode = 'wireguard' | 'socks5'
 export type UploadListenMode = 'udp' | 'socks5_tcp'
+// v4.0.0 TCP forwarding. forward_protocol 'udp' (default) is the historical
+// UDP relay; 'tcp' carries the user's TCP stream reliably over the spoof
+// channel using a reliability engine.
+export type ForwardProtocol = 'udp' | 'tcp'
+export type TcpReliabilityEngine = 'kcp' | 'quic'
+export type ForwardEnginePreset = 'interactive' | 'balanced' | 'lossy'
 
 export interface Tunnel {
   id: number
@@ -91,6 +97,13 @@ export interface Tunnel {
   mtu?: number
   max_connections?: number
   idle_timeout?: number
+  // TCP forwarding (v4.0.0), shared by both roles. forward_protocol 'udp'
+  // (default) leaves the other three inert. forward_engine_tuning is an
+  // optional JSON blob of Advanced overrides ('' = pure preset).
+  forward_protocol?: ForwardProtocol
+  tcp_reliability_engine?: TcpReliabilityEngine
+  forward_engine_preset?: ForwardEnginePreset
+  forward_engine_tuning?: string
   // Multi-port: the full authoritative list of application ports this
   // tunnel carries (INCLUDING the main port from local_listen_addr /
   // forward_target), with a fixed 1:1 same-number mapping on both sides.

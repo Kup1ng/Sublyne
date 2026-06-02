@@ -46,6 +46,11 @@ const TUNNEL_INPUT_FIELDS = [
   'idle_timeout',
   'icmp_echo_mode',
   'ports',
+  // TCP forwarding (v4.0.0), shared by both roles.
+  'forward_protocol',
+  'tcp_reliability_engine',
+  'forward_engine_preset',
+  'forward_engine_tuning',
   // client-side optional
   'local_listen_addr',
   'download_receive_port',
