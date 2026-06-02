@@ -209,13 +209,15 @@ jobs:
         with:
           # Phase 2 introduces net/http and BurntSushi/toml, which
           # between them reach encoding/asn1, crypto/tls,
-          # crypto/x509, encoding/pem, and net/url. The known
-          # stdlib vulnerabilities reachable from those packages
-          # are only fully resolved in go1.25.8+, so the CI
-          # toolchain runs on 1.25. The go.mod directive stays at
-          # 1.23 — it's a minimum, not the toolchain version, and
-          # 1.25 satisfies it.
+          # crypto/x509, encoding/pem, and net/url. New stdlib
+          # advisories land in patch releases (e.g. GO-2026-5037/5039,
+          # fixed in go1.25.11), so we run the CI toolchain on the
+          # LATEST 1.25.x — check-latest forces setup-go to fetch it
+          # rather than reuse a cached older patch that govulncheck
+          # would then flag. The go.mod directive stays at 1.23 — it's
+          # a minimum, not the toolchain version, and 1.25 satisfies it.
           go-version: '1.25'
+          check-latest: true
           cache-dependency-path: control-plane/go.sum
 
       - name: gofmt -l
