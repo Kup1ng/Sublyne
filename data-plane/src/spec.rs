@@ -347,6 +347,11 @@ pub enum SpecError {
     /// TCP stream as best-effort UDP, which would corrupt it.
     #[error("forward_protocol=tcp with engine {0:?} is not available in this build")]
     ForwardEngineUnavailable(TcpReliabilityEngine),
+    /// `forward_protocol=tcp` on a multi-port tunnel. Multi-port TCP
+    /// forwarding (one engine instance per app port) lands in a follow-up;
+    /// single-port TCP forwarding works today.
+    #[error("multi-port TCP forwarding is not yet supported; use a single port")]
+    ForwardMultiportUnsupported,
     /// A client tunnel spec carried both `wireguard_fwmark != 0` and a
     /// `socks5_target` block. The two upload paths are mutually
     /// exclusive — the Go control plane never sets both, but the
@@ -390,14 +395,19 @@ impl TunnelSpec {
             return Err(SpecError::MtuTooSmall(self.mtu));
         }
 
-        // v4.0.0: TCP forwarding. The KCP and QUIC engines are wired in
-        // follow-up commits; until then a `tcp` spec is refused with a
-        // clear error rather than silently relaying the byte stream as
-        // best-effort UDP (which would corrupt it on the first loss).
+        // v4.0.0: TCP forwarding. KCP (single-port) is wired; QUIC and
+        // multi-port TCP forwarding land in follow-ups and are refused
+        // with a clear error until then — better than silently relaying
+        // the byte stream as best-effort UDP (which corrupts it on loss).
         if self.forward_protocol == ForwardProtocol::Tcp {
-            return Err(SpecError::ForwardEngineUnavailable(
-                self.tcp_reliability_engine,
-            ));
+            if self.tcp_reliability_engine == TcpReliabilityEngine::Quic {
+                return Err(SpecError::ForwardEngineUnavailable(
+                    TcpReliabilityEngine::Quic,
+                ));
+            }
+            if self.ports.len() >= 2 {
+                return Err(SpecError::ForwardMultiportUnsupported);
+            }
         }
 
         match self.role {
@@ -638,17 +648,40 @@ mod tests {
     }
 
     #[test]
-    fn forward_tcp_rejected_until_engine_lands() {
-        // PR1 carries the field but refuses a tcp spec rather than
-        // silently relaying as UDP. Replaced per-engine in PR2/PR3.
+    fn forward_tcp_kcp_single_port_ok() {
+        // Single-port TCP forwarding with KCP is wired and validates.
         let mut s = base_client();
         s.forward_protocol = ForwardProtocol::Tcp;
         s.tcp_reliability_engine = TcpReliabilityEngine::Kcp;
+        let r = s.validate().expect("tcp+kcp single-port should validate");
+        assert_eq!(r.forward_protocol, ForwardProtocol::Tcp);
+        assert_eq!(r.tcp_reliability_engine, TcpReliabilityEngine::Kcp);
+    }
+
+    #[test]
+    fn forward_tcp_quic_rejected_until_engine_lands() {
+        // QUIC engine isn't wired yet; refuse rather than mis-forward.
+        let mut s = base_client();
+        s.forward_protocol = ForwardProtocol::Tcp;
+        s.tcp_reliability_engine = TcpReliabilityEngine::Quic;
         assert!(matches!(
             s.validate(),
             Err(SpecError::ForwardEngineUnavailable(
-                TcpReliabilityEngine::Kcp
+                TcpReliabilityEngine::Quic
             ))
+        ));
+    }
+
+    #[test]
+    fn forward_tcp_multiport_rejected() {
+        // Multi-port TCP forwarding lands in a follow-up.
+        let mut s = base_client();
+        s.forward_protocol = ForwardProtocol::Tcp;
+        s.tcp_reliability_engine = TcpReliabilityEngine::Kcp;
+        s.ports = vec![44443, 44444];
+        assert!(matches!(
+            s.validate(),
+            Err(SpecError::ForwardMultiportUnsupported)
         ));
     }
 

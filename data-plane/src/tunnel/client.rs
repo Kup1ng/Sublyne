@@ -44,20 +44,22 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::io::unix::AsyncFd;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::batch::{self, RecvBatch};
+use crate::forward::{self, DatagramSink};
 use crate::hmac::{self, HmacKey, OpenError, SeqWindow};
 use crate::manager::SpawnError;
 use crate::metrics::TunnelMetrics;
 use crate::multiport;
 use crate::protocol::TunnelState;
 use crate::session::{InsertOutcome, SessionTable};
-use crate::spec::{ResolvedSpec, Transport, TunnelSpec};
+use crate::spec::{ForwardProtocol, ResolvedSpec, TcpReliabilityEngine, Transport, TunnelSpec};
 use crate::time_util::now_unix;
 use crate::transport::udp::MAX_UDP_DATAGRAM;
 use crate::transport::{icmp, icmpv6, tcp_syn, udp, ParsedInbound};
@@ -129,6 +131,46 @@ enum PortRouter {
         sessions: Arc<SessionTable>,
     },
     Multi(Arc<HashMap<u16, PortBinding>>),
+    /// `forward_protocol=tcp` (v4.0.0): the verified payload is an inner
+    /// reliability-engine datagram (a KCP segment), not a user UDP packet.
+    /// The verify worker hands it to the engine via this inbox instead of
+    /// delivering it to a UDP listener; the engine reconstructs the TCP
+    /// stream and writes it to the user socket. Single-port only for now
+    /// (multi-port TCP forwarding is gated off in `spec::validate`).
+    Tcp {
+        inbox: forward::InboundTx,
+    },
+}
+
+/// Client-side [`DatagramSink`]: the reliability engine's outbound
+/// datagrams leave through the tunnel's upload transport (WireGuard /
+/// SOCKS5), exactly like a user UDP payload would. Upload metering mirrors
+/// the UDP path so the dashboard's bytes-out counter is unchanged.
+struct ClientForwardSink {
+    upload: Arc<dyn UploadTransport>,
+    session: SessionKey,
+    max_payload: usize,
+    metrics: Arc<TunnelMetrics>,
+}
+
+#[async_trait]
+impl DatagramSink for ClientForwardSink {
+    async fn send(&self, datagram: &[u8]) -> io::Result<bool> {
+        match self.upload.send(self.session, datagram).await {
+            Ok(true) => {
+                self.metrics.record_upload(datagram.len(), now_unix());
+                Ok(true)
+            }
+            Ok(false) => {
+                self.metrics.record_upload_drop();
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn max_payload(&self) -> usize {
+        self.max_payload
+    }
 }
 
 /// Process-wide sampled counter for multi-port download packets whose
@@ -218,6 +260,64 @@ pub(super) async fn spawn(
     let upload_transport = crate::upload::build_for_client_spec(spec, resolved, stop_rx.clone())
         .await
         .map_err(SpawnError::Io)?;
+
+    // v4.0.0 TCP forwarding (single-port, KCP). Terminate the user's TCP
+    // on `local`, carry the byte stream over the reliability engine, and
+    // route the download verify workers' verified segments into the engine
+    // inbox. `spec::validate` guarantees single-port + KCP here (QUIC and
+    // multi-port TCP forwarding are gated off until their follow-ups land).
+    if resolved.forward_protocol == ForwardProtocol::Tcp
+        && spec.tcp_reliability_engine == TcpReliabilityEngine::Kcp
+    {
+        let tcp_listener = bind_dualstack_tcp(local)
+            .map_err(|e| SpawnError::Io(crate::perf::bind_err(e, "client/tcp-listen", local)))?;
+        crate::perf::tune_socket(&tcp_listener, "client/tcp-listen");
+        info!(tunnel_id = id, addr = %local, family = address_family_label(local),
+            "client: TCP-forward listener bound (KCP engine)");
+        let (inbox_tx, inbox_rx) = forward::inbound_channel();
+        let sink = Arc::new(ClientForwardSink {
+            upload: upload_transport.clone(),
+            session: SessionKey {
+                client_addr: local,
+                local_port: local.port(),
+            },
+            max_payload: (spec.mtu as usize).saturating_sub(multiport::PORT_TAG_LEN),
+            metrics: metrics.clone(),
+        });
+        let engine = forward::KcpEngine::new(
+            forward::EngineConfig {
+                tunnel_id: id,
+                idle_timeout_sec: spec.idle_timeout_sec,
+                tuning: resolved.forward_kcp.unwrap_or_default(),
+            },
+            forward::EngineRole::Client {
+                listener: tcp_listener,
+            },
+            sink,
+        );
+        tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
+
+        // The download pipeline feeds the engine inbox instead of a UDP
+        // listener. No UDP listener, idle sweeper, or ping-smoothing
+        // responder on this path: "sessions" are the engine's convs, and
+        // ping smoothing only applies to an end-user UDP/ICMP listener.
+        spawn_download_pipeline(
+            tasks,
+            spec,
+            resolved,
+            id,
+            name.clone(),
+            PortRouter::Tcp { inbox: inbox_tx },
+            mutable_config.clone(),
+            metrics.clone(),
+            download_port,
+            state.clone(),
+            error_reason.clone(),
+            stop_rx.clone(),
+        )
+        .await?;
+        return Ok(upload_transport);
+    }
 
     // Multi-port vs single-port routing. A multi-port tunnel binds one
     // listener + one session table PER application port (all sharing the
@@ -397,6 +497,28 @@ fn bind_dualstack_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
     UdpSocket::from_std(sock.into())
+}
+
+/// Bind a TCP listener on `addr` for the `forward_protocol=tcp` path,
+/// enabling dual-stack for IPv6 wildcards (same rationale as
+/// [`bind_dualstack_udp`]). Returns a tokio `TcpListener`.
+fn bind_dualstack_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(false)?;
+    }
+    // A stopped+restarted tunnel must re-bind its listen port without
+    // waiting out TIME_WAIT.
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    TcpListener::from_std(sock.into())
 }
 
 /// Upload listener task. When `tag_port` is `None` (single-port) the
@@ -986,6 +1108,18 @@ async fn deliver_verified_job(
     let verify_result = hmac::open_with(psk, sealed, window);
     match verify_result {
         Ok(payload) => {
+            // TCP forwarding: the verified payload is an inner reliability-
+            // engine datagram (a KCP segment), not a user UDP packet. Record
+            // the activity (so the health badge reflects real download
+            // traffic) and hand it to the engine, which reconstructs the TCP
+            // stream and writes it to the user socket. Drop on a full inbox —
+            // the inner protocol retransmits.
+            if let PortRouter::Tcp { inbox } = router {
+                metrics.record_download(payload.len(), now_unix());
+                metrics.record_transport_packet(transport_label);
+                let _ = inbox.try_send(payload.to_vec());
+                return;
+            }
             // Resolve the delivery target. Single-port: deliver the whole
             // verified payload via the one listener (wire-identical to
             // before). Multi-port: decode the authenticated 2-byte
@@ -1029,6 +1163,11 @@ async fn deliver_verified_job(
                             return;
                         }
                     }
+                }
+                // The TCP-forward case returned above; this match only
+                // resolves UDP delivery targets.
+                PortRouter::Tcp { .. } => {
+                    unreachable!("tcp forwarding is delivered to the engine inbox earlier")
                 }
             };
             deliver_to_end_user(
