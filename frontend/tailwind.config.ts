@@ -72,6 +72,14 @@ export default {
           '0%': { opacity: '0', transform: 'translateY(2px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
+        // Modal/dialog entrance: a gentle fade + slight scale + rise so
+        // the panel eases in instead of popping. Paired with the overlay
+        // opacity transition in AppDialog. Honours prefers-reduced-motion
+        // via the global rule in main.css.
+        popIn: {
+          '0%': { opacity: '0', transform: 'translateY(8px) scale(0.97)' },
+          '100%': { opacity: '1', transform: 'translateY(0) scale(1)' },
+        },
         sheen: {
           '0%, 100%': { backgroundPosition: '0% 50%' },
           '50%': { backgroundPosition: '100% 50%' },
@@ -80,6 +88,7 @@ export default {
       animation: {
         pulseSoft: 'pulseSoft 2.4s ease-in-out infinite',
         fadeIn: 'fadeIn 160ms ease-out both',
+        popIn: 'popIn 180ms cubic-bezier(0.16, 1, 0.3, 1) both',
         sheen: 'sheen 8s ease-in-out infinite',
       },
     },

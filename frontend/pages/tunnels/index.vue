@@ -1,27 +1,63 @@
 <script setup lang="ts">
 import { Cable, Plus, Play, Square, Pencil, Download, Copy, Upload } from 'lucide-vue-next'
-import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useDrawer } from '~/composables/useDrawer'
 import { useMetrics } from '~/composables/useMetrics'
 import { useTunnels } from '~/composables/useTunnels'
 import { useTunnelActions } from '~/composables/useTunnelActions'
 import type { Tunnel } from '~/types/api'
 import TunnelExportDialog from '~/components/tunnel/TunnelExportDialog.vue'
+import TunnelFormDialog from '~/components/tunnel/TunnelFormDialog.vue'
 import TunnelImportDialog from '~/components/tunnel/TunnelImportDialog.vue'
 import { formatBitsPerSecond, formatNumber } from '~/utils/format'
 
+const route = useRoute()
 const router = useRouter()
 const tunnels = useTunnels()
 const metrics = useMetrics()
 const actions = useTunnelActions()
 const drawer = useDrawer()
 
+// --- create / edit modal -------------------------------------------
+// The tunnel form is a popup over this list (no navigation). A null
+// editId means "new"; a number means "edit that tunnel".
+const showForm = ref(false)
+const editId = ref<number | null>(null)
+
+function openCreate() {
+  editId.value = null
+  showForm.value = true
+}
+function openEdit(t: { id: number }) {
+  editId.value = t.id
+  showForm.value = true
+}
+
+// /tunnels/new and /tunnels/:id are kept as thin redirects that bounce
+// here with ?new=1 / ?edit=:id so bookmarks and cross-page links (the
+// dashboard CTA, tunnel cards) still work. Consume that intent, open the
+// matching modal, then scrub the query so a refresh or Back won't re-pop
+// it. The watch covers the case where this page is already mounted when
+// the redirect arrives.
+function consumeQueryIntent() {
+  if (route.query.new !== undefined) {
+    openCreate()
+    router.replace('/tunnels')
+  } else if (route.query.edit !== undefined) {
+    const id = Number(route.query.edit)
+    if (Number.isFinite(id)) openEdit({ id })
+    router.replace('/tunnels')
+  }
+}
+
 onMounted(async () => {
   metrics.connect()
   metrics.fetchLatest()
   await tunnels.refresh()
+  consumeQueryIntent()
 })
+watch(() => [route.query.new, route.query.edit], consumeQueryIntent)
 
 const rates = metrics.rates
 
@@ -48,12 +84,14 @@ function openExport(t: Tunnel) {
 
 async function onClone(t: Tunnel) {
   const created = await actions.clone(t.id)
-  if (created) router.push(`/tunnels/${created.id}`)
+  // Clone lands stopped — open it in the modal so the operator can
+  // resolve port clashes / review it before starting.
+  if (created) openEdit(created)
 }
 
 async function onImported(tunnel: Tunnel) {
   await tunnels.refresh()
-  router.push(`/tunnels/${tunnel.id}`)
+  openEdit(tunnel)
 }
 </script>
 
@@ -64,12 +102,10 @@ async function onImported(tunnel: Tunnel) {
         <Upload class="size-4" />
         Import
       </AppButton>
-      <NuxtLink to="/tunnels/new">
-        <AppButton size="sm">
-          <Plus class="size-4" />
-          New tunnel
-        </AppButton>
-      </NuxtLink>
+      <AppButton size="sm" @click="openCreate">
+        <Plus class="size-4" />
+        New tunnel
+      </AppButton>
     </template>
   </Topbar>
 
@@ -80,12 +116,10 @@ async function onImported(tunnel: Tunnel) {
     description="Add a Client or Remote tunnel and pair it with the matching server."
   >
     <template #actions>
-      <NuxtLink to="/tunnels/new">
-        <AppButton>
-          <Plus class="size-4" />
-          Create tunnel
-        </AppButton>
-      </NuxtLink>
+      <AppButton @click="openCreate">
+        <Plus class="size-4" />
+        Create tunnel
+      </AppButton>
     </template>
   </EmptyState>
 
@@ -111,7 +145,13 @@ async function onImported(tunnel: Tunnel) {
             class="border-b border-line/60 last:border-b-0 hover:bg-elevated/50"
           >
             <td class="px-5 py-3.5 font-medium text-ink">
-              <NuxtLink :to="`/tunnels/${t.id}`" class="hover:text-brand">{{ t.name }}</NuxtLink>
+              <button
+                type="button"
+                class="text-left transition hover:text-brand"
+                @click="openEdit(t)"
+              >
+                {{ t.name }}
+              </button>
             </td>
             <td class="px-5 py-3.5 font-mono text-[12.5px] text-subtle">
               {{ t.role === 'client' ? t.local_listen_addr : t.upload_listen_addr }}
@@ -173,11 +213,15 @@ async function onImported(tunnel: Tunnel) {
                 >
                   <Copy v-if="!actions.isBusy(t.id)" class="size-3.5" />
                 </AppButton>
-                <NuxtLink :to="`/tunnels/${t.id}`">
-                  <AppButton size="sm" variant="ghost">
-                    <Pencil class="size-3.5" />
-                  </AppButton>
-                </NuxtLink>
+                <AppButton
+                  size="sm"
+                  variant="ghost"
+                  aria-label="Edit tunnel"
+                  title="Edit tunnel"
+                  @click="openEdit(t)"
+                >
+                  <Pencil class="size-3.5" />
+                </AppButton>
               </div>
             </td>
           </tr>
@@ -186,6 +230,7 @@ async function onImported(tunnel: Tunnel) {
     </div>
   </AppCard>
 
+  <TunnelFormDialog v-model:open="showForm" :tunnel-id="editId" />
   <TunnelImportDialog v-model:open="showImport" @imported="onImported" />
   <TunnelExportDialog v-if="exportTarget" v-model:open="showExport" :tunnel="exportTarget" />
 </template>

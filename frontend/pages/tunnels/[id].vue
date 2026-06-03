@@ -1,122 +1,19 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { ApiError } from '~/composables/useApi'
-import { useDrawer } from '~/composables/useDrawer'
-import { useToast } from '~/composables/useToast'
-import { useTunnels } from '~/composables/useTunnels'
-import type { Tunnel } from '~/types/api'
-
-const route = useRoute()
-const router = useRouter()
-const tunnels = useTunnels()
-const toast = useToast()
-const drawer = useDrawer()
-
-const id = Number(route.params.id)
-const current = ref<Tunnel | null>(null)
-const submitting = ref(false)
-const errors = ref<Record<string, string>>({})
-const confirmDelete = ref(false)
-
-onMounted(async () => {
-  try {
-    current.value = await tunnels.get(id)
-  } catch (e) {
-    toast.error('Tunnel not found', (e as Error).message)
-    router.push('/tunnels')
-  }
+// The tunnel edit form is now a modal on the /tunnels listing (v3.1.0).
+// This route is kept only as a thin redirect so existing links, tunnel
+// cards' edit buttons, and bookmarks to /tunnels/:id keep working: it
+// bounces to the listing and signals it (via ?edit=:id) to auto-open
+// the edit modal for that tunnel.
+definePageMeta({
+  middleware(to) {
+    return navigateTo(
+      { path: '/tunnels', query: { edit: String(to.params.id) } },
+      { replace: true },
+    )
+  },
 })
-
-async function onSubmit(value: Partial<Tunnel>) {
-  submitting.value = true
-  errors.value = {}
-  try {
-    // Reconcile the runtime state with the saved "enabled" flag so
-    // toggling the switch on the edit form actually starts or stops
-    // the dataplane — the PUT itself only updates the DB row.
-    const wasEnabled = current.value?.enabled === true
-    const wantsEnabled = value.enabled === true
-    const t = await tunnels.update(id, value)
-    current.value = t
-    if (wantsEnabled !== wasEnabled) {
-      try {
-        if (wantsEnabled) await tunnels.start(id)
-        else await tunnels.stop(id)
-      } catch (lifecycleErr) {
-        toast.error(
-          wantsEnabled ? 'Saved but could not start' : 'Saved but could not stop',
-          (lifecycleErr as Error).message,
-        )
-        return
-      }
-    }
-    // Surface the backend's hot-reload envelope so a change that needs a
-    // Stop/Start (e.g. a listen-address edit on a running tunnel) isn't
-    // silently reported as a plain "Saved", and a failed live reload is
-    // not swallowed.
-    if (t.dataplane_error) {
-      toast.error('Saved, but the live update failed', t.dataplane_error)
-    } else if (t.restart_required) {
-      toast.info(
-        'Saved — restart needed to apply',
-        t.restart_required_message || 'Stop and Start this tunnel for the change to take effect.',
-      )
-    } else {
-      toast.success('Saved')
-    }
-  } catch (e) {
-    if (e instanceof ApiError) {
-      errors.value = e.fields
-      toast.error('Save failed', e.message)
-    } else {
-      toast.error('Save failed', (e as Error).message)
-    }
-  } finally {
-    submitting.value = false
-  }
-}
-
-async function doDelete() {
-  try {
-    await tunnels.remove(id)
-    toast.success('Tunnel deleted')
-    router.push('/tunnels')
-  } catch (e) {
-    toast.error('Delete failed', (e as Error).message)
-  } finally {
-    confirmDelete.value = false
-  }
-}
 </script>
 
 <template>
-  <Topbar
-    :title="current?.name || 'Tunnel'"
-    subtitle="Edit fields and save. Hot-reload applies most changes without dropping traffic."
-    @open-menu="drawer.show"
-  />
-
-  <TunnelForm
-    v-if="current"
-    :initial="current"
-    :submitting="submitting"
-    :errors="errors"
-    :on-delete="() => (confirmDelete = true)"
-    @submit="onSubmit"
-  />
-
-  <AppDialog
-    v-model:open="confirmDelete"
-    title="Delete tunnel?"
-    description="This stops the listener immediately and removes the configuration. Cannot be undone."
-  >
-    <p class="text-[13px] text-subtle">
-      Confirming deletes <span class="font-semibold text-ink">{{ current?.name }}</span> from this server.
-      The matching tunnel on the other side stays intact until you delete it there too.
-    </p>
-    <template #footer>
-      <AppButton variant="secondary" @click="confirmDelete = false">Cancel</AppButton>
-      <AppButton variant="danger" @click="doDelete">Delete tunnel</AppButton>
-    </template>
-  </AppDialog>
+  <div />
 </template>
