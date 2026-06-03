@@ -301,10 +301,10 @@ jobs:
           node-version: '20'
 
       - name: pnpm install
-        # The repo's first push doesn't carry a lockfile — pnpm generates
-        # one on this run. Later commits can switch to --frozen-lockfile
-        # once a lockfile is in source control.
-        run: pnpm install --no-frozen-lockfile
+        # The lockfile (frontend/pnpm-lock.yaml) is committed, so the PR gate
+        # uses --frozen-lockfile to match build.sh / release.yml — lockfile
+        # drift then fails at PR time instead of silently diverging at release.
+        run: pnpm install --frozen-lockfile
 
       - name: pnpm lint
         run: pnpm lint

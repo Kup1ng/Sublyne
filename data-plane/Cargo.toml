@@ -2,7 +2,7 @@
 name = "sublyne-dataplane"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.88"
 description = "Sublyne data plane (UDP / TCP-SYN / ICMP / ICMPv6 spoof transports, HMAC-authenticated)"
 license = "MIT"
 repository = "https://github.com/Kup1ng/Sublyne"
@@ -108,8 +108,8 @@ rcgen = { version = "0.14", default-features = false, features = [
     "ring",
 ] }
 
-# `async fn` in traits via the standard proc-macro shim. Rust 1.83
-# supports native async fn in traits, but the trait-object form
+# `async fn` in traits via the standard proc-macro shim. Native async fn
+# in traits has been stable since 1.75, but the trait-object form
 # (`Arc<dyn UploadTransport>`) still needs the `async_trait` adapter
 # because async fns in traits aren't yet dyn-safe on stable. The crate
 # is tiny and adds no runtime cost beyond one extra heap allocation
