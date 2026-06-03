@@ -107,6 +107,13 @@ type tunnelDTO struct {
 	IdleTimeout             int    `json:"idle_timeout"`
 	IcmpEchoMode            string `json:"icmp_echo_mode"`
 
+	// TCP forwarding (v4.0.0). ForwardProtocol 'udp' (default) leaves the
+	// other three inert. See tunnels/forward.go.
+	ForwardProtocol      string `json:"forward_protocol"`
+	TCPReliabilityEngine string `json:"tcp_reliability_engine"`
+	ForwardEnginePreset  string `json:"forward_engine_preset"`
+	ForwardEngineTuning  string `json:"forward_engine_tuning"`
+
 	// Ports (v2.5.0 multi-port): the full authoritative list of
 	// application ports this tunnel carries. Empty / absent = legacy
 	// single-port. Returned as the parsed array on read.
@@ -160,6 +167,10 @@ func toDTO(t tunnels.Tunnel, redactPSK bool) tunnelDTO {
 		MaxConnections:          t.MaxConnections,
 		IdleTimeout:             t.IdleTimeout,
 		IcmpEchoMode:            string(t.IcmpEchoMode),
+		ForwardProtocol:         string(t.ForwardProtocol),
+		TCPReliabilityEngine:    string(t.TCPReliabilityEngine),
+		ForwardEnginePreset:     t.ForwardEnginePreset,
+		ForwardEngineTuning:     t.ForwardEngineTuning,
 		Ports:                   t.Ports,
 		UploadMode:              string(t.UploadMode),
 		UploadListenMode:        string(t.UploadListenMode),
@@ -173,6 +184,15 @@ func toDTO(t tunnels.Tunnel, redactPSK bool) tunnelDTO {
 	}
 	if d.UploadListenMode == "" {
 		d.UploadListenMode = string(tunnels.UploadListenModeUDP)
+	}
+	if d.ForwardProtocol == "" {
+		d.ForwardProtocol = string(tunnels.ForwardProtocolUDP)
+	}
+	if d.TCPReliabilityEngine == "" {
+		d.TCPReliabilityEngine = string(tunnels.TCPEngineKCP)
+	}
+	if d.ForwardEnginePreset == "" {
+		d.ForwardEnginePreset = string(tunnels.PresetBalanced)
 	}
 	if redactPSK {
 		d.PSK = RedactedPSK
@@ -255,6 +275,14 @@ type tunnelInput struct {
 	IdleTimeout             int     `json:"idle_timeout"`
 	IcmpEchoMode            string  `json:"icmp_echo_mode"`
 
+	// TCP forwarding (v4.0.0). Omit forward_protocol (or send empty) and
+	// applyDefaults coerces to 'udp' so a pre-v4 panel build posting the
+	// same JSON shape keeps working.
+	ForwardProtocol      string `json:"forward_protocol"`
+	TCPReliabilityEngine string `json:"tcp_reliability_engine"`
+	ForwardEnginePreset  string `json:"forward_engine_preset"`
+	ForwardEngineTuning  string `json:"forward_engine_tuning"`
+
 	// Ports (v2.5.0 multi-port): the full authoritative list of
 	// application ports. Absent or [] means single-port; the validator
 	// enforces range / dedup / cap / canonical-membership when present.
@@ -321,6 +349,19 @@ func (in *tunnelInput) applyDefaults() {
 	if in.UploadListenMode == "" {
 		in.UploadListenMode = string(tunnels.DefaultListenMode(dt))
 	}
+	// TCP-forwarding defaults: a minimal body (or an import / pre-v4
+	// clone) lands on UDP forwarding with KCP/balanced parked at valid
+	// values so the row's CHECK constraints hold even though they're
+	// inert until forward_protocol is switched to 'tcp'.
+	if in.ForwardProtocol == "" {
+		in.ForwardProtocol = string(tunnels.ForwardProtocolUDP)
+	}
+	if in.TCPReliabilityEngine == "" {
+		in.TCPReliabilityEngine = string(tunnels.TCPEngineKCP)
+	}
+	if in.ForwardEnginePreset == "" {
+		in.ForwardEnginePreset = string(tunnels.PresetBalanced)
+	}
 }
 
 // toTunnel converts the wire input into the persistence struct. The
@@ -339,6 +380,10 @@ func (in *tunnelInput) toTunnel(role tunnels.Role, psk string) tunnels.Tunnel {
 		MaxConnections:          in.MaxConnections,
 		IdleTimeout:             in.IdleTimeout,
 		IcmpEchoMode:            tunnels.IcmpEchoMode(in.IcmpEchoMode),
+		ForwardProtocol:         tunnels.ForwardProtocol(in.ForwardProtocol),
+		TCPReliabilityEngine:    tunnels.TCPEngine(in.TCPReliabilityEngine),
+		ForwardEnginePreset:     in.ForwardEnginePreset,
+		ForwardEngineTuning:     in.ForwardEngineTuning,
 		Ports:                   in.Ports,
 		UploadMode:              tunnels.UploadMode(in.UploadMode),
 		UploadListenMode:        tunnels.UploadListenMode(in.UploadListenMode),
@@ -1005,9 +1050,15 @@ const (
 	// rejects any body whose `type` differs, which also rejects the
 	// pre-v2.7.0 bare {"tunnel": …} shape (it has no `type`).
 	ExportType = "sublyne-tunnel-export"
-	// ExportSchemaVersion is the current envelope schema. Import accepts
-	// only this exact value.
-	ExportSchemaVersion = 1
+	// ExportSchemaVersion is the current envelope schema. Bumped to 2 in
+	// v4.0.0 when the four TCP-forwarding fields were added to the export
+	// body. Import accepts this value and the older schema 1 (whose
+	// exports simply lack the forward fields → UDP forwarding on import).
+	ExportSchemaVersion = 2
+	// MinImportSchemaVersion is the oldest export schema this build can
+	// read. Schema 1 (pre-v4) is forward-compatible: the missing TCP
+	// fields default to UDP forwarding.
+	MinImportSchemaVersion = 1
 )
 
 // tunnelExportBody is the portable, by-name shape of a tunnel inside an
@@ -1028,6 +1079,13 @@ type tunnelExportBody struct {
 	MTU                     int    `json:"mtu"`
 	MaxConnections          int    `json:"max_connections"`
 	IdleTimeout             int    `json:"idle_timeout"`
+
+	// TCP forwarding (v4.0.0 / export schema 2). Absent in a schema-1
+	// export, which import reads as UDP forwarding (the pre-v4 default).
+	ForwardProtocol      string `json:"forward_protocol"`
+	TCPReliabilityEngine string `json:"tcp_reliability_engine"`
+	ForwardEnginePreset  string `json:"forward_engine_preset"`
+	ForwardEngineTuning  string `json:"forward_engine_tuning"`
 
 	Ports []int `json:"ports"`
 
@@ -1089,6 +1147,10 @@ func buildExportBody(ctx context.Context, deps TunnelDeps, t tunnels.Tunnel, sec
 		MTU:                     t.MTU,
 		MaxConnections:          t.MaxConnections,
 		IdleTimeout:             t.IdleTimeout,
+		ForwardProtocol:         string(t.ForwardProtocol),
+		TCPReliabilityEngine:    string(t.TCPReliabilityEngine),
+		ForwardEnginePreset:     t.ForwardEnginePreset,
+		ForwardEngineTuning:     t.ForwardEngineTuning,
 		Ports:                   t.Ports,
 		UploadMode:              string(t.UploadMode),
 		UploadListenMode:        string(t.UploadListenMode),
@@ -1241,11 +1303,11 @@ func ImportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 			}})
 			return
 		}
-		if envelope.SchemaVersion != ExportSchemaVersion {
+		if envelope.SchemaVersion < MinImportSchemaVersion || envelope.SchemaVersion > ExportSchemaVersion {
 			writeValidationError(w, &tunnels.ValidationError{Fields: map[string]string{
 				"file": fmt.Sprintf(
-					"This export was made by a different Sublyne version (schema %d). This Sublyne understands version %d.",
-					envelope.SchemaVersion, ExportSchemaVersion),
+					"This export was made by a different Sublyne version (schema %d). This Sublyne understands versions %d-%d.",
+					envelope.SchemaVersion, MinImportSchemaVersion, ExportSchemaVersion),
 			}})
 			return
 		}
@@ -1274,6 +1336,10 @@ func ImportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 			MaxConnections:          body.MaxConnections,
 			IdleTimeout:             body.IdleTimeout,
 			IcmpEchoMode:            body.IcmpEchoMode,
+			ForwardProtocol:         body.ForwardProtocol,
+			TCPReliabilityEngine:    body.TCPReliabilityEngine,
+			ForwardEnginePreset:     body.ForwardEnginePreset,
+			ForwardEngineTuning:     body.ForwardEngineTuning,
 			Ports:                   body.Ports,
 			LocalListenAddr:         body.LocalListenAddr,
 			DownloadReceivePort:     body.DownloadReceivePort,

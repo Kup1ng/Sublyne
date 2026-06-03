@@ -15,8 +15,9 @@ const showExport = ref(false)
 
 async function onClone() {
   const created = await actions.clone(props.tunnel.id)
-  // Created stopped — open it so the operator can resolve port clashes / edit.
-  if (created) router.push(`/tunnels/${created.id}`)
+  // Created stopped — open it on the Tunnels page (where the edit modal
+  // lives) so the operator can resolve port clashes / edit.
+  if (created) router.push(`/tunnels?edit=${created.id}`)
 }
 
 // A disabled tunnel reads "Stopped" (pairs with the Start button); an
@@ -45,7 +46,7 @@ const portsLabel = computed(() => {
   <div class="surface-card group p-5 transition hover:border-line/100">
     <div class="flex items-start justify-between gap-3">
       <NuxtLink
-        :to="`/tunnels/${tunnel.id}`"
+        :to="`/tunnels?edit=${tunnel.id}`"
         class="flex min-w-0 items-center gap-3 outline-none"
       >
         <div class="grid size-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand">
@@ -141,7 +142,7 @@ const portsLabel = computed(() => {
       >
         <Copy v-if="!actions.isBusy(tunnel.id)" class="size-3.5" />
       </AppButton>
-      <NuxtLink :to="`/tunnels/${tunnel.id}`" aria-label="Edit tunnel">
+      <NuxtLink :to="`/tunnels?edit=${tunnel.id}`" aria-label="Edit tunnel">
         <AppButton size="sm" variant="ghost" aria-label="Edit tunnel">
           <Pencil class="size-3.5" />
         </AppButton>

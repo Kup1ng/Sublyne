@@ -89,6 +89,10 @@ fn client_spec(cfg: &LoopbackConfig, psk: &str) -> TunnelSpec {
         socks5_target: None,
         upload_listen_mode: sublyne_dataplane::spec::UploadListenMode::Udp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     }
 }
 
@@ -120,6 +124,10 @@ fn remote_spec(cfg: &LoopbackConfig, psk: &str) -> TunnelSpec {
         socks5_target: None,
         upload_listen_mode: sublyne_dataplane::spec::UploadListenMode::Udp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     }
 }
 
@@ -422,6 +430,10 @@ async fn loopback_idle_resume_picks_freshest_session() {
         socks5_target: None,
         upload_listen_mode: sublyne_dataplane::spec::UploadListenMode::Udp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     };
     let remote_spec = TunnelSpec {
         id: 502,
@@ -450,6 +462,10 @@ async fn loopback_idle_resume_picks_freshest_session() {
         socks5_target: None,
         upload_listen_mode: sublyne_dataplane::spec::UploadListenMode::Udp,
         ports: Vec::new(),
+        forward_protocol: sublyne_dataplane::spec::ForwardProtocol::Udp,
+        tcp_reliability_engine: sublyne_dataplane::spec::TcpReliabilityEngine::Kcp,
+        forward_kcp: None,
+        forward_quic: None,
     };
 
     mgr.start_tunnel(remote_spec).await.expect("start remote");

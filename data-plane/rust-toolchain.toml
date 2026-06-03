@@ -1,10 +1,10 @@
 [toolchain]
-# Pinned to 1.85.0 — first stable with Cargo's `edition2024` feature,
-# which the constant_time_eq v0.4.2 transitive dep requires. Matches
-# the toolchain set by .github/workflows/{ci,release}.yml. Bump
-# deliberately when we're ready to re-format the codebase or accept
-# a new lockfile baseline.
-channel = "1.85.0"
+# Bumped to 1.88.0 for v4.0.0: the QUIC forwarding engine pulls quinn +
+# rustls + rcgen, whose current releases (rcgen 0.14.8, time 0.3.47, …)
+# set MSRV 1.88. 1.88 still ships edition2024 (1.85+), so the original
+# constant_time_eq reason is unaffected. Matches the toolchain set by
+# .github/workflows/{ci,release}.yml — keep them in lockstep.
+channel = "1.88.0"
 targets = ["x86_64-unknown-linux-musl"]
 components = ["rustfmt", "clippy"]
 profile = "minimal"

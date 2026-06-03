@@ -106,6 +106,18 @@ type TunnelSpec struct {
 	// DownloadTransport is not icmp or icmpv6.
 	IcmpEchoMode string `json:"icmp_echo_mode,omitempty"`
 
+	// TCP forwarding (v4.0.0) — shared by both roles. ForwardProtocol is
+	// "udp" (default, omitted) or "tcp". When "tcp", TCPReliabilityEngine
+	// is "kcp" or "quic" and exactly one of KcpTuning / QuicTuning carries
+	// the resolved concrete numbers (preset merged with Advanced
+	// overrides on the Go side). The Rust dataplane consumes the numbers
+	// directly — it has no preset table. Empty / absent ⇒ the dataplane
+	// falls back to its built-in balanced defaults.
+	ForwardProtocol      string      `json:"forward_protocol,omitempty"`
+	TCPReliabilityEngine string      `json:"tcp_reliability_engine,omitempty"`
+	KcpTuning            *KcpTuning  `json:"forward_kcp,omitempty"`
+	QuicTuning           *QuicTuning `json:"forward_quic,omitempty"`
+
 	// Ports (v2.5.0 multi-port) — shared by both roles. The full
 	// authoritative list of application ports this tunnel carries, with a
 	// fixed 1:1 same-number mapping (client :8000 <-> remote :8000).
@@ -167,6 +179,31 @@ type Socks5Target struct {
 	// never hit a still-broken slot. Field is omitted on the wire when
 	// zero; the Rust deserialiser defaults to a sane value (2).
 	MinReadySlots uint32 `json:"min_ready_slots,omitempty"`
+}
+
+// KcpTuning is the concrete KCP parameter set for a tcp-forwarding
+// tunnel whose engine is KCP. Mirrors tunnels.KcpTuning; the Go control
+// plane resolves preset + Advanced overrides into these numbers and the
+// Rust dataplane applies them via ikcp_nodelay / ikcp_wndsize.
+type KcpTuning struct {
+	NoDelay  uint32 `json:"nodelay"`
+	Interval uint32 `json:"interval"`
+	Resend   uint32 `json:"resend"`
+	NC       uint32 `json:"nc"`
+	SndWnd   uint32 `json:"snd_wnd"`
+	RcvWnd   uint32 `json:"rcv_wnd"`
+}
+
+// QuicTuning is the concrete QUIC parameter set for a tcp-forwarding
+// tunnel whose engine is QUIC. Mirrors tunnels.QuicTuning. Congestion is
+// "cubic" | "newreno" | "bbr"; windows are bytes; timings milliseconds.
+type QuicTuning struct {
+	Congestion       string `json:"congestion"`
+	InitialRTTMs     uint32 `json:"initial_rtt_ms"`
+	MaxIdleMs        uint32 `json:"max_idle_ms"`
+	KeepAliveMs      uint32 `json:"keep_alive_ms"`
+	StreamRecvWindow uint64 `json:"stream_recv_window"`
+	ConnRecvWindow   uint64 `json:"conn_recv_window"`
 }
 
 // StopTunnelPayload is the body of a StopTunnel command.

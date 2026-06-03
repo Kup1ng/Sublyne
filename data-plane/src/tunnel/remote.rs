@@ -43,13 +43,18 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
+use async_trait::async_trait;
+
 use crate::batch::{self, SendBatch};
+use crate::forward::{self, DatagramSink};
 use crate::hmac;
 use crate::manager::SpawnError;
 use crate::metrics::TunnelMetrics;
 use crate::multiport;
 use crate::session::{InsertOutcome, SessionTable};
-use crate::spec::{ResolvedSpec, Transport, TunnelSpec, UploadListenMode};
+use crate::spec::{
+    ForwardProtocol, ResolvedSpec, TcpReliabilityEngine, Transport, TunnelSpec, UploadListenMode,
+};
 use crate::time_util::now_unix;
 use crate::transport::udp::MAX_UDP_DATAGRAM;
 use crate::transport::{icmp, icmpv6, tcp_syn, udp};
@@ -215,6 +220,38 @@ pub(super) async fn spawn(
         );
     }
     let icmp_echo_mode = spec.icmp_echo_mode;
+
+    // v4.0.0 TCP forwarding (single- AND multi-port). Replace the UDP
+    // forward/recv flows entirely: client uploads feed the reliability engine
+    // (KCP or QUIC), the engine dials forward_target over TCP, and the
+    // engine's outbound datagrams are sealed + spoofed down to the Client
+    // through the same seal pipeline (one seq stream, one session_id).
+    // `spawn_tcp_forward_remote` builds one engine per app port in multi-port
+    // mode; all per-port engines share that one seal/send pipeline.
+    if resolved.forward_protocol == ForwardProtocol::Tcp {
+        return spawn_tcp_forward_remote(
+            spec,
+            resolved,
+            tasks,
+            stop_rx,
+            mutable_config,
+            session_table,
+            metrics,
+            id,
+            name,
+            seq_counter,
+            icmp_seq_counter,
+            session_id,
+            icmp_identifier,
+            icmp_echo_mode,
+            initial_send_target,
+            send_port,
+            client_ip,
+            forward_target,
+            upload_listen,
+        )
+        .await;
+    }
 
     // (2) Forward-target socket. Bind on the same family as the forward
     // target so v6 forward_target works. The download path uses this
@@ -399,6 +436,609 @@ fn address_family_label(addr: SocketAddr) -> &'static str {
         "ipv6"
     } else {
         "ipv4"
+    }
+}
+
+/// Remote-side [`DatagramSink`]: the reliability engine's outbound
+/// datagrams (KCP segments / QUIC packets produced from `forward_target`'s
+/// reply stream) are sealed + spoofed down to the Client through the same
+/// seal pipeline the UDP path uses. Each datagram is assigned the next
+/// monotonic `hmac_seq` and routed to `seal_txs[seq % N]`, identical to the
+/// UDP recv loop, so wire FIFO and the single send socket are preserved.
+///
+/// On a multi-port tunnel `tag` is `Some(port)` and each datagram is
+/// prefixed with the 2-byte application-port tag (inside the seal, so the
+/// tag is HMAC-authenticated for free) before it enters the shared seal
+/// pipeline — that is what lets the Client demux this engine's segments to
+/// the right port. Single-port leaves `tag` `None` and seals the datagram
+/// opaque, wire-identical to before. Every port's engine shares the SAME
+/// `seal_txs` + `seq_counter`, so there is ONE seq stream + ONE session_id +
+/// ONE send socket for the whole tunnel regardless of port count.
+struct RemoteForwardSink {
+    seal_txs: Vec<mpsc::Sender<DownloadSpoofJob>>,
+    seq_counter: Arc<std::sync::atomic::AtomicU64>,
+    icmp_seq_counter: Arc<std::sync::atomic::AtomicU32>,
+    max_payload: usize,
+    metrics: Arc<TunnelMetrics>,
+    tag: Option<u16>,
+}
+
+#[async_trait]
+impl DatagramSink for RemoteForwardSink {
+    async fn send(&self, datagram: &[u8]) -> io::Result<bool> {
+        use std::sync::atomic::Ordering;
+        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
+        let icmp_seq = self.icmp_seq_counter.fetch_add(1, Ordering::Relaxed) as u16;
+        let n = self.seal_txs.len().max(1);
+        let worker = (seq as usize) % n;
+        // Multi-port: prepend the 2-byte application-port tag so the Client
+        // can demux this engine's segments after HMAC verify. The tag rides
+        // INSIDE the sealed payload (authenticated for free, since the seal
+        // hashes the whole payload). Single-port ships it opaque.
+        let payload = match self.tag {
+            Some(port) => {
+                let mut buf = Vec::with_capacity(multiport::PORT_TAG_LEN + datagram.len());
+                multiport::encode_tag(port, datagram, &mut buf);
+                buf
+            }
+            None => datagram.to_vec(),
+        };
+        let job = DownloadSpoofJob {
+            payload,
+            hmac_seq: seq,
+            icmp_seq,
+        };
+        match self.seal_txs[worker].try_send(job) {
+            Ok(()) => {
+                self.metrics.record_download(datagram.len(), now_unix());
+                Ok(true)
+            }
+            // Seal channel full — drop; the inner KCP layer retransmits.
+            Err(_) => Ok(false),
+        }
+    }
+    fn max_payload(&self) -> usize {
+        self.max_payload
+    }
+}
+
+/// How the TCP-forward upload listeners route a received datagram to a
+/// per-port reliability-engine inbox. `Single` is the single-port path —
+/// the whole datagram is the one engine's inbound. `Multi` decodes the
+/// 2-byte application-port tag and routes the untagged body to that port's
+/// engine inbox. Mirrors [`UploadForwarder`] for the UDP forward path.
+#[derive(Clone)]
+enum TcpUploadRouter {
+    Single(forward::InboundTx),
+    Multi(Arc<std::collections::HashMap<u16, forward::InboundTx>>),
+}
+
+impl TcpUploadRouter {
+    /// Resolve which engine inbox a received upload datagram feeds, and the
+    /// (possibly untagged) body to deliver. Returns `None` on a too-short or
+    /// unknown-port datagram (dropped + sampled-warn, mirroring the UDP
+    /// `resolve_upload_forward` path).
+    fn route<'a>(
+        &'a self,
+        datagram: &'a [u8],
+        id: i64,
+    ) -> Option<(&'a forward::InboundTx, &'a [u8])> {
+        match self {
+            TcpUploadRouter::Single(inbox) => Some((inbox, datagram)),
+            TcpUploadRouter::Multi(map) => {
+                let (port, body) = match multiport::decode_tag(datagram) {
+                    Some(v) => v,
+                    None => {
+                        debug!(
+                            tunnel_id = id,
+                            "remote: multi-port tcp-forward upload datagram too short for port tag"
+                        );
+                        return None;
+                    }
+                };
+                match map.get(&port) {
+                    Some(inbox) => Some((inbox, body)),
+                    None => {
+                        let prev = UNKNOWN_PORT_UPLOAD_DROPS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if prev % 1000 == 0 {
+                            warn!(
+                                tunnel_id = id,
+                                port,
+                                dropped_total = prev + 1,
+                                "remote: multi-port tcp-forward upload tagged with a port that is \
+                                 not in this tunnel's configured set — the two sides have different \
+                                 port lists; align them"
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Spawn the chosen reliability engine (KCP or QUIC) for the Remote role
+/// over a shared sink + inbox. Used by both the single- and multi-port
+/// TCP-forward paths so the engine-selection match lives in one place. Each
+/// engine instance is self-contained: its own conv map / connection, its
+/// own idle reaper (KCP) or native idle timeout (QUIC), and its own per-conn
+/// backpressure — so one slow port can never stall another.
+#[allow(clippy::too_many_arguments)]
+fn spawn_remote_forward_engine(
+    engine: TcpReliabilityEngine,
+    tunnel_id: i64,
+    idle_timeout_sec: u32,
+    kcp_tuning: crate::spec::KcpTuning,
+    quic_tuning: &crate::spec::QuicTuning,
+    forward_target: SocketAddr,
+    sink: Arc<dyn DatagramSink>,
+    inbox_rx: forward::InboundRx,
+    tasks: &mut JoinSet<()>,
+    stop_rx: &watch::Receiver<bool>,
+) {
+    let role = forward::EngineRole::Remote { forward_target };
+    match engine {
+        TcpReliabilityEngine::Kcp => {
+            let e = forward::KcpEngine::new(
+                forward::EngineConfig {
+                    tunnel_id,
+                    idle_timeout_sec,
+                    tuning: kcp_tuning,
+                },
+                role,
+                sink,
+            );
+            tasks.spawn(e.run(inbox_rx, stop_rx.clone()));
+        }
+        TcpReliabilityEngine::Quic => {
+            let e = forward::QuicEngine::new(
+                forward::QuicConfig {
+                    tunnel_id,
+                    idle_timeout_sec,
+                    tuning: quic_tuning.clone(),
+                },
+                role,
+                sink,
+            );
+            tasks.spawn(e.run(inbox_rx, stop_rx.clone()));
+        }
+    }
+}
+
+/// Spin up the seal + single-send pipeline (workers + raw send socket)
+/// and return the seal-worker senders. This mirrors the seal/send half of
+/// `spawn_download_pipeline` but without the UDP recv loops — the TCP
+/// forward engine feeds the returned senders via [`RemoteForwardSink`]
+/// instead. The n_workers clamp keeps `SEAL_WORKER_CHANNEL_CAP * workers`
+/// within Iran's `SeqWindow`, exactly as the UDP path.
+#[allow(clippy::too_many_arguments)]
+fn spawn_seal_workers(
+    tasks: &mut JoinSet<()>,
+    transport: Transport,
+    icmp_echo_mode: crate::spec::IcmpEchoMode,
+    icmp_identifier: u16,
+    id: i64,
+    name: Arc<String>,
+    mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
+    session_id: u64,
+    initial_send_target: SendTarget,
+    send_port: u16,
+    client_ip_for_log: IpAddr,
+    stop_rx: watch::Receiver<bool>,
+) -> Result<Vec<mpsc::Sender<DownloadSpoofJob>>, SpawnError> {
+    let label: &'static str = match transport {
+        Transport::Udp => "udp",
+        Transport::TcpSyn => "tcp_syn",
+        Transport::Icmp => "icmp",
+        Transport::Icmpv6 => "icmpv6",
+    };
+    let send_batch_size = crate::perf::send_batch();
+    let requested_workers = crate::perf::per_core_sockets().max(1);
+    let max_seal_workers = (hmac::SEQ_WINDOW_SIZE as usize / SEAL_WORKER_CHANNEL_CAP).max(1);
+    let n_workers = requested_workers.min(max_seal_workers);
+
+    let mut seal_txs: Vec<mpsc::Sender<DownloadSpoofJob>> = Vec::with_capacity(n_workers);
+    let mut seal_rxs: Vec<mpsc::Receiver<DownloadSpoofJob>> = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let (tx, rx) = mpsc::channel::<DownloadSpoofJob>(SEAL_WORKER_CHANNEL_CAP);
+        seal_txs.push(tx);
+        seal_rxs.push(rx);
+    }
+
+    let (sealed_tx, sealed_rx) = mpsc::channel::<SealedPacket>(SEND_QUEUE_CAP);
+    let raw_send = open_send_socket_for_transport(transport)?;
+    let raw_send_fd = std::os::fd::OwnedFd::from(raw_send);
+    let send_sock = Arc::new(AsyncFd::new(raw_send_fd).map_err(SpawnError::Io)?);
+
+    info!(
+        tunnel_id = id,
+        transport = label,
+        dst = %client_ip_for_log,
+        port = send_port,
+        seal_workers = n_workers,
+        "remote: TCP-forward seal + serial send pipeline spinning up"
+    );
+
+    for (worker_id, rx) in seal_rxs.into_iter().enumerate() {
+        tasks.spawn(download_seal_worker(
+            rx,
+            sealed_tx.clone(),
+            initial_send_target,
+            send_port,
+            transport,
+            icmp_echo_mode,
+            icmp_identifier,
+            session_id,
+            label,
+            mutable_config.clone(),
+            metrics.clone(),
+            id,
+            worker_id,
+            name.clone(),
+            stop_rx.clone(),
+        ));
+    }
+    drop(sealed_tx);
+    tasks.spawn(download_send_worker(
+        sealed_rx,
+        send_sock,
+        label,
+        metrics.clone(),
+        mutable_config.clone(),
+        id,
+        name.clone(),
+        stop_rx.clone(),
+        send_batch_size,
+    ));
+    Ok(seal_txs)
+}
+
+/// Bring up the Remote half of a `forward_protocol=tcp` tunnel: one
+/// reliability engine (KCP or QUIC) that dials `forward_target` per learned
+/// connection, fed by the upload listener and draining its sealed segments
+/// to the Client. In multi-port mode there is ONE engine per application
+/// port, each dialing its own `(forward_host, port)` and tagging its
+/// download datagrams; all engines share the single seal + send pipeline
+/// (one seq stream, one session_id, one raw send socket), so the wire-order
+/// and anti-replay invariants hold regardless of port count.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_tcp_forward_remote(
+    spec: &TunnelSpec,
+    resolved: &ResolvedSpec,
+    tasks: &mut JoinSet<()>,
+    stop_rx: watch::Receiver<bool>,
+    mutable_config: MutableConfigSlot,
+    session_table: Arc<SessionTable>,
+    metrics: Arc<TunnelMetrics>,
+    id: i64,
+    name: Arc<String>,
+    seq_counter: Arc<std::sync::atomic::AtomicU64>,
+    icmp_seq_counter: Arc<std::sync::atomic::AtomicU32>,
+    session_id: u64,
+    icmp_identifier: u16,
+    icmp_echo_mode: crate::spec::IcmpEchoMode,
+    initial_send_target: SendTarget,
+    send_port: u16,
+    client_ip_for_log: IpAddr,
+    forward_target: SocketAddr,
+    upload_listen: SocketAddr,
+) -> Result<(), SpawnError> {
+    let transport = spec.download_transport;
+    let seal_txs = spawn_seal_workers(
+        tasks,
+        transport,
+        icmp_echo_mode,
+        icmp_identifier,
+        id,
+        name.clone(),
+        mutable_config.clone(),
+        metrics.clone(),
+        session_id,
+        initial_send_target,
+        send_port,
+        client_ip_for_log,
+        stop_rx.clone(),
+    )?;
+
+    let max_payload = (spec.mtu as usize).saturating_sub(multiport::PORT_TAG_LEN);
+    let engine = spec.tcp_reliability_engine;
+    let kcp_tuning = resolved.forward_kcp.unwrap_or_default();
+    let quic_tuning = resolved.forward_quic.clone().unwrap_or_default();
+
+    // Build one reliability engine per application port (multi-port) or a
+    // single engine (single-port). Every engine shares the ONE seal pipeline
+    // built above, so there is one seq stream + one session_id + one send
+    // socket for the whole tunnel; each multi-port engine dials its own
+    // `(forward_host, port)` and tags its download datagrams so the Client
+    // demuxes them per port. The single-port branch is wire-identical to
+    // pre-multi-port (no tag).
+    let router = if resolved.multiport() {
+        let forward_host = forward_target.ip();
+        let mut map: std::collections::HashMap<u16, forward::InboundTx> =
+            std::collections::HashMap::with_capacity(resolved.ports.len());
+        for &port in &resolved.ports {
+            if map.contains_key(&port) {
+                continue;
+            }
+            let target = SocketAddr::new(forward_host, port);
+            let (inbox_tx, inbox_rx) = forward::inbound_channel();
+            let sink: Arc<dyn DatagramSink> = Arc::new(RemoteForwardSink {
+                seal_txs: seal_txs.clone(),
+                seq_counter: seq_counter.clone(),
+                icmp_seq_counter: icmp_seq_counter.clone(),
+                max_payload,
+                metrics: metrics.clone(),
+                tag: Some(port),
+            });
+            spawn_remote_forward_engine(
+                engine,
+                id,
+                spec.idle_timeout_sec,
+                kcp_tuning,
+                &quic_tuning,
+                target,
+                sink,
+                inbox_rx,
+                tasks,
+                &stop_rx,
+            );
+            info!(tunnel_id = id, target = %target, engine = ?engine,
+                "remote: multi-port TCP-forward engine spun up");
+            map.insert(port, inbox_tx);
+        }
+        TcpUploadRouter::Multi(Arc::new(map))
+    } else {
+        let (inbox_tx, inbox_rx) = forward::inbound_channel();
+        let sink: Arc<dyn DatagramSink> = Arc::new(RemoteForwardSink {
+            seal_txs,
+            seq_counter,
+            icmp_seq_counter,
+            max_payload,
+            metrics: metrics.clone(),
+            tag: None,
+        });
+        spawn_remote_forward_engine(
+            engine,
+            id,
+            spec.idle_timeout_sec,
+            kcp_tuning,
+            &quic_tuning,
+            forward_target,
+            sink,
+            inbox_rx,
+            tasks,
+            &stop_rx,
+        );
+        TcpUploadRouter::Single(inbox_tx)
+    };
+    info!(tunnel_id = id, engine = ?engine, multiport = resolved.multiport(),
+        "remote: TCP-forward engine(s) ready");
+
+    // Upload listener: client→remote datagrams feed the engine inbox(es)
+    // (single-port: the one inbox; multi-port: routed by the 2-byte
+    // application-port tag) instead of being forwarded to a UDP target.
+    match spec.upload_listen_mode {
+        UploadListenMode::Udp => {
+            let upload_sock = bind_dualstack_udp(upload_listen).map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "remote/upload", upload_listen))
+            })?;
+            crate::perf::tune_socket(&upload_sock, "remote/upload");
+            let upload_sock = Arc::new(upload_sock);
+            info!(tunnel_id = id, addr = %upload_listen,
+                "remote: TCP-forward upload_listen bound (UDP)");
+            spawn_tcp_upload_udp(
+                tasks,
+                id,
+                upload_sock,
+                router,
+                session_table.clone(),
+                metrics.clone(),
+                mutable_config.clone(),
+                stop_rx.clone(),
+            );
+        }
+        UploadListenMode::Socks5Tcp => {
+            let tcp_listener = TcpListener::bind(upload_listen).await.map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "remote/upload", upload_listen))
+            })?;
+            crate::perf::tune_socket(&tcp_listener, "socks5/remote-listen");
+            let keepalive = crate::upload::Socks5Profile::for_download(transport).keepalive;
+            info!(tunnel_id = id, addr = %upload_listen,
+                "remote: TCP-forward upload_listen bound (SOCKS5/TCP)");
+            spawn_tcp_upload_socks5(
+                tasks,
+                id,
+                tcp_listener,
+                router,
+                session_table.clone(),
+                metrics.clone(),
+                mutable_config.clone(),
+                keepalive,
+                stop_rx.clone(),
+            );
+        }
+    }
+
+    spawn_idle_sweeper(
+        tasks,
+        id,
+        spec.idle_timeout_sec,
+        session_table,
+        metrics,
+        stop_rx,
+    );
+    Ok(())
+}
+
+/// UDP upload listener for the TCP-forward path: every received datagram is
+/// fed into the engine inbox (single-port) or routed by its 2-byte
+/// application-port tag to the matching port's engine inbox (multi-port),
+/// instead of being forwarded to a UDP target. Mirrors `spawn_upload_task`'s
+/// MTU cap + session accounting.
+#[allow(clippy::too_many_arguments)]
+fn spawn_tcp_upload_udp(
+    tasks: &mut JoinSet<()>,
+    id: i64,
+    upload_sock: Arc<UdpSocket>,
+    router: TcpUploadRouter,
+    session_table: Arc<SessionTable>,
+    metrics: Arc<TunnelMetrics>,
+    mutable_config: MutableConfigSlot,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    tasks.spawn(async move {
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => return,
+                res = upload_sock.recv_from(&mut buf) => {
+                    let (n, src) = match res {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(tunnel_id = id, err = %e, "remote: tcp-forward upload recv");
+                            continue;
+                        }
+                    };
+                    // Resolve the engine inbox (stripping the application-port
+                    // tag in multi-port mode) BEFORE the MTU cap so the cap
+                    // applies to the UNTAGGED body, exactly as the UDP path.
+                    let (inbox, body) = match router.route(&buf[..n], id) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+                    if body.len() > mtu.max(64) {
+                        continue;
+                    }
+                    let outcome = session_table.insert_or_refresh(src, src);
+                    if matches!(outcome, InsertOutcome::Rejected) {
+                        metrics.record_session_reject();
+                        continue;
+                    }
+                    let body_len = body.len();
+                    if inbox.try_send(body.to_vec()).is_ok() {
+                        metrics.record_upload(body_len, now_unix());
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// SOCKS5/TCP upload listener for the TCP-forward path: accept connections
+/// and decode `[u16 BE length][payload]` frames into engine-inbox datagrams,
+/// routed per-port by the application-port tag in multi-port mode. Mirrors
+/// the framing of `drive_socks5_upload_connection`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_tcp_upload_socks5(
+    tasks: &mut JoinSet<()>,
+    id: i64,
+    listener: TcpListener,
+    router: TcpUploadRouter,
+    session_table: Arc<SessionTable>,
+    metrics: Arc<TunnelMetrics>,
+    mutable_config: MutableConfigSlot,
+    keepalive: Socks5KeepaliveProfile,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => return,
+                accept = listener.accept() => {
+                    let (stream, peer) = match accept {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(tunnel_id = id, err = %e, "remote: tcp-forward socks5 accept");
+                            continue;
+                        }
+                    };
+                    crate::perf::tune_socks5_tcp_socket(&stream, "socks5/remote-in", keepalive);
+                    let router = router.clone();
+                    let session_table = session_table.clone();
+                    let metrics = metrics.clone();
+                    let mutable_config = mutable_config.clone();
+                    let conn_stop = stop_rx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = drive_socks5_upload_to_inbox(
+                            id, stream, peer, router, session_table, metrics, mutable_config,
+                            conn_stop,
+                        )
+                        .await
+                        {
+                            warn!(tunnel_id = id, %peer, err = %e,
+                                "remote: tcp-forward socks5 upload connection ended with error");
+                        }
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Decode `[u16 len][payload]` frames off one accepted SOCKS5 connection and
+/// feed each payload into the engine inbox (single-port) or the matching
+/// port's inbox by application-port tag (multi-port).
+#[allow(clippy::too_many_arguments)]
+async fn drive_socks5_upload_to_inbox(
+    id: i64,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    router: TcpUploadRouter,
+    session_table: Arc<SessionTable>,
+    metrics: Arc<TunnelMetrics>,
+    mutable_config: MutableConfigSlot,
+    mut stop_rx: watch::Receiver<bool>,
+) -> io::Result<()> {
+    let mut stream = BufReader::with_capacity(4 * MAX_UDP_DATAGRAM, stream);
+    let mut len_buf = [0u8; 2];
+    let mut payload = vec![0u8; MAX_UDP_DATAGRAM];
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => return Ok(()),
+            len_res = stream.read_exact(&mut len_buf) => {
+                if let Err(e) = len_res {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+                let n = u16::from_be_bytes(len_buf) as usize;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "socks5_tcp tcp-forward upload: zero-length frame",
+                    ));
+                }
+                if n > payload.len() {
+                    payload.resize(n, 0);
+                }
+                stream.read_exact(&mut payload[..n]).await?;
+                // Resolve the engine inbox (stripping the application-port
+                // tag in multi-port mode) BEFORE the MTU cap so the cap
+                // applies to the UNTAGGED body.
+                let (inbox, body) = match router.route(&payload[..n], id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+                if body.len() > mtu.max(64) {
+                    continue;
+                }
+                let outcome = session_table.insert_or_refresh(peer, peer);
+                if matches!(outcome, InsertOutcome::Rejected) {
+                    metrics.record_session_reject();
+                    continue;
+                }
+                let body_len = body.len();
+                if inbox.try_send(body.to_vec()).is_ok() {
+                    metrics.record_upload(body_len, now_unix());
+                }
+            }
+        }
     }
 }
 

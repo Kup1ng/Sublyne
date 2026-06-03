@@ -1,5 +1,90 @@
 # Release notes
 
+## v4.0.0 — TCP forwarding (KCP / QUIC) + multi-port + modal form (2026-06-03)
+
+**The headline**
+
+Every tunnel can now forward **TCP**, not just UDP. That means you can hand
+your users **VLESS-TCP / VLESS-WS** configs (not only WireGuard / Hysteria).
+Sublyne terminates the user's TCP connection, carries it **reliably** across
+the lossy spoof-download path using a reliability engine, and re-opens TCP to
+your real service on the foreign box.
+
+**What TCP forwarding unlocks**
+
+Until now a tunnel only carried UDP: a lost or badly-reordered spoofed packet
+was simply gone, which UDP protocols (WireGuard) tolerate because they repair
+themselves. Raw TCP can't survive that — one lost byte corrupts the stream
+forever. v4.0.0 puts a **reliability engine** between the user's TCP socket
+and the spoof channel, turning the best-effort packet path into a solid byte
+stream. So you can now serve the many users who find VLESS-TCP / VLESS-WS
+easier to set up than WireGuard.
+
+**Choosing an engine — KCP vs QUIC (plain language)**
+
+When you set a tunnel to TCP, you pick one engine. They behave differently:
+
+- **KCP** *(recommended default)* — simple, predictable, light on CPU and
+  memory, and has **no MTU floor**, so it works on every path including the
+  hostile ICMP transports. It recovers from loss aggressively.
+  - *When to pick it:* almost always — especially on lossy or ICMP paths, or
+    low-powered boxes.
+  - *Cost:* on a very lossy link the "lossy / aggressive recovery" preset
+    retransmits hard, which uses more upstream bandwidth to push data through.
+- **QUIC** — adds native multiplexing (many user connections over one
+  encrypted QUIC link) and built-in TLS encryption. Widely understood.
+  - *When to pick it:* clean, higher-capacity paths where you want QUIC's
+    multiplexing/encryption, or to match an existing QUIC-based setup.
+  - *Cost:* heavier handshake and more CPU/memory than KCP, and it **needs
+    MTU ≥ 1252** (QUIC packets are ≥1200 bytes) — the panel enforces this.
+  - *Where it can silently disappoint:* on a **very lossy path** QUIC's
+    loss-based congestion control backs off harder than KCP, so throughput can
+    quietly collapse where KCP would push through. On a **hostile ICMP path**
+    its padded 1200-byte handshake can stall. If in doubt on a bad link, use
+    KCP.
+
+Both engines are proven on every build by an automated test that drops 10% and
+reorders 5% of packets and confirms the byte stream survives intact.
+
+**Multi-port TCP forwarding**
+
+A TCP tunnel can carry **several application ports** at once. Each port gets
+its **own independent reliability engine** (its own connection handling, idle
+cleanup, and flow control), all sharing the one secure download/upload
+pipeline and demultiplexed by a 2-byte port tag. One busy or slow port never
+stalls the others. The engine, preset, and Advanced tuning you choose apply to
+every port (one tunnel = one engine kind). A single-port TCP tunnel is
+byte-for-byte identical on the wire to before.
+
+**The new tunnel form**
+
+Creating or editing a tunnel now opens a **centered pop-up** over the Tunnels
+page instead of a separate page. Same fields and validation; the new
+Forward-protocol controls live inside it, and Save/Cancel stay visible as the
+form scrolls.
+
+**Your existing tunnels — zero action**
+
+On first start of v4.0.0 a database migration sets every existing tunnel to
+**forward_protocol = udp**, which is byte-for-byte the behavior you have today.
+Nothing about your running UDP tunnels changes.
+
+**Upgrading (important)**
+
+- **UDP tunnels** still interoperate v4 ↔ v3 — the seal/spoof envelope is
+  unchanged, so you can upgrade one box at a time.
+- **TCP tunnels need BOTH ends on v4.0.0+** (the reliability engine doesn't
+  exist on v3). To switch a tunnel to TCP: upgrade both its boxes, then set
+  forward_protocol = tcp + an engine on each.
+
+That both-ends requirement and the significant new capability are why this is
+a **major** version.
+
+**Validate on real hardware first.** The full spoof path needs root, so it
+can't run in CI. Before relying on TCP tunnels, follow
+[docs/v4-hardware-test.md](docs/v4-hardware-test.md) to test a tcp+kcp and a
+tcp+quic tunnel (and a 2-port tunnel) on your two boxes.
+
 ## v2.7.0 — Unified port list (2026-06-01)
 
 **What changed for you**
