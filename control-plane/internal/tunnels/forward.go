@@ -3,6 +3,7 @@ package tunnels
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // --- v4.0.0 TCP forwarding -------------------------------------------
@@ -161,7 +162,13 @@ func ResolveKcpTuning(preset ForwardEnginePreset, overrideJSON string) (KcpTunin
 	}
 	if s := trimBlank(overrideJSON); s != "" {
 		var o kcpOverride
-		if err := json.Unmarshal([]byte(s), &o); err != nil {
+		// Reject unknown keys so a typo'd override field (e.g. "snd_win"
+		// instead of "snd_wnd") is a loud error rather than silently
+		// ignored — silently dropping it would leave the operator with the
+		// preset value while the panel showed their (unapplied) override.
+		dec := json.NewDecoder(strings.NewReader(s))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&o); err != nil {
 			return KcpTuning{}, fmt.Errorf("KCP tuning overrides are not valid JSON: %w", err)
 		}
 		if o.NoDelay != nil {
@@ -198,7 +205,11 @@ func ResolveQuicTuning(preset ForwardEnginePreset, overrideJSON string) (QuicTun
 	}
 	if s := trimBlank(overrideJSON); s != "" {
 		var o quicOverride
-		if err := json.Unmarshal([]byte(s), &o); err != nil {
+		// Reject unknown keys (see ResolveKcpTuning) so a typo'd override
+		// field surfaces as an error instead of silently keeping the preset.
+		dec := json.NewDecoder(strings.NewReader(s))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&o); err != nil {
 			return QuicTuning{}, fmt.Errorf("QUIC tuning overrides are not valid JSON: %w", err)
 		}
 		if o.Congestion != nil {
@@ -260,8 +271,20 @@ func validateQuicTuning(t QuicTuning) error {
 	if t.MaxIdleMs < 1_000 || t.MaxIdleMs > 600_000 {
 		return fmt.Errorf("QUIC max_idle_ms must be between 1000 and 600000, got %d", t.MaxIdleMs)
 	}
+	if t.KeepAliveMs < 1_000 {
+		// 0 would make the dataplane send a PING roughly every millisecond
+		// (it clamps to max(1) ms), flooding the link.
+		return fmt.Errorf("QUIC keep_alive_ms must be at least 1000, got %d", t.KeepAliveMs)
+	}
 	if t.KeepAliveMs > 300_000 {
 		return fmt.Errorf("QUIC keep_alive_ms must be at most 300000, got %d", t.KeepAliveMs)
+	}
+	if t.KeepAliveMs >= t.MaxIdleMs {
+		// A keepalive at or beyond the idle timeout never refreshes the
+		// connection in time, so it idles out despite keepalive being "on".
+		return fmt.Errorf(
+			"QUIC keep_alive_ms (%d) must be less than max_idle_ms (%d) so the connection is kept alive before it idles out",
+			t.KeepAliveMs, t.MaxIdleMs)
 	}
 	if t.StreamRecvWindow < 64*1024 || t.StreamRecvWindow > 256*mib {
 		return fmt.Errorf("QUIC stream_recv_window must be between 64 KiB and 256 MiB, got %d", t.StreamRecvWindow)

@@ -110,9 +110,18 @@ func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, exist
 	}
 	if t.MaxConnections <= 0 {
 		ve.Fields["max_connections"] = "Max connections must be greater than zero."
+	} else if t.MaxConnections > 1_000_000 {
+		// Upper bound so a huge value can't silently wrap when narrowed to
+		// the dataplane's uint32 session cap. 1,000,000 is well above the
+		// 200k-sessions/server design target.
+		ve.Fields["max_connections"] = "Max connections must be 1,000,000 or fewer."
 	}
 	if t.IdleTimeout <= 0 {
 		ve.Fields["idle_timeout"] = "Idle timeout must be greater than zero seconds."
+	} else if t.IdleTimeout > 86_400 {
+		// One day is far longer than any real tunnel idle window and keeps
+		// the value comfortably inside the dataplane's uint32 seconds.
+		ve.Fields["idle_timeout"] = "Idle timeout must be 86400 seconds (1 day) or fewer."
 	}
 
 	// Default the Remote-side upload-listen mode from the v2 matrix so a
@@ -363,7 +372,10 @@ func validateForward(t *Tunnel, ve *ValidationError) {
 
 	// The tuning blob only matters for a TCP tunnel. Resolve it against
 	// the chosen engine + preset so a malformed override or out-of-range
-	// value surfaces as a per-field error the operator can fix.
+	// value surfaces as a per-field error the operator can fix. A UDP
+	// tunnel deliberately ignores the (inert) blob — see
+	// TestValidate_ForwardUDPIgnoresTuning — so import/clone of a tunnel
+	// that was once TCP doesn't fail on a now-irrelevant override.
 	if t.ForwardProtocol == ForwardProtocolTCP &&
 		t.TCPReliabilityEngine.IsValid() &&
 		ForwardEnginePreset(t.ForwardEnginePreset).IsValid() {

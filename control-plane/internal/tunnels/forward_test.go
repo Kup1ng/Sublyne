@@ -48,6 +48,32 @@ func TestResolveKcpTuning_RejectsOutOfRange(t *testing.T) {
 	}
 }
 
+// v4-audit B6: a typo'd / unknown override key must be a loud error, not
+// silently ignored (which would leave the preset value while the panel showed
+// the operator's intended override).
+func TestResolveKcpTuning_RejectsUnknownKey(t *testing.T) {
+	if _, err := ResolveKcpTuning(PresetBalanced, `{"snd_win": 2048}`); err == nil {
+		t.Error("expected error for unknown KCP override key 'snd_win'")
+	}
+}
+
+func TestResolveQuicTuning_RejectsUnknownKey(t *testing.T) {
+	if _, err := ResolveQuicTuning(PresetBalanced, `{"keepalive_ms": 5000}`); err == nil {
+		t.Error("expected error for unknown QUIC override key 'keepalive_ms'")
+	}
+}
+
+// v4-audit B7: a keepalive at or beyond the idle timeout never refreshes the
+// connection in time, and a sub-1s keepalive floods PINGs.
+func TestResolveQuicTuning_RejectsKeepAliveBeyondIdle(t *testing.T) {
+	if _, err := ResolveQuicTuning(PresetBalanced, `{"keep_alive_ms": 70000, "max_idle_ms": 60000}`); err == nil {
+		t.Error("expected error when keep_alive_ms >= max_idle_ms")
+	}
+	if _, err := ResolveQuicTuning(PresetBalanced, `{"keep_alive_ms": 0}`); err == nil {
+		t.Error("expected error for keep_alive_ms below the 1000ms floor")
+	}
+}
+
 func TestResolveQuicTuning_PurePreset(t *testing.T) {
 	got, err := ResolveQuicTuning(PresetLossy, "")
 	if err != nil {

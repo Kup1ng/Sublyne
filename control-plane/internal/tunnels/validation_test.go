@@ -89,6 +89,28 @@ func TestValidate_HappyRemote(t *testing.T) {
 	}
 }
 
+// v4-audit B8: max_connections / idle_timeout need an upper bound so a huge
+// value can't silently wrap when narrowed to the dataplane's uint32 fields.
+func TestValidate_RejectsExcessiveMaxConnections(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	t1 := sampleClient("toomany")
+	t1.MaxConnections = 2_000_000
+	if err := Validate(ctx, repo, RoleClient, &t1, 0); err == nil {
+		t.Error("expected error for max_connections above the 1,000,000 cap")
+	}
+}
+
+func TestValidate_RejectsExcessiveIdleTimeout(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	t1 := sampleClient("idle")
+	t1.IdleTimeout = 200_000 // > 86400s (1 day)
+	if err := Validate(ctx, repo, RoleClient, &t1, 0); err == nil {
+		t.Error("expected error for idle_timeout above the 1-day cap")
+	}
+}
+
 // Phase R4: icmp_echo_mode must validate to either "reply" or "request",
 // and must default to "reply" when the field is empty.
 func TestValidate_IcmpEchoMode_DefaultsToReply(t *testing.T) {
