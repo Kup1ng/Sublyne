@@ -221,16 +221,14 @@ pub(super) async fn spawn(
     }
     let icmp_echo_mode = spec.icmp_echo_mode;
 
-    // v4.0.0 TCP forwarding (single-port, KCP). Replace the UDP
-    // forward/recv flows entirely: client uploads feed a KCP engine, the
-    // engine dials forward_target over TCP, and the engine's outbound
-    // datagrams are sealed + spoofed down to the Client through the same
-    // seal pipeline (one seq stream, one session_id). `spec::validate`
-    // guarantees single-port + KCP here (QUIC and multi-port TCP land in
-    // follow-ups).
-    if resolved.forward_protocol == ForwardProtocol::Tcp
-        && spec.tcp_reliability_engine == TcpReliabilityEngine::Kcp
-    {
+    // v4.0.0 TCP forwarding (single-port). Replace the UDP forward/recv
+    // flows entirely: client uploads feed the reliability engine (KCP or
+    // QUIC), the engine dials forward_target over TCP, and the engine's
+    // outbound datagrams are sealed + spoofed down to the Client through
+    // the same seal pipeline (one seq stream, one session_id).
+    // `spec::validate` guarantees single-port here (multi-port TCP land in
+    // a follow-up).
+    if resolved.forward_protocol == ForwardProtocol::Tcp {
         return spawn_tcp_forward_remote(
             spec,
             resolved,
@@ -614,7 +612,7 @@ async fn spawn_tcp_forward_remote(
     )?;
 
     let max_payload = (spec.mtu as usize).saturating_sub(multiport::PORT_TAG_LEN);
-    let sink = Arc::new(RemoteForwardSink {
+    let sink: Arc<dyn DatagramSink> = Arc::new(RemoteForwardSink {
         seal_txs,
         seq_counter,
         icmp_seq_counter,
@@ -623,16 +621,33 @@ async fn spawn_tcp_forward_remote(
     });
 
     let (inbox_tx, inbox_rx) = forward::inbound_channel();
-    let engine = forward::KcpEngine::new(
-        forward::EngineConfig {
-            tunnel_id: id,
-            idle_timeout_sec: spec.idle_timeout_sec,
-            tuning: resolved.forward_kcp.unwrap_or_default(),
-        },
-        forward::EngineRole::Remote { forward_target },
-        sink,
-    );
-    tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
+    let role = forward::EngineRole::Remote { forward_target };
+    match spec.tcp_reliability_engine {
+        TcpReliabilityEngine::Kcp => {
+            let engine = forward::KcpEngine::new(
+                forward::EngineConfig {
+                    tunnel_id: id,
+                    idle_timeout_sec: spec.idle_timeout_sec,
+                    tuning: resolved.forward_kcp.unwrap_or_default(),
+                },
+                role,
+                sink,
+            );
+            tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
+        }
+        TcpReliabilityEngine::Quic => {
+            let engine = forward::QuicEngine::new(
+                forward::QuicConfig {
+                    tunnel_id: id,
+                    idle_timeout_sec: spec.idle_timeout_sec,
+                    tuning: resolved.forward_quic.clone().unwrap_or_default(),
+                },
+                role,
+                sink,
+            );
+            tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
+        }
+    }
 
     // Upload listener: client→remote datagrams feed the engine inbox
     // instead of being forwarded to a UDP target.

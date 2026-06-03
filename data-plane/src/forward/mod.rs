@@ -15,6 +15,8 @@
 
 pub mod channel;
 pub mod kcp;
+pub mod quic;
 
 pub use channel::{inbound_channel, DatagramSink, InboundRx, InboundTx};
 pub use kcp::{EngineConfig, EngineRole, EngineStats, KcpEngine};
+pub use quic::{QuicConfig, QuicEngine};

@@ -104,6 +104,13 @@ type QuicTuning struct {
 
 const mib = 1024 * 1024
 
+// QuicMinMTU is the smallest tunnel MTU that can carry QUIC forwarding.
+// QUIC requires >=1200-byte datagrams (its Initial pads to 1200); the
+// dataplane sizes the engine MTU to tunnel_mtu - 2 (the multiport tag), so
+// the tunnel MTU must clear 1200 + the tag + a small margin. KCP has no
+// such floor. Mirrors data-plane/src/spec.rs QUIC_MIN_TUNNEL_MTU.
+const QuicMinMTU = 1252
+
 // kcpPresets holds the three KCP profiles. See the v4.0.0 plan §3.
 var kcpPresets = map[ForwardEnginePreset]KcpTuning{
 	// Tight loop, aggressive ACK, small windows — snappy for VLESS-WS,

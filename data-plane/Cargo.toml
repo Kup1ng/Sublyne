@@ -69,6 +69,37 @@ bytes = "1"
 # TCP bridging ourselves in src/forward/.
 kcp = "0.6"
 
+# QUIC reliable transport, the second forward_protocol=tcp engine (v4.0.0).
+# We drive quinn over a CUSTOM `quinn::AsyncUdpSocket` (src/forward/quic.rs)
+# instead of a kernel UDP socket, so QUIC rides the same spoof/upload
+# datagram channel as KCP.
+#
+# CRITICAL — musl static build: every crypto-bearing crate is pinned to the
+# `ring` provider, NOT `aws-lc-rs` (which needs cmake/C++ and breaks the
+# fully-static x86_64-unknown-linux-musl build). quinn's default is already
+# `rustls-ring`; we drop `platform-verifier` (its only path to aws-lc-rs) and
+# force ring on the direct rustls + rcgen deps too. The CI gate
+# `cargo tree -i aws-lc-rs` must stay empty.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# Self-signed cert for the point-to-point QUIC tunnel. ring-backed (default
+# in 0.14; aws_lc_rs is opt-in) — pinned explicitly so a default change
+# can't pull aws-lc-rs.
+rcgen = { version = "0.14", default-features = false, features = [
+    "crypto",
+    "pem",
+    "ring",
+] }
+
 # `async fn` in traits via the standard proc-macro shim. Rust 1.83
 # supports native async fn in traits, but the trait-object form
 # (`Arc<dyn UploadTransport>`) still needs the `async_trait` adapter

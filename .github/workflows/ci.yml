@@ -21,19 +21,34 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        # Pinned to 1.85.0 — this is the stable that ships Cargo's
-        # `edition2024` feature, which the `constant_time_eq` v0.4.2
-        # transitive dep in the Cargo.lock requires. Stays in lockstep
-        # with data-plane/rust-toolchain.toml.
+        # Pinned to 1.88.0 (v4.0.0): the QUIC forwarding engine's deps
+        # (rcgen 0.14.8, time 0.3.47, …) set MSRV 1.88. 1.88 still ships
+        # `edition2024` (1.85+), which the `constant_time_eq` v0.4.2
+        # transitive dep requires. Stays in lockstep with
+        # data-plane/rust-toolchain.toml.
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.85.0'
+          toolchain: '1.88.0'
           components: rustfmt, clippy
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: data-plane
+
+      - name: Assert no aws-lc-rs (musl static-build gate)
+        # The QUIC engine pulls quinn + rustls + rcgen, all of which default
+        # to the aws-lc-rs crypto provider. aws-lc-rs needs cmake + a C/C++
+        # toolchain and breaks the fully-static x86_64-unknown-linux-musl
+        # build, so every crypto-bearing dep is pinned to `ring`. This gate
+        # fails the build the moment aws-lc-rs (re)enters the dependency tree.
+        run: |
+          if cargo tree -i aws-lc-rs 2>/dev/null | grep -q 'aws-lc-rs'; then
+            echo "::error::aws-lc-rs is in the dependency tree — it breaks the musl static build. Force the ring crypto provider (default-features=false + ring)."
+            cargo tree -i aws-lc-rs || true
+            exit 1
+          fi
+          echo "ok: aws-lc-rs absent — ring provider in use"
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -110,7 +125,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.85.0'
+          toolchain: '1.88.0'
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -161,7 +176,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.85.0'
+          toolchain: '1.88.0'
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2

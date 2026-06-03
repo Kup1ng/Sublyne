@@ -261,21 +261,19 @@ pub(super) async fn spawn(
         .await
         .map_err(SpawnError::Io)?;
 
-    // v4.0.0 TCP forwarding (single-port, KCP). Terminate the user's TCP
-    // on `local`, carry the byte stream over the reliability engine, and
-    // route the download verify workers' verified segments into the engine
-    // inbox. `spec::validate` guarantees single-port + KCP here (QUIC and
-    // multi-port TCP forwarding are gated off until their follow-ups land).
-    if resolved.forward_protocol == ForwardProtocol::Tcp
-        && spec.tcp_reliability_engine == TcpReliabilityEngine::Kcp
-    {
+    // v4.0.0 TCP forwarding (single-port). Terminate the user's TCP on
+    // `local`, carry the byte stream over the chosen reliability engine
+    // (KCP or QUIC), and route the download verify workers' verified
+    // segments into the engine inbox. `spec::validate` guarantees
+    // single-port here (multi-port TCP forwarding lands in a follow-up).
+    if resolved.forward_protocol == ForwardProtocol::Tcp {
         let tcp_listener = bind_dualstack_tcp(local)
             .map_err(|e| SpawnError::Io(crate::perf::bind_err(e, "client/tcp-listen", local)))?;
         crate::perf::tune_socket(&tcp_listener, "client/tcp-listen");
         info!(tunnel_id = id, addr = %local, family = address_family_label(local),
-            "client: TCP-forward listener bound (KCP engine)");
+            engine = ?spec.tcp_reliability_engine, "client: TCP-forward listener bound");
         let (inbox_tx, inbox_rx) = forward::inbound_channel();
-        let sink = Arc::new(ClientForwardSink {
+        let sink: Arc<dyn DatagramSink> = Arc::new(ClientForwardSink {
             upload: upload_transport.clone(),
             session: SessionKey {
                 client_addr: local,
@@ -284,18 +282,35 @@ pub(super) async fn spawn(
             max_payload: (spec.mtu as usize).saturating_sub(multiport::PORT_TAG_LEN),
             metrics: metrics.clone(),
         });
-        let engine = forward::KcpEngine::new(
-            forward::EngineConfig {
-                tunnel_id: id,
-                idle_timeout_sec: spec.idle_timeout_sec,
-                tuning: resolved.forward_kcp.unwrap_or_default(),
-            },
-            forward::EngineRole::Client {
-                listener: tcp_listener,
-            },
-            sink,
-        );
-        tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
+        let role = forward::EngineRole::Client {
+            listener: tcp_listener,
+        };
+        match spec.tcp_reliability_engine {
+            TcpReliabilityEngine::Kcp => {
+                let engine = forward::KcpEngine::new(
+                    forward::EngineConfig {
+                        tunnel_id: id,
+                        idle_timeout_sec: spec.idle_timeout_sec,
+                        tuning: resolved.forward_kcp.unwrap_or_default(),
+                    },
+                    role,
+                    sink,
+                );
+                tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
+            }
+            TcpReliabilityEngine::Quic => {
+                let engine = forward::QuicEngine::new(
+                    forward::QuicConfig {
+                        tunnel_id: id,
+                        idle_timeout_sec: spec.idle_timeout_sec,
+                        tuning: resolved.forward_quic.clone().unwrap_or_default(),
+                    },
+                    role,
+                    sink,
+                );
+                tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
+            }
+        }
 
         // The download pipeline feeds the engine inbox instead of a UDP
         // listener. No UDP listener, idle sweeper, or ping-smoothing

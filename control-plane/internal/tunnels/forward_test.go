@@ -116,6 +116,23 @@ func TestValidate_ForwardTCPQuicHappy(t *testing.T) {
 	}
 }
 
+func TestValidate_ForwardQuicRejectsLowMtu(t *testing.T) {
+	repo := NewRepo(newTestDB(t))
+	ctx := context.Background()
+	t1 := sampleClient("fwd-quic-lowmtu")
+	t1.ForwardProtocol = ForwardProtocolTCP
+	t1.TCPReliabilityEngine = TCPEngineQUIC
+	t1.MTU = 1000 // below QuicMinMTU
+	err := Validate(ctx, repo, RoleClient, &t1, 0)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	if _, ok := ve.Fields["mtu"]; !ok {
+		t.Errorf("expected an mtu error for QUIC below the floor: %v", ve.Fields)
+	}
+}
+
 func TestValidate_ForwardRejectsBadEngine(t *testing.T) {
 	repo := NewRepo(newTestDB(t))
 	ctx := context.Background()

@@ -10,6 +10,12 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+/// Minimum tunnel MTU for QUIC forwarding. QUIC requires datagrams of at
+/// least 1200 bytes (its Initial pads to 1200); the engine sizes its MTU to
+/// `tunnel_mtu - PORT_TAG_LEN(2)`, so the tunnel MTU must clear 1200 + the
+/// tag + a small margin. KCP has no such floor.
+const QUIC_MIN_TUNNEL_MTU: u32 = 1252;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -345,8 +351,11 @@ pub enum SpecError {
     /// isn't compiled in yet. Replaced per-engine as KCP and QUIC land
     /// (KCP first, then QUIC). Refusing here beats silently relaying the
     /// TCP stream as best-effort UDP, which would corrupt it.
-    #[error("forward_protocol=tcp with engine {0:?} is not available in this build")]
-    ForwardEngineUnavailable(TcpReliabilityEngine),
+    /// `forward_protocol=tcp` + QUIC on a tunnel whose MTU can't carry
+    /// QUIC's >=1200-byte datagrams (its Initial pads to 1200). KCP has no
+    /// such floor.
+    #[error("QUIC forwarding needs mtu >= 1252; got {0}")]
+    QuicMtuTooSmall(u32),
     /// `forward_protocol=tcp` on a multi-port tunnel. Multi-port TCP
     /// forwarding (one engine instance per app port) lands in a follow-up;
     /// single-port TCP forwarding works today.
@@ -395,18 +404,18 @@ impl TunnelSpec {
             return Err(SpecError::MtuTooSmall(self.mtu));
         }
 
-        // v4.0.0: TCP forwarding. KCP (single-port) is wired; QUIC and
-        // multi-port TCP forwarding land in follow-ups and are refused
-        // with a clear error until then — better than silently relaying
-        // the byte stream as best-effort UDP (which corrupts it on loss).
+        // v4.0.0: TCP forwarding. Single-port KCP and QUIC are wired.
+        // Multi-port TCP forwarding (one engine per app port) lands in a
+        // follow-up and is refused until then. QUIC also needs the tunnel
+        // MTU to fit its >=1200-byte datagrams.
         if self.forward_protocol == ForwardProtocol::Tcp {
-            if self.tcp_reliability_engine == TcpReliabilityEngine::Quic {
-                return Err(SpecError::ForwardEngineUnavailable(
-                    TcpReliabilityEngine::Quic,
-                ));
-            }
             if self.ports.len() >= 2 {
                 return Err(SpecError::ForwardMultiportUnsupported);
+            }
+            if self.tcp_reliability_engine == TcpReliabilityEngine::Quic
+                && self.mtu < QUIC_MIN_TUNNEL_MTU
+            {
+                return Err(SpecError::QuicMtuTooSmall(self.mtu));
             }
         }
 
@@ -659,16 +668,27 @@ mod tests {
     }
 
     #[test]
-    fn forward_tcp_quic_rejected_until_engine_lands() {
-        // QUIC engine isn't wired yet; refuse rather than mis-forward.
+    fn forward_tcp_quic_ok_with_adequate_mtu() {
+        // base_client mtu is 1400 (>= 1252), so QUIC validates.
         let mut s = base_client();
         s.forward_protocol = ForwardProtocol::Tcp;
         s.tcp_reliability_engine = TcpReliabilityEngine::Quic;
+        let r = s
+            .validate()
+            .expect("tcp+quic with mtu 1400 should validate");
+        assert_eq!(r.tcp_reliability_engine, TcpReliabilityEngine::Quic);
+    }
+
+    #[test]
+    fn forward_tcp_quic_rejected_below_mtu_floor() {
+        // QUIC needs mtu >= 1252 to carry its >=1200-byte datagrams.
+        let mut s = base_client();
+        s.forward_protocol = ForwardProtocol::Tcp;
+        s.tcp_reliability_engine = TcpReliabilityEngine::Quic;
+        s.mtu = 1000;
         assert!(matches!(
             s.validate(),
-            Err(SpecError::ForwardEngineUnavailable(
-                TcpReliabilityEngine::Quic
-            ))
+            Err(SpecError::QuicMtuTooSmall(1000))
         ));
     }
 

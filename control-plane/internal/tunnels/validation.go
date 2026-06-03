@@ -379,6 +379,14 @@ func validateForward(t *Tunnel, ve *ValidationError) {
 			ve.Fields["forward_engine_tuning"] = err.Error()
 		}
 	}
+
+	// QUIC needs the tunnel MTU to carry its >=1200-byte datagrams.
+	if t.ForwardProtocol == ForwardProtocolTCP &&
+		t.TCPReliabilityEngine == TCPEngineQUIC && t.MTU < QuicMinMTU {
+		ve.Fields["mtu"] = fmt.Sprintf(
+			"QUIC forwarding needs an MTU of at least %d (QUIC datagrams are at least 1200 bytes). Raise the MTU or use the KCP engine.",
+			QuicMinMTU)
+	}
 }
 
 // validatePorts enforces the unified application-port list rules (v2.7.0):
