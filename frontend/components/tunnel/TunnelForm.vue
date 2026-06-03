@@ -277,6 +277,17 @@ watch([() => draft.value.forward_engine_preset, () => draft.value.tcp_reliabilit
 watch(forwardAdvanced, (on) => {
   if (!on) draft.value.forward_engine_tuning = ''
 })
+// Leaving TCP forwarding clears any engine-tuning override + the Advanced
+// toggle so a stale blob isn't persisted on a now-UDP tunnel (v4-audit B12).
+watch(
+  () => draft.value.forward_protocol,
+  (proto) => {
+    if (proto !== 'tcp') {
+      draft.value.forward_engine_tuning = ''
+      forwardAdvanced.value = false
+    }
+  },
+)
 
 function err(field: string) {
   return props.errors?.[field] ?? null
