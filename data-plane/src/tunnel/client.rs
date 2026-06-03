@@ -1240,7 +1240,6 @@ async fn deliver_verified_job(
                     return;
                 }
                 PortRouter::TcpMulti(inboxes) => {
-                    metrics.record_download(payload.len(), now_unix());
                     metrics.record_transport_packet(transport_label);
                     let (port, body) = match multiport::decode_tag(payload) {
                         Some(v) => v,
@@ -1253,6 +1252,10 @@ async fn deliver_verified_job(
                             return;
                         }
                     };
+                    // Count the UNTAGGED body length so the download throughput
+                    // metric matches the UDP path and the single-port TCP path
+                    // (the 2-byte app-port tag is framing, not payload).
+                    metrics.record_download(body.len(), now_unix());
                     match inboxes.get(&port) {
                         Some(inbox) => {
                             let _ = inbox.try_send(body.to_vec());
