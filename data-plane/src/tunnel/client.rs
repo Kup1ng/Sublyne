@@ -131,32 +131,48 @@ enum PortRouter {
         sessions: Arc<SessionTable>,
     },
     Multi(Arc<HashMap<u16, PortBinding>>),
-    /// `forward_protocol=tcp` (v4.0.0): the verified payload is an inner
-    /// reliability-engine datagram (a KCP segment), not a user UDP packet.
-    /// The verify worker hands it to the engine via this inbox instead of
-    /// delivering it to a UDP listener; the engine reconstructs the TCP
-    /// stream and writes it to the user socket. Single-port only for now
-    /// (multi-port TCP forwarding is gated off in `spec::validate`).
+    /// `forward_protocol=tcp`, single-port (v4.0.0): the verified payload is
+    /// an inner reliability-engine datagram (a KCP/QUIC packet), not a user
+    /// UDP packet. The verify worker hands it to the engine via this inbox
+    /// instead of delivering it to a UDP listener; the engine reconstructs
+    /// the TCP stream and writes it to the user socket.
     Tcp {
         inbox: forward::InboundTx,
     },
+    /// `forward_protocol=tcp`, multi-port: one engine per app port. The
+    /// verify worker decodes the authenticated 2-byte port tag and routes
+    /// the untagged engine datagram to that port's inbox. Unknown ports are
+    /// dropped + warned (config drift), mirroring the UDP `Multi` path.
+    TcpMulti(Arc<HashMap<u16, forward::InboundTx>>),
 }
 
 /// Client-side [`DatagramSink`]: the reliability engine's outbound
 /// datagrams leave through the tunnel's upload transport (WireGuard /
-/// SOCKS5), exactly like a user UDP payload would. Upload metering mirrors
-/// the UDP path so the dashboard's bytes-out counter is unchanged.
+/// SOCKS5), exactly like a user UDP payload would. On a multi-port tunnel
+/// `tag` is `Some(port)` and each datagram is prefixed with the 2-byte
+/// application-port tag (so the peer's verify worker routes it to the right
+/// port's engine); single-port leaves it `None` and ships the datagram
+/// opaque. Upload metering mirrors the UDP path.
 struct ClientForwardSink {
     upload: Arc<dyn UploadTransport>,
     session: SessionKey,
     max_payload: usize,
     metrics: Arc<TunnelMetrics>,
+    tag: Option<u16>,
 }
 
 #[async_trait]
 impl DatagramSink for ClientForwardSink {
     async fn send(&self, datagram: &[u8]) -> io::Result<bool> {
-        match self.upload.send(self.session, datagram).await {
+        let outcome = match self.tag {
+            Some(port) => {
+                let mut buf = Vec::with_capacity(multiport::PORT_TAG_LEN + datagram.len());
+                multiport::encode_tag(port, datagram, &mut buf);
+                self.upload.send(self.session, &buf).await
+            }
+            None => self.upload.send(self.session, datagram).await,
+        };
+        match outcome {
             Ok(true) => {
                 self.metrics.record_upload(datagram.len(), now_unix());
                 Ok(true)
@@ -170,6 +186,50 @@ impl DatagramSink for ClientForwardSink {
     }
     fn max_payload(&self) -> usize {
         self.max_payload
+    }
+}
+
+/// Spawn the chosen reliability engine (KCP or QUIC) over a shared sink +
+/// inbox. Used by both the single- and multi-port TCP-forward paths so the
+/// engine-selection match lives in one place.
+#[allow(clippy::too_many_arguments)]
+fn spawn_forward_engine(
+    engine: TcpReliabilityEngine,
+    tunnel_id: i64,
+    idle_timeout_sec: u32,
+    kcp_tuning: crate::spec::KcpTuning,
+    quic_tuning: &crate::spec::QuicTuning,
+    role: forward::EngineRole,
+    sink: Arc<dyn DatagramSink>,
+    inbox_rx: forward::InboundRx,
+    tasks: &mut JoinSet<()>,
+    stop_rx: &watch::Receiver<bool>,
+) {
+    match engine {
+        TcpReliabilityEngine::Kcp => {
+            let e = forward::KcpEngine::new(
+                forward::EngineConfig {
+                    tunnel_id,
+                    idle_timeout_sec,
+                    tuning: kcp_tuning,
+                },
+                role,
+                sink,
+            );
+            tasks.spawn(e.run(inbox_rx, stop_rx.clone()));
+        }
+        TcpReliabilityEngine::Quic => {
+            let e = forward::QuicEngine::new(
+                forward::QuicConfig {
+                    tunnel_id,
+                    idle_timeout_sec,
+                    tuning: quic_tuning.clone(),
+                },
+                role,
+                sink,
+            );
+            tasks.spawn(e.run(inbox_rx, stop_rx.clone()));
+        }
     }
 }
 
@@ -261,58 +321,91 @@ pub(super) async fn spawn(
         .await
         .map_err(SpawnError::Io)?;
 
-    // v4.0.0 TCP forwarding (single-port). Terminate the user's TCP on
-    // `local`, carry the byte stream over the chosen reliability engine
-    // (KCP or QUIC), and route the download verify workers' verified
-    // segments into the engine inbox. `spec::validate` guarantees
-    // single-port here (multi-port TCP forwarding lands in a follow-up).
+    // v4.0.0 TCP forwarding. Terminate the user's TCP on `local` (one
+    // listener per app port in multi-port mode), carry each byte stream over
+    // the chosen reliability engine (KCP or QUIC), and route the download
+    // verify workers' verified segments into the right engine inbox. Multi
+    // port runs one engine per port over the SHARED upload transport, with
+    // the 2-byte app-port tag applied to engine datagrams.
     if resolved.forward_protocol == ForwardProtocol::Tcp {
-        let tcp_listener = bind_dualstack_tcp(local)
-            .map_err(|e| SpawnError::Io(crate::perf::bind_err(e, "client/tcp-listen", local)))?;
-        crate::perf::tune_socket(&tcp_listener, "client/tcp-listen");
-        info!(tunnel_id = id, addr = %local, family = address_family_label(local),
-            engine = ?spec.tcp_reliability_engine, "client: TCP-forward listener bound");
-        let (inbox_tx, inbox_rx) = forward::inbound_channel();
-        let sink: Arc<dyn DatagramSink> = Arc::new(ClientForwardSink {
-            upload: upload_transport.clone(),
-            session: SessionKey {
-                client_addr: local,
-                local_port: local.port(),
-            },
-            max_payload: (spec.mtu as usize).saturating_sub(multiport::PORT_TAG_LEN),
-            metrics: metrics.clone(),
-        });
-        let role = forward::EngineRole::Client {
-            listener: tcp_listener,
-        };
-        match spec.tcp_reliability_engine {
-            TcpReliabilityEngine::Kcp => {
-                let engine = forward::KcpEngine::new(
-                    forward::EngineConfig {
-                        tunnel_id: id,
-                        idle_timeout_sec: spec.idle_timeout_sec,
-                        tuning: resolved.forward_kcp.unwrap_or_default(),
-                    },
-                    role,
-                    sink,
-                );
-                tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
-            }
-            TcpReliabilityEngine::Quic => {
-                let engine = forward::QuicEngine::new(
-                    forward::QuicConfig {
-                        tunnel_id: id,
-                        idle_timeout_sec: spec.idle_timeout_sec,
-                        tuning: resolved.forward_quic.clone().unwrap_or_default(),
-                    },
-                    role,
-                    sink,
-                );
-                tasks.spawn(engine.run(inbox_rx, stop_rx.clone()));
-            }
-        }
+        let engine = spec.tcp_reliability_engine;
+        let kcp_tuning = resolved.forward_kcp.unwrap_or_default();
+        let quic_tuning = resolved.forward_quic.clone().unwrap_or_default();
+        let max_payload = (spec.mtu as usize).saturating_sub(multiport::PORT_TAG_LEN);
 
-        // The download pipeline feeds the engine inbox instead of a UDP
+        let router = if resolved.multiport() {
+            let local_host = local.ip();
+            let mut map: HashMap<u16, forward::InboundTx> =
+                HashMap::with_capacity(resolved.ports.len());
+            for &port in &resolved.ports {
+                if map.contains_key(&port) {
+                    continue;
+                }
+                let addr = SocketAddr::new(local_host, port);
+                let listener = bind_dualstack_tcp(addr).map_err(|e| {
+                    SpawnError::Io(crate::perf::bind_err(e, "client/tcp-listen", addr))
+                })?;
+                crate::perf::tune_socket(&listener, "client/tcp-listen");
+                let (inbox_tx, inbox_rx) = forward::inbound_channel();
+                let sink: Arc<dyn DatagramSink> = Arc::new(ClientForwardSink {
+                    upload: upload_transport.clone(),
+                    session: SessionKey {
+                        client_addr: addr,
+                        local_port: port,
+                    },
+                    max_payload,
+                    metrics: metrics.clone(),
+                    tag: Some(port),
+                });
+                spawn_forward_engine(
+                    engine,
+                    id,
+                    spec.idle_timeout_sec,
+                    kcp_tuning,
+                    &quic_tuning,
+                    forward::EngineRole::Client { listener },
+                    sink,
+                    inbox_rx,
+                    tasks,
+                    &stop_rx,
+                );
+                map.insert(port, inbox_tx);
+            }
+            PortRouter::TcpMulti(Arc::new(map))
+        } else {
+            let listener = bind_dualstack_tcp(local).map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "client/tcp-listen", local))
+            })?;
+            crate::perf::tune_socket(&listener, "client/tcp-listen");
+            let (inbox_tx, inbox_rx) = forward::inbound_channel();
+            let sink: Arc<dyn DatagramSink> = Arc::new(ClientForwardSink {
+                upload: upload_transport.clone(),
+                session: SessionKey {
+                    client_addr: local,
+                    local_port: local.port(),
+                },
+                max_payload,
+                metrics: metrics.clone(),
+                tag: None,
+            });
+            spawn_forward_engine(
+                engine,
+                id,
+                spec.idle_timeout_sec,
+                kcp_tuning,
+                &quic_tuning,
+                forward::EngineRole::Client { listener },
+                sink,
+                inbox_rx,
+                tasks,
+                &stop_rx,
+            );
+            PortRouter::Tcp { inbox: inbox_tx }
+        };
+        info!(tunnel_id = id, addr = %local, engine = ?engine,
+            multiport = resolved.multiport(), "client: TCP-forward listener(s) bound");
+
+        // The download pipeline feeds the engine inbox(es) instead of a UDP
         // listener. No UDP listener, idle sweeper, or ping-smoothing
         // responder on this path: "sessions" are the engine's convs, and
         // ping smoothing only applies to an end-user UDP/ICMP listener.
@@ -322,7 +415,7 @@ pub(super) async fn spawn(
             resolved,
             id,
             name.clone(),
-            PortRouter::Tcp { inbox: inbox_tx },
+            router,
             mutable_config.clone(),
             metrics.clone(),
             download_port,
@@ -1124,16 +1217,61 @@ async fn deliver_verified_job(
     match verify_result {
         Ok(payload) => {
             // TCP forwarding: the verified payload is an inner reliability-
-            // engine datagram (a KCP segment), not a user UDP packet. Record
-            // the activity (so the health badge reflects real download
-            // traffic) and hand it to the engine, which reconstructs the TCP
-            // stream and writes it to the user socket. Drop on a full inbox —
-            // the inner protocol retransmits.
-            if let PortRouter::Tcp { inbox } = router {
-                metrics.record_download(payload.len(), now_unix());
-                metrics.record_transport_packet(transport_label);
-                let _ = inbox.try_send(payload.to_vec());
-                return;
+            // engine datagram (a KCP segment / QUIC packet), not a user UDP
+            // packet. Record the activity (so the health badge reflects real
+            // download traffic) and hand it to the engine, which reconstructs
+            // the TCP stream and writes it to the user socket. Drop on a full
+            // inbox — the inner protocol retransmits.
+            //
+            // Single-port: one engine, deliver the whole payload. Multi-port:
+            // decode the authenticated 2-byte app-port tag and route the
+            // untagged body to that port's engine inbox; an unknown port is a
+            // config-drift drop, counted like an auth/seq drop.
+            match router {
+                PortRouter::Tcp { inbox } => {
+                    metrics.record_download(payload.len(), now_unix());
+                    metrics.record_transport_packet(transport_label);
+                    let _ = inbox.try_send(payload.to_vec());
+                    return;
+                }
+                PortRouter::TcpMulti(inboxes) => {
+                    metrics.record_download(payload.len(), now_unix());
+                    metrics.record_transport_packet(transport_label);
+                    let (port, body) = match multiport::decode_tag(payload) {
+                        Some(v) => v,
+                        None => {
+                            debug!(
+                                tunnel_id = id,
+                                transport = transport_label,
+                                "client: multi-port TCP download payload too short for port tag"
+                            );
+                            return;
+                        }
+                    };
+                    match inboxes.get(&port) {
+                        Some(inbox) => {
+                            let _ = inbox.try_send(body.to_vec());
+                        }
+                        None => {
+                            let prev = UNKNOWN_PORT_DROPS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if prev % 1000 == 0 {
+                                warn!(
+                                    tunnel_id = id,
+                                    transport = transport_label,
+                                    port,
+                                    dropped_total = prev + 1,
+                                    "client: multi-port TCP download tagged with a port that is \
+                                     not in this tunnel's configured set — the two sides have \
+                                     different port lists; align them"
+                                );
+                            }
+                            metrics.record_auth_drop();
+                        }
+                    }
+                    return;
+                }
+                _ => {}
             }
             // Resolve the delivery target. Single-port: deliver the whole
             // verified payload via the one listener (wire-identical to
@@ -1179,9 +1317,9 @@ async fn deliver_verified_job(
                         }
                     }
                 }
-                // The TCP-forward case returned above; this match only
+                // The TCP-forward cases returned above; this match only
                 // resolves UDP delivery targets.
-                PortRouter::Tcp { .. } => {
+                PortRouter::Tcp { .. } | PortRouter::TcpMulti(_) => {
                     unreachable!("tcp forwarding is delivered to the engine inbox earlier")
                 }
             };

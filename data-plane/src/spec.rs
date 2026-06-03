@@ -356,11 +356,6 @@ pub enum SpecError {
     /// such floor.
     #[error("QUIC forwarding needs mtu >= 1252; got {0}")]
     QuicMtuTooSmall(u32),
-    /// `forward_protocol=tcp` on a multi-port tunnel. Multi-port TCP
-    /// forwarding (one engine instance per app port) lands in a follow-up;
-    /// single-port TCP forwarding works today.
-    #[error("multi-port TCP forwarding is not yet supported; use a single port")]
-    ForwardMultiportUnsupported,
     /// A client tunnel spec carried both `wireguard_fwmark != 0` and a
     /// `socks5_target` block. The two upload paths are mutually
     /// exclusive — the Go control plane never sets both, but the
@@ -404,19 +399,13 @@ impl TunnelSpec {
             return Err(SpecError::MtuTooSmall(self.mtu));
         }
 
-        // v4.0.0: TCP forwarding. Single-port KCP and QUIC are wired.
-        // Multi-port TCP forwarding (one engine per app port) lands in a
-        // follow-up and is refused until then. QUIC also needs the tunnel
-        // MTU to fit its >=1200-byte datagrams.
-        if self.forward_protocol == ForwardProtocol::Tcp {
-            if self.ports.len() >= 2 {
-                return Err(SpecError::ForwardMultiportUnsupported);
-            }
-            if self.tcp_reliability_engine == TcpReliabilityEngine::Quic
-                && self.mtu < QUIC_MIN_TUNNEL_MTU
-            {
-                return Err(SpecError::QuicMtuTooSmall(self.mtu));
-            }
+        // v4.0.0: TCP forwarding (KCP + QUIC, single- and multi-port). QUIC
+        // needs the tunnel MTU to fit its >=1200-byte datagrams.
+        if self.forward_protocol == ForwardProtocol::Tcp
+            && self.tcp_reliability_engine == TcpReliabilityEngine::Quic
+            && self.mtu < QUIC_MIN_TUNNEL_MTU
+        {
+            return Err(SpecError::QuicMtuTooSmall(self.mtu));
         }
 
         match self.role {
@@ -693,16 +682,14 @@ mod tests {
     }
 
     #[test]
-    fn forward_tcp_multiport_rejected() {
-        // Multi-port TCP forwarding lands in a follow-up.
+    fn forward_tcp_multiport_ok() {
+        // Multi-port TCP forwarding (one engine per app port) validates.
         let mut s = base_client();
         s.forward_protocol = ForwardProtocol::Tcp;
         s.tcp_reliability_engine = TcpReliabilityEngine::Kcp;
         s.ports = vec![44443, 44444];
-        assert!(matches!(
-            s.validate(),
-            Err(SpecError::ForwardMultiportUnsupported)
-        ));
+        let r = s.validate().expect("tcp+kcp multi-port should validate");
+        assert!(r.multiport());
     }
 
     #[test]

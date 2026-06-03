@@ -586,6 +586,12 @@ defineExpose({ submit })
         </FieldGroup>
       </div>
 
+      <p v-if="isTcpForward && portsCount > 1" class="mt-4 text-[13px] text-subtle">
+        This tunnel carries {{ portsCount }} ports. The chosen engine, preset, and Advanced settings
+        apply to every port — Sublyne runs one independent reliability engine per port, so a slow or
+        busy port never stalls the others.
+      </p>
+
       <div v-if="isTcpForward" class="mt-5 grid gap-5 md:grid-cols-2">
         <FieldGroup
           label="Tuning preset"
