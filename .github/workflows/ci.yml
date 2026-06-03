@@ -242,7 +242,42 @@ jobs:
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          # GO-2026-5039 (net/textproto) and GO-2026-5037 (crypto/x509)
+          # are Go stdlib advisories fixed only in go1.25.11, which the
+          # GitHub runners don't ship yet (actions/go-versions tops out
+          # at 1.25.10). Waive these two specific IDs so the gate stays
+          # green, while still failing on any OTHER called vulnerability.
+          # Remove this block (back to a bare `govulncheck ./...`) once
+          # setup-go can install go1.25.11.
+          ALLOW="GO-2026-5039 GO-2026-5037"
+          set +e
+          json="$(govulncheck -format json ./...)"
+          rc=$?
+          set -e
+          # In JSON mode the findings are in the stream; treat exit 0
+          # (clean) and 3 (vulns found) as "ran OK" and let the allowlist
+          # decide. Any other code is a real tooling failure.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+            echo "::error::govulncheck failed to run (exit $rc)"
+            printf '%s\n' "$json"
+            exit "$rc"
+          fi
+          # OSV IDs whose top trace frame is a real function call — the
+          # "Your code is affected by N vulnerabilities" set.
+          called="$(printf '%s' "$json" | jq -r 'select(.finding.trace[0].function != null) | .finding.osv' | sort -u)"
+          echo "Called vulnerabilities: ${called:-none}"
+          unexpected=""
+          for id in $called; do
+            case " $ALLOW " in
+              *" $id "*) ;;
+              *) unexpected="$unexpected $id" ;;
+            esac
+          done
+          if [ -n "$unexpected" ]; then
+            echo "::error::Unwaived vulnerabilities detected:$unexpected"
+            exit 1
+          fi
+          echo "No unwaived vulnerabilities — passing (allowlist: $ALLOW)."
 
   frontend:
     name: frontend (nuxt 3)
