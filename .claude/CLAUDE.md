@@ -41,6 +41,17 @@ stop and surface it to the user — don't quietly work around it.
 - **Asymmetric data path.** Upload via WireGuard or SOCKS5,
   download via raw-socket spoofing. The two paths share nothing
   but the PSK and tunnel config.
+- **Forward protocol is an orthogonal layer (v4.0.0).** A tunnel's
+  `forward_protocol` (`udp` default | `tcp`) is independent of
+  download_transport and upload_mode. When `tcp`, a reliability engine
+  (KCP or QUIC, in `data-plane/src/forward/`) sits BETWEEN the user's
+  TCP socket and the existing seal/spoof/anti-replay pipeline — which
+  keeps carrying opaque ≤MTU datagrams and never learns they hold
+  KCP/QUIC framing. Do not push the engine below the seal layer or
+  parallelise the Remote send side; the single send socket + 1024-slot
+  SeqWindow invariants still hold. Engine datagrams are sized like a
+  user UDP payload (≤ mtu − 2). Single-port only so far; multi-port TCP
+  (one engine per port) is gated off in `spec::validate`.
 - **No inter-server control plane.** Client and Remote never
   exchange management messages. All coordination is via shared static
   config.
@@ -172,9 +183,15 @@ understanding the failure they prevent.
 
 ### 5.1 Data plane (Rust)
 
-- Toolchain: stable Rust (currently 1.83+). Pinned via
-  `data-plane/rust-toolchain.toml`.
+- Toolchain: stable Rust, **1.88.0** (bumped from 1.85 in v4.0.0 for the
+  QUIC deps' MSRV). Pinned via `data-plane/rust-toolchain.toml`; keep
+  CI (`ci.yml`, `release.yml`) in lockstep.
 - Target: `x86_64-unknown-linux-musl` (static binary, no glibc dep).
+- **Crypto provider = `ring`, never `aws-lc-rs`.** The v4 QUIC engine
+  pulls quinn + rustls + rcgen, all of which default to `aws-lc-rs`
+  (needs cmake/C++, breaks the static musl build). They're pinned to
+  `ring`; the CI gate `cargo tree -i aws-lc-rs` must stay empty. The
+  `kcp` engine is pure-Rust and adds no such constraint.
 
 Commands (run from `data-plane/`):
 

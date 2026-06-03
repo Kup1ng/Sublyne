@@ -219,6 +219,27 @@ Sublyne hardens the SOCKS5 mode beyond the predecessor project:
 
 ---
 
+## Forward protocol — UDP or TCP (v4.0.0)
+
+Each tunnel has a **Forward protocol**:
+
+- **UDP** (default) — the historical behaviour: datagrams in at the
+  listen port are relayed as UDP. Hand users WireGuard / Hysteria.
+- **TCP** — the tunnel terminates the user's TCP connection and carries
+  it **reliably** over the lossy spoof channel using a reliability engine
+  (**KCP** or **QUIC**), then re-opens TCP to `forward_target`. This lets
+  you hand users **VLESS-TCP / VLESS-WS** configs. Pick a tuning preset
+  (interactive / balanced / lossy) and optionally fine-tune in Advanced.
+
+`forward_protocol` is independent of the spoof transport and upload mode —
+it works on every download×upload row. Both servers must use the same
+forward_protocol + engine + tuning. Existing tunnels migrate to `udp`
+automatically. See [docs/v4.0.0-tcp-forwarding.md](docs/v4.0.0-tcp-forwarding.md)
+for the full guide, engine trade-offs, and the both-ends upgrade note.
+(Multi-port TCP forwarding lands in v4.1.0; use one port per TCP tunnel.)
+
+---
+
 ## Ports and multi-port tunnels
 
 Each tunnel's **Local listen address** (Client) and **Forward target**
