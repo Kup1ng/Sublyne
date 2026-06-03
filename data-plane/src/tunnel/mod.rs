@@ -45,7 +45,10 @@ use crate::manager::StateBroadcast;
 use crate::metrics::TunnelMetrics;
 use crate::protocol::TunnelState;
 use crate::rst_suppress::RstSuppressGuard;
-use crate::spec::{IcmpEchoMode, Role, Socks5Target, Transport, TunnelSpec, UploadListenMode};
+use crate::spec::{
+    ForwardProtocol, IcmpEchoMode, KcpTuning, QuicTuning, Role, Socks5Target, TcpReliabilityEngine,
+    Transport, TunnelSpec, UploadListenMode,
+};
 
 /// Shared state slot used by the tunnel actor to publish its
 /// lifecycle status. Wrapped in `Arc<Mutex<T>>` so the spawn function
@@ -128,6 +131,30 @@ pub(crate) struct SpecSnapshot {
     /// UDP and SOCKS5/TCP rebinds the listener (different socket type
     /// entirely), so a change is operator-visible restart-required.
     pub upload_listen_mode: UploadListenMode,
+
+    /// v4.0.0 TCP forwarding fields. These are consumed ONLY at spawn
+    /// time (client::spawn / remote::spawn build the reliability engine,
+    /// its listener/dial, the per-port conv map, and the inbox once and
+    /// never re-read them), so they are NOT in `MutableConfig` and CANNOT
+    /// hot-reload — any change must route through an internal Stop+Start.
+    /// Tracking them here is what lets `internal_restart_field_differs`
+    /// detect such a change instead of silently classifying it as a
+    /// no-op hot-reload (the engine/preset/tuning would otherwise keep
+    /// running the old config while the panel reported success).
+    pub forward_protocol: ForwardProtocol,
+    pub tcp_reliability_engine: TcpReliabilityEngine,
+    pub forward_kcp: Option<KcpTuning>,
+    pub forward_quic: Option<QuicTuning>,
+    /// Tunnel MTU. Hot-reloadable for UDP forwarding (the relay path
+    /// reads it fresh per packet via `MutableConfig`), but the reliability
+    /// engine bakes `mtu - PORT_TAG_LEN` into its segment size at spawn,
+    /// so for a `forward_protocol=tcp` tunnel an MTU change must rebuild
+    /// the engine via an internal restart (see
+    /// `internal_restart_field_differs`).
+    pub mtu: u32,
+    /// Multi-port app-port list. A change rebinds per-port sockets, so it
+    /// is always an internal restart regardless of `forward_protocol`.
+    pub ports: Vec<u16>,
 }
 
 impl SpecSnapshot {
@@ -145,6 +172,12 @@ impl SpecSnapshot {
             wireguard_fwmark: spec.wireguard_fwmark,
             socks5_target: spec.socks5_target.clone(),
             upload_listen_mode: spec.upload_listen_mode,
+            forward_protocol: spec.forward_protocol,
+            tcp_reliability_engine: spec.tcp_reliability_engine,
+            forward_kcp: spec.forward_kcp,
+            forward_quic: spec.forward_quic.clone(),
+            mtu: spec.mtu,
+            ports: spec.ports.clone(),
         }
     }
 
@@ -200,6 +233,25 @@ impl SpecSnapshot {
             || self.download_send_port != spec.download_send_port
             || self.client_real_ip != spec.client_real_ip
             || self.wireguard_fwmark != spec.wireguard_fwmark
+            // v4.0.0 TCP-forwarding fields: spawn-time-only, so any change
+            // rebuilds the reliability engine via an internal Stop+Start
+            // rather than silently no-op'ing as a hot-reload. Toggling
+            // forward_protocol (incl. udp<->tcp) also rebinds the
+            // listener socket (UDP socket vs TCP listener), which the
+            // internal restart handles.
+            || self.forward_protocol != spec.forward_protocol
+            || self.tcp_reliability_engine != spec.tcp_reliability_engine
+            || self.forward_kcp != spec.forward_kcp
+            || self.forward_quic != spec.forward_quic
+            // Multi-port app-port set: a change rebinds per-port sockets.
+            || self.ports != spec.ports
+            // MTU is hot-reloadable for UDP forwarding (the relay path
+            // re-reads it per packet), but a TCP-forwarding engine bakes
+            // mtu - PORT_TAG_LEN into its segment size at spawn and cannot
+            // resize live — so a TCP tunnel's MTU change must rebuild the
+            // engine. Routing it through the internal restart also re-runs
+            // validate(), restoring the QUIC mtu>=1252 floor check.
+            || (self.forward_protocol == ForwardProtocol::Tcp && self.mtu != spec.mtu)
     }
 
     /// True iff `spec` is identical to the snapshot across every field
@@ -866,5 +918,97 @@ mod classification_tests {
         to_wg.wireguard_fwmark = 0x1001;
         to_wg.socks5_target = None;
         assert!(snap_socks.socks5_credentials_differ(&to_wg));
+    }
+
+    // --- v4.0.0 TCP forwarding (v4-audit A1/A2 regressions) -------------
+    //
+    // The reliability engine, its tuning, the multi-port set, and (for TCP
+    // tunnels) the MTU are all spawn-time-only. Editing any of them on a
+    // running tunnel MUST force an internal Stop+Start, not a silent
+    // hot-reload no-op. Before the fix all of these fell through to
+    // HotReload and were silently dropped while the panel reported success.
+
+    #[test]
+    fn forward_engine_change_is_internal_restart() {
+        let mut base = baseline_client();
+        base.forward_protocol = ForwardProtocol::Tcp;
+        base.tcp_reliability_engine = TcpReliabilityEngine::Kcp;
+        let snap = SpecSnapshot::from_spec(&base);
+        let mut next = base.clone();
+        next.tcp_reliability_engine = TcpReliabilityEngine::Quic;
+        assert!(!snap.listen_addr_differs(&next));
+        assert!(
+            snap.internal_restart_field_differs(&next),
+            "KCP->QUIC on a running tunnel must be an internal restart, not a no-op"
+        );
+    }
+
+    #[test]
+    fn forward_protocol_toggle_is_internal_restart() {
+        let base = baseline_client(); // forward_protocol = Udp
+        let snap = SpecSnapshot::from_spec(&base);
+        let mut next = base.clone();
+        next.forward_protocol = ForwardProtocol::Tcp;
+        assert!(
+            snap.internal_restart_field_differs(&next),
+            "udp->tcp must rebuild the listener/engine via internal restart"
+        );
+    }
+
+    #[test]
+    fn forward_tuning_override_change_is_internal_restart() {
+        let mut base = baseline_client();
+        base.forward_protocol = ForwardProtocol::Tcp;
+        base.forward_kcp = Some(KcpTuning::default());
+        let snap = SpecSnapshot::from_spec(&base);
+        let mut next = base.clone();
+        next.forward_kcp = Some(KcpTuning {
+            snd_wnd: 256,
+            ..KcpTuning::default()
+        });
+        assert!(
+            snap.internal_restart_field_differs(&next),
+            "an Advanced tuning override change must rebuild the engine"
+        );
+    }
+
+    #[test]
+    fn mtu_change_on_tcp_forward_is_internal_restart() {
+        let mut base = baseline_client();
+        base.forward_protocol = ForwardProtocol::Tcp;
+        base.tcp_reliability_engine = TcpReliabilityEngine::Kcp;
+        base.mtu = 1400;
+        let snap = SpecSnapshot::from_spec(&base);
+        let mut next = base.clone();
+        next.mtu = 1300;
+        assert!(
+            snap.internal_restart_field_differs(&next),
+            "lowering MTU on a tcp-forward tunnel must rebuild the engine"
+        );
+    }
+
+    #[test]
+    fn mtu_change_on_udp_forward_stays_hot_reload() {
+        let base = baseline_client(); // forward_protocol = Udp
+        let snap = SpecSnapshot::from_spec(&base);
+        let mut next = base.clone();
+        next.mtu = 1300;
+        assert!(
+            !snap.internal_restart_field_differs(&next),
+            "UDP-forward MTU stays hot-reloadable (relay reads it per packet)"
+        );
+    }
+
+    #[test]
+    fn ports_change_is_internal_restart() {
+        let mut base = baseline_client();
+        base.ports = vec![44443, 44444];
+        let snap = SpecSnapshot::from_spec(&base);
+        let mut next = base.clone();
+        next.ports = vec![44443, 44444, 44445];
+        assert!(
+            snap.internal_restart_field_differs(&next),
+            "adding an app port must rebind sockets via internal restart"
+        );
     }
 }
