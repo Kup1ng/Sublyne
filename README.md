@@ -236,7 +236,9 @@ it works on every download×upload row. Both servers must use the same
 forward_protocol + engine + tuning. Existing tunnels migrate to `udp`
 automatically. See [docs/v4.0.0-tcp-forwarding.md](docs/v4.0.0-tcp-forwarding.md)
 for the full guide, engine trade-offs, and the both-ends upgrade note.
-(Multi-port TCP forwarding lands in v4.1.0; use one port per TCP tunnel.)
+Multi-port TCP tunnels are supported: each app port gets its own
+reliability engine over the shared seal/upload pipeline, routed by the
+2-byte application-port tag.
 
 ---
 

@@ -50,8 +50,13 @@ stop and surface it to the user — don't quietly work around it.
   KCP/QUIC framing. Do not push the engine below the seal layer or
   parallelise the Remote send side; the single send socket + 1024-slot
   SeqWindow invariants still hold. Engine datagrams are sized like a
-  user UDP payload (≤ mtu − 2). Single-port only so far; multi-port TCP
-  (one engine per port) is gated off in `spec::validate`.
+  user UDP payload (≤ mtu − 2). Multi-port TCP runs **one independent
+  reliability engine per app port** (each with its own listener/dial,
+  conv map, and idle reaper), routed by the same 2-byte application-port
+  tag the UDP multi-port path uses; all per-port engines share the one
+  seal/send pipeline (one seq stream, one session_id, one send socket).
+  A single-port TCP tunnel stays byte-for-byte identical on the wire (no
+  tag). Wire-compat: a TCP tunnel needs BOTH ends on v4.
 - **No inter-server control plane.** Client and Remote never
   exchange management messages. All coordination is via shared static
   config.
