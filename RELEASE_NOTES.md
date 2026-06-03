@@ -1,5 +1,62 @@
 # Release notes
 
+## v4.0.1 — v4 hardening (TCP-forwarding bug fixes) (2026-06-03)
+
+A focused hardening pass over the v4.0.0 TCP-forwarding feature. **No new
+features** — it fixes real bugs found in a deep, end-to-end audit of the new
+KCP/QUIC engines and the panel that drives them. Upgrading is a drop-in
+replacement; nothing in your config changes.
+
+**The bugs that mattered most**
+
+- **Editing a running TCP tunnel now actually applies.** Before, changing the
+  reliability engine (KCP↔QUIC), the tuning preset, the Advanced overrides, the
+  port list, or flipping a tunnel between UDP and TCP *while it was running*
+  was silently ignored by the data plane — the panel said "saved" but the box
+  kept running the old settings until you manually Stopped and Started it. The
+  worst case was switching a live tunnel to TCP: the panel showed TCP and you'd
+  hand users TCP configs, but the box was still running the old UDP listener,
+  so nothing connected and no error was shown. These edits now cleanly rebuild
+  the tunnel (a brief blip), exactly like a download-transport change already
+  did.
+- **KCP connections no longer leak or quietly swallow data.** A KCP connection
+  that went idle while still open could leave a background worker and a network
+  handle behind, and bytes the user sent afterward could vanish into a
+  no-longer-active connection. Idle cleanup now fully tears the connection down.
+- **A freshly-opened KCP connection is no longer killed instantly** on a box
+  that has been running longer than the idle timeout.
+- **The QUIC "MTU too small" error now shows in red on the MTU field** instead
+  of only a vague pop-up.
+
+**Robustness / safety**
+
+- **TCP tunnels now respect the memory safety limit and the connection cap.**
+  Under memory pressure (or at the configured max connections) a foreign box
+  now refuses *new* TCP connections cleanly instead of opening them without
+  bound — the same protection UDP tunnels already had. It never self-restarts;
+  existing connections keep flowing.
+- **Bad engine-tuning values are caught when you save**, not silently ignored:
+  a mistyped Advanced field, a QUIC keepalive longer than the idle timeout, or
+  an out-of-range connection/idle value now produces a clear error.
+- Silent TCP-forward upload drops are now counted and logged; minor build/CI
+  and form-cleanup hygiene.
+
+**Known limitation (documented, unchanged)**
+
+TCP forwarding dials your real service only after the *client* sends its first
+byte — which is exactly how VLESS-TCP / VLESS-WS and essentially all proxied
+protocols behave, so it's invisible for the intended use. A genuinely
+*server-speaks-first* protocol (raw SMTP, FTP control, a bare MySQL/SSH banner)
+would not connect; wrap it in a client-speaks-first transport. A proper fix is
+tracked for a later release.
+
+**Still to do (operator):** validate a `tcp+kcp` and a `tcp+quic` tunnel on
+your real two-VPS pair — these fixes are verified by automated tests + CI, not
+by live traffic through the spoof path (which needs root and real hosts).
+
+The full engineering audit — every finding, what was fixed, and what was
+deliberately deferred and why — is in `docs/v4-audit-findings.md`.
+
 ## v4.0.0 — TCP forwarding (KCP / QUIC) + multi-port + modal form (2026-06-03)
 
 **The headline**

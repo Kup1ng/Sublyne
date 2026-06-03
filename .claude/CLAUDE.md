@@ -56,7 +56,14 @@ stop and surface it to the user — don't quietly work around it.
   tag the UDP multi-port path uses; all per-port engines share the one
   seal/send pipeline (one seq stream, one session_id, one send socket).
   A single-port TCP tunnel stays byte-for-byte identical on the wire (no
-  tag). Wire-compat: a TCP tunnel needs BOTH ends on v4.
+  tag). Wire-compat: a TCP tunnel needs BOTH ends on v4. **Known limitation
+  (v4.0.1):** TCP forwarding is *client-speaks-first* — the Remote dials
+  `forward_target` only after the first engine datagram, which both engines
+  emit only once the user's app writes. This fits VLESS-TCP/WS and every
+  proxied protocol; a true server-speaks-first protocol (raw SMTP, FTP
+  control, bare MySQL/SSH banners) would hang until idle-reap. A fix needs an
+  out-of-band conv-open control datagram (an inner engine wire-format change)
+  — do NOT add an in-band priming byte (it corrupts the stream).
 - **No inter-server control plane.** Client and Remote never
   exchange management messages. All coordination is via shared static
   config.
