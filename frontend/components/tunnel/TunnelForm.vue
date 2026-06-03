@@ -28,8 +28,16 @@ const props = defineProps<{
   submitting?: boolean
   onDelete?: (() => void) | null
   errors?: Record<string, string>
+  // When embedded in the tunnel modal the form hides its own sticky
+  // footer — the dialog owns Save / Cancel / Delete and submits this
+  // form via a button associated to `formId`.
+  embedded?: boolean
+  formId?: string
 }>()
-const emit = defineEmits<{ (e: 'submit', value: Partial<Tunnel>): void }>()
+const emit = defineEmits<{
+  (e: 'submit', value: Partial<Tunnel>): void
+  (e: 'update:dirty', value: boolean): void
+}>()
 
 const auth = useAuth()
 const wg = useWireguard()
@@ -174,6 +182,21 @@ const portsParsed = computed(() => parsePorts(portsInput.value))
 const portsError = computed(() => portsParsed.value.error)
 const portsCount = computed(() => portsParsed.value.ports.length)
 
+// --- unsaved-changes tracking ---------------------------------------
+// The modal warns before discarding edits. We compare a JSON fingerprint
+// of the editable state against a baseline captured once the form has
+// mounted with its initial values seeded, so a freshly opened form reads
+// "clean" and any real edit (including switch toggles) flips it dirty.
+const baseline = ref<string | null>(null)
+function fingerprint(): string {
+  return JSON.stringify({ draft: draft.value, ports: portsInput.value })
+}
+const isDirty = computed(() => baseline.value !== null && fingerprint() !== baseline.value)
+watch(isDirty, (v) => emit('update:dirty', v))
+onMounted(() => {
+  baseline.value = fingerprint()
+})
+
 function err(field: string) {
   return props.errors?.[field] ?? null
 }
@@ -188,7 +211,7 @@ function submit() {
 </script>
 
 <template>
-  <form @submit.prevent="submit" class="space-y-6">
+  <form :id="formId" @submit.prevent="submit" class="space-y-6">
     <AppCard title="Identity" description="What to call this tunnel and whether it auto-starts.">
       <div class="grid gap-5 md:grid-cols-2">
         <FieldGroup
@@ -563,7 +586,10 @@ function submit() {
       </div>
     </AppCard>
 
+    <!-- Page-mode footer. Hidden when embedded in the tunnel modal,
+         which renders its own pinned Save / Cancel / Delete bar. -->
     <div
+      v-if="!embedded"
       class="sticky bottom-0 -mx-6 flex items-center justify-between gap-2 border-t border-line/70 bg-bg/90 px-6 py-4 backdrop-blur-md md:-mx-10 md:px-10"
     >
       <AppButton v-if="onDelete" type="button" variant="ghost" @click="onDelete">
