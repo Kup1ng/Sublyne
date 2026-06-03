@@ -12,6 +12,14 @@ publish = false
 name = "sublyne_dataplane"
 path = "src/lib.rs"
 
+# The 1.88 toolchain bump (pulled in for the QUIC engine's deps) promoted
+# clippy::uninlined_format_args to a default-deny lint. The codebase
+# consistently uses the explicit `"{}", x` style; rather than churn every
+# format string, allow it package-wide (covers lib, bin, and every test
+# target in one place).
+[lints.clippy]
+uninlined_format_args = "allow"
+
 [[bin]]
 name = "sublyne-dataplane"
 path = "src/main.rs"

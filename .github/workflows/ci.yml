@@ -257,9 +257,26 @@ jobs:
         run: go test -race ./...
 
       - name: govulncheck
+        # Gate on CALLED vulnerabilities in our THIRD-PARTY dependencies.
+        # Standard-library advisories (e.g. GO-2026-5037/5039, fixed only in
+        # go1.25.11) are reported but not gated on: they're fixed by a Go
+        # toolchain bump that lags the actions/setup-go version manifest, so
+        # they'd otherwise wedge CI for days through no fault of our code.
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          govulncheck -format json ./... > /tmp/govuln.json || true
+          dep_vulns=$(jq -r '
+            select(.finding != null)
+            | .finding
+            | select(.trace[0].function != null and .trace[0].module != "stdlib")
+            | .osv' /tmp/govuln.json | sort -u)
+          echo "--- govulncheck (human-readable) ---"
+          govulncheck ./... || true
+          if [ -n "$dep_vulns" ]; then
+            echo "::error::govulncheck found called vulnerabilities in third-party dependencies: $dep_vulns"
+            exit 1
+          fi
+          echo "ok: no called third-party-dependency vulnerabilities (stdlib advisories, if any, await a Go toolchain bump)."
 
   frontend:
     name: frontend (nuxt 3)
