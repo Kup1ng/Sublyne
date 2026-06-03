@@ -139,6 +139,14 @@ struct Conv {
     /// Set by a read pump on TCP EOF so the reaper closes the conv after
     /// a short linger even if the peer keeps it warm.
     closing: Arc<AtomicBool>,
+    /// Fired (via `notify_one`, permit-storing) when this conv is reaped
+    /// so its still-parked read pump unblocks, drops the TCP read half
+    /// (closing the fd), and exits — instead of leaking forever on
+    /// `window.notified()` and silently black-holing later user bytes
+    /// into a no-longer-driven KCP. `notify_one` (not `notify_waiters`)
+    /// so a reap that races the pump's brief between-await window still
+    /// stores a permit the next `notified()` consumes.
+    stop: Arc<Notify>,
     snd_wnd: usize,
 }
 
@@ -249,7 +257,7 @@ impl KcpEngine {
                     let now = clock.elapsed().as_millis() as u64;
                     handle_inbound(
                         &dg, now, &cfg, mtu, clock, &convs, &egress_tx, &stats,
-                        forward_target, &mut recently_closed, &mut recv_buf,
+                        forward_target, &mut recently_closed, &mut recv_buf, &stop_rx,
                     );
                 }
                 _ = tick.tick() => {
@@ -296,6 +304,7 @@ fn build_conv(
     mtu: usize,
     egress_tx: &mpsc::Sender<Vec<u8>>,
     stats: Arc<EngineStats>,
+    now_ms: u64,
 ) -> (Conv, mpsc::Receiver<Vec<u8>>) {
     let sink = OutSink {
         tx: egress_tx.clone(),
@@ -311,8 +320,15 @@ fn build_conv(
         kcp: Arc::new(Mutex::new(kcp)),
         app_tx,
         window: Arc::new(Notify::new()),
-        last_activity_ms: Arc::new(AtomicU64::new(0)),
+        // Seed last_activity with the current engine clock, NOT 0: on an
+        // engine that has already been up longer than idle_timeout, a
+        // fresh conv with last=0 has idle = now - 0 >= idle_ms and would
+        // be reaped on the very next sweep before it ever carried traffic
+        // (e.g. a client slow to send its first byte). Seeding `now` gives
+        // every conv a full idle window from creation.
+        last_activity_ms: Arc::new(AtomicU64::new(now_ms)),
         closing: Arc::new(AtomicBool::new(false)),
+        stop: Arc::new(Notify::new()),
         snd_wnd,
     };
     (conv, app_rx)
@@ -333,6 +349,7 @@ fn handle_inbound(
     forward_target: Option<SocketAddr>,
     recently_closed: &mut VecDeque<(u32, u64)>,
     recv_buf: &mut [u8],
+    stop_rx: &watch::Receiver<bool>,
 ) {
     let Some(conv_id) = peek_conv(dg) else {
         return;
@@ -362,12 +379,13 @@ fn handle_inbound(
         return;
     }
 
-    let (conv, app_rx) = build_conv(conv_id, cfg, mtu, egress_tx, stats.clone());
+    let (conv, app_rx) = build_conv(conv_id, cfg, mtu, egress_tx, stats.clone(), now);
     let kcp = conv.kcp.clone();
     let app_tx = conv.app_tx.clone();
     let last = conv.last_activity_ms.clone();
     let window = conv.window.clone();
     let closing = conv.closing.clone();
+    let stop = conv.stop.clone();
     let snd_wnd = conv.snd_wnd;
     convs.lock().expect("conv map").insert(conv_id, conv);
     stats.conv_opens.fetch_add(1, Ordering::Relaxed);
@@ -384,6 +402,8 @@ fn handle_inbound(
 
     // Dial off-driver so a slow connect can't stall the timer loop.
     let convs = convs.clone();
+    let stats = stats.clone();
+    let stop_rx = stop_rx.clone();
     let tunnel_id = cfg.tunnel_id;
     tokio::spawn(async move {
         match TcpStream::connect(forward_target).await {
@@ -391,12 +411,21 @@ fn handle_inbound(
                 let _ = stream.set_nodelay(true);
                 let (read, write) = stream.into_split();
                 spawn_write_pump(write, app_rx);
-                spawn_read_pump(read, kcp, window, last, closing, snd_wnd, clock);
+                spawn_read_pump(
+                    read, kcp, window, last, closing, stop, snd_wnd, clock, stop_rx,
+                );
             }
             Err(e) => {
                 warn!(tunnel_id, conv = conv_id, target = %forward_target, err = %e,
                     "kcp: dial forward_target failed; dropping conv");
-                convs.lock().expect("conv map").remove(&conv_id);
+                // Decrement active_conns ONLY if we actually evicted the
+                // conv — a concurrent reap_idle may have removed it first
+                // (and already decremented), and an unguarded fetch_sub
+                // would underflow the AtomicU64. This keeps active_conns
+                // from leaking upward on every failed forward_target dial.
+                if convs.lock().expect("conv map").remove(&conv_id).is_some() {
+                    stats.active_conns.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     });
@@ -477,10 +506,18 @@ fn reap_idle(
     stats: &EngineStats,
     recently_closed: &mut VecDeque<(u32, u64)>,
 ) {
-    let idle_ms = u64::from(cfg.idle_timeout_sec) * 1000;
+    // Clamp idle_timeout to >= 1 s: a (mis)configured idle_timeout_sec = 0
+    // would make idle_ms = 0 so EVERY conv reaps on the next sweep. Mirror
+    // the >=1 clamp the other timeout consumers apply.
+    let idle_ms = u64::from(cfg.idle_timeout_sec.max(1)) * 1000;
     // Linger a closing conv long enough to flush final ACKs.
     let linger_ms = (u64::from(cfg.tuning.interval) * 2).max(200);
-    let mut removed: Vec<u32> = Vec::new();
+    // Collect (id, stop-handle) of reaped convs so we can wake their
+    // detached read pumps AFTER releasing the map lock — the read pump
+    // is not a map entry and would otherwise stay parked on
+    // window.notified() forever, leaking its task + TCP read-half fd and
+    // silently swallowing any later user bytes into a no-longer-driven KCP.
+    let mut removed: Vec<(u32, Arc<Notify>)> = Vec::new();
     {
         let mut map = convs.lock().expect("conv map");
         map.retain(|&id, c| {
@@ -489,7 +526,7 @@ fn reap_idle(
             let drop_it =
                 (c.closing.load(Ordering::Relaxed) && idle >= linger_ms) || idle >= idle_ms;
             if drop_it {
-                removed.push(id);
+                removed.push((id, c.stop.clone()));
             }
             !drop_it
         });
@@ -501,7 +538,11 @@ fn reap_idle(
         stats
             .idle_teardowns
             .fetch_add(removed.len() as u64, Ordering::Relaxed);
-        for id in removed {
+        for (id, stop) in removed {
+            // Permit-storing wake: if the read pump is mid-iteration (not
+            // currently parked on `notified()`), notify_one stores a permit
+            // the next `notified()` consumes, so the wake can't be missed.
+            stop.notify_one();
             recently_closed.push_back((id, now));
             debug!(
                 tunnel_id = cfg.tunnel_id,
@@ -548,12 +589,19 @@ fn spawn_accept_loop(
                     };
                     let _ = stream.set_nodelay(true);
                     let conv_id = conv_counter.fetch_add(1, Ordering::Relaxed);
-                    let (conv, app_rx) =
-                        build_conv(conv_id, &cfg, mtu, &egress_tx, stats.clone());
+                    let (conv, app_rx) = build_conv(
+                        conv_id,
+                        &cfg,
+                        mtu,
+                        &egress_tx,
+                        stats.clone(),
+                        clock.elapsed().as_millis() as u64,
+                    );
                     let kcp = conv.kcp.clone();
                     let window = conv.window.clone();
                     let last = conv.last_activity_ms.clone();
                     let closing = conv.closing.clone();
+                    let stop = conv.stop.clone();
                     let snd_wnd = conv.snd_wnd;
                     convs.lock().expect("conv map").insert(conv_id, conv);
                     stats.conv_opens.fetch_add(1, Ordering::Relaxed);
@@ -561,7 +609,9 @@ fn spawn_accept_loop(
                     debug!(tunnel_id = cfg.tunnel_id, conv = conv_id, "kcp: accepted TCP, opened conv");
                     let (read, write) = stream.into_split();
                     spawn_write_pump(write, app_rx);
-                    spawn_read_pump(read, kcp, window, last, closing, snd_wnd, clock);
+                    spawn_read_pump(
+                        read, kcp, window, last, closing, stop, snd_wnd, clock, stop_rx.clone(),
+                    );
                 }
             }
         }
@@ -578,16 +628,27 @@ fn spawn_read_pump(
     window: Arc<Notify>,
     last: Arc<AtomicU64>,
     closing: Arc<AtomicBool>,
+    stop: Arc<Notify>,
     snd_wnd: usize,
     clock: Instant,
+    mut stop_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; TCP_READ_CHUNK];
-        loop {
-            let n = match read.read(&mut buf).await {
-                Ok(0) => break, // EOF
-                Ok(n) => n,
-                Err(_) => break,
+        'pump: loop {
+            // BOTH await points race the stop signals so a reaped conv
+            // (per-conv `stop`) or a stopping engine (`stop_rx`) unblocks
+            // the pump promptly — dropping `read` closes the TCP read-half
+            // fd. Without this the pump leaks and silently feeds later user
+            // bytes into a KCP the driver no longer updates.
+            let n = tokio::select! {
+                _ = stop_rx.changed() => break,
+                _ = stop.notified() => break,
+                r = read.read(&mut buf) => match r {
+                    Ok(0) => break, // EOF
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
             };
             // Window gate: wait until KCP has room before queuing more.
             loop {
@@ -604,7 +665,11 @@ fn spawn_read_pump(
                     last.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
                     break;
                 }
-                window.notified().await;
+                tokio::select! {
+                    _ = stop_rx.changed() => break 'pump,
+                    _ = stop.notified() => break 'pump,
+                    _ = window.notified() => {}
+                }
             }
         }
         // Signal the reaper to tear this conv down after a short linger.
@@ -626,4 +691,99 @@ fn spawn_write_pump(
         }
         let _ = write.shutdown().await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the idle-reaper accounting and the fresh-conv grace
+    //! window. `build_conv` and `reap_idle` are module-private free
+    //! functions, so a same-file test can drive them without real sockets
+    //! (the dial / pump tasks are never spawned here).
+
+    use super::*;
+
+    fn cfg(idle_timeout_sec: u32) -> EngineConfig {
+        EngineConfig {
+            tunnel_id: 1,
+            idle_timeout_sec,
+            tuning: KcpTuning::default(),
+        }
+    }
+
+    fn empty_convs() -> Arc<Mutex<HashMap<u32, Conv>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// A4 regression: a conv created on an engine that has already been up
+    /// far longer than idle_timeout must NOT be reaped on the very next
+    /// sweep. Before the fix `last_activity_ms` started at 0, so
+    /// `idle = now - 0 >= idle_ms` was instantly true and the brand-new
+    /// connection was killed before it ever carried traffic.
+    #[test]
+    fn fresh_conv_survives_reap_on_long_lived_engine() {
+        let c = cfg(10);
+        let stats = Arc::new(EngineStats::default());
+        let (egress_tx, _egress_rx) = mpsc::channel::<Vec<u8>>(16);
+        let convs = empty_convs();
+        // Engine "now" ~1000 s of uptime, far exceeding the 10 s idle window.
+        let now = 1_000_000u64;
+        let (conv, _app_rx) = build_conv(5, &c, 1200, &egress_tx, stats.clone(), now);
+        convs.lock().unwrap().insert(5, conv);
+        stats.active_conns.fetch_add(1, Ordering::Relaxed);
+        let mut rc = VecDeque::new();
+        reap_idle(now, &c, &convs, &stats, &mut rc);
+        assert_eq!(
+            convs.lock().unwrap().len(),
+            1,
+            "a freshly-seeded conv must survive the first sweep on a long-lived engine"
+        );
+        assert_eq!(stats.active_conns.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.idle_teardowns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Reap accounting is symmetric: an idle conv is removed, active_conns
+    /// is decremented (so it can't drift upward), idle_teardowns is bumped,
+    /// and the id is recorded in recently_closed (Remote resurrection guard).
+    #[test]
+    fn idle_conv_is_reaped_with_symmetric_accounting() {
+        let c = cfg(10);
+        let stats = Arc::new(EngineStats::default());
+        let (egress_tx, _egress_rx) = mpsc::channel::<Vec<u8>>(16);
+        let convs = empty_convs();
+        // last = 0; now = 11 s → idle 11 s >= the 10 s idle window.
+        let (conv, _app_rx) = build_conv(7, &c, 1200, &egress_tx, stats.clone(), 0);
+        convs.lock().unwrap().insert(7, conv);
+        stats.active_conns.fetch_add(1, Ordering::Relaxed);
+        let mut rc = VecDeque::new();
+        reap_idle(11_000, &c, &convs, &stats, &mut rc);
+        assert!(convs.lock().unwrap().is_empty(), "idle conv must be reaped");
+        assert_eq!(
+            stats.active_conns.load(Ordering::Relaxed),
+            0,
+            "active_conns must return to 0 after the only conv is reaped"
+        );
+        assert_eq!(stats.idle_teardowns.load(Ordering::Relaxed), 1);
+        assert!(rc.iter().any(|(id, _)| *id == 7));
+    }
+
+    /// idle_timeout_sec = 0 must be clamped to >= 1 s so a fresh conv is not
+    /// reaped on the very next sweep (a degenerate 0 would make every conv
+    /// idle-out instantly).
+    #[test]
+    fn idle_timeout_zero_is_clamped() {
+        let c = cfg(0);
+        let stats = Arc::new(EngineStats::default());
+        let (egress_tx, _egress_rx) = mpsc::channel::<Vec<u8>>(16);
+        let convs = empty_convs();
+        let now = 100u64; // 100 ms of uptime; clamp gives a 1 s idle window
+        let (conv, _app_rx) = build_conv(9, &c, 1200, &egress_tx, stats.clone(), now);
+        convs.lock().unwrap().insert(9, conv);
+        let mut rc = VecDeque::new();
+        reap_idle(now, &c, &convs, &stats, &mut rc);
+        assert_eq!(
+            convs.lock().unwrap().len(),
+            1,
+            "idle_timeout_sec=0 must clamp to >=1 s, not reap a fresh conv immediately"
+        );
+    }
 }
