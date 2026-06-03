@@ -558,8 +558,18 @@ defineExpose({ submit })
         >
           <AppSelect v-model="draft.icmp_echo_mode" :options="icmpModeOptions" />
         </FieldGroup>
-        <FieldGroup label="MTU" help="Default 1400 — leaves headroom for WG + HMAC overhead.">
-          <AppInput v-model="draft.mtu" type="number" placeholder="1400" monospace />
+        <FieldGroup
+          label="MTU"
+          help="Default 1400 — leaves headroom for WG + HMAC overhead."
+          :error="err('mtu')"
+        >
+          <AppInput
+            v-model="draft.mtu"
+            type="number"
+            placeholder="1400"
+            monospace
+            :invalid="!!err('mtu')"
+          />
         </FieldGroup>
       </div>
     </AppCard>
