@@ -13,17 +13,22 @@
 //! NOTE — weaker isolation proof than the KCP test: QUIC negotiates its own
 //! random connection IDs per handshake, so a misrouted packet delivered to
 //! the wrong engine is dropped as an unknown-DCID packet rather than
-//! corrupting the other port's stream. This test therefore catches GROSS
-//! misrouting (a tag that's ignored / always wrong) as a TIMEOUT, not as
-//! byte corruption — unlike the KCP test, where colliding conv-ids make a
-//! misroute corrupt the stream and fail loudly. It is still a real
-//! regression guard; just don't read it as a byte-level no-cross-talk proof.
+//! corrupting the other port's stream. To compensate, this test instruments
+//! the channel: it asserts BOTH ports carried correctly-tagged traffic and
+//! that ZERO datagrams were untagged / tagged for an unknown port — so an
+//! engine that emits a missing/garbage tag fails loudly here instead of as a
+//! slow timeout. The *production* per-port routing decode
+//! (`TcpUploadRouter::route`) is itself covered deterministically by a unit
+//! test in `data-plane/src/tunnel/remote.rs` (correct port → right inbox,
+//! unknown port / too-short → dropped), which is the byte-level
+//! no-cross-talk proof this end-to-end test can't give on its own.
 //!
 //! Needs NO CAP_NET_RAW and no real sockets beyond loopback TCP.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,10 +71,36 @@ fn lcg(state: &mut u64) -> u64 {
     *state
 }
 
-async fn deliver(routes: &HashMap<u16, InboundTx>, pkt: Vec<u8>) {
-    if let Some((port, body)) = decode_tag(&pkt) {
-        if let Some(tx) = routes.get(&port) {
-            let _ = tx.send(body.to_vec()).await;
+/// Per-port delivery counter + a `bad` counter for any datagram that is
+/// untagged (too short) or tagged for a port not in the route set — i.e. a
+/// sender that emitted a missing/garbage tag. Shared across both directions.
+struct TagStats {
+    per_port: HashMap<u16, AtomicU64>,
+    bad: AtomicU64,
+}
+
+async fn deliver(routes: &HashMap<u16, InboundTx>, pkt: Vec<u8>, stats: &TagStats) {
+    match decode_tag(&pkt) {
+        Some((port, body)) => match routes.get(&port) {
+            Some(tx) => {
+                if let Some(c) = stats.per_port.get(&port) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Decoded a port we route by but didn't pre-register a
+                    // counter for — treat as unexpected.
+                    stats.bad.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = tx.send(body.to_vec()).await;
+            }
+            // Tagged for a port outside the configured set: a misroute the
+            // engine should never produce here.
+            None => {
+                stats.bad.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        // Too short to carry the 2-byte tag — a malformed/untagged datagram.
+        None => {
+            stats.bad.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -77,6 +108,7 @@ async fn deliver(routes: &HashMap<u16, InboundTx>, pkt: Vec<u8>) {
 async fn routing_lossy_pipe(
     mut in_rx: mpsc::Receiver<Vec<u8>>,
     routes: HashMap<u16, InboundTx>,
+    stats: Arc<TagStats>,
     drop_pct: u64,
     reorder_pct: u64,
     seed: u64,
@@ -91,13 +123,13 @@ async fn routing_lossy_pipe(
             held = Some(pkt);
             continue;
         }
-        deliver(&routes, pkt).await;
+        deliver(&routes, pkt, &stats).await;
         if let Some(h) = held.take() {
-            deliver(&routes, h).await;
+            deliver(&routes, h, &stats).await;
         }
     }
     if let Some(h) = held.take() {
-        deliver(&routes, h).await;
+        deliver(&routes, h, &stats).await;
     }
 }
 
@@ -240,18 +272,42 @@ async fn quic_multiport_streams_survive_without_crosstalk() {
     let (client_in_a_tx, client_in_a_rx) = inbound_channel();
     let (client_in_b_tx, client_in_b_rx) = inbound_channel();
 
+    // Shared tag-fidelity stats across both directions: every datagram either
+    // routes to PORT_A or PORT_B, and `bad` must stay 0 (no untagged / unknown
+    // tag from either engine).
+    let stats = Arc::new(TagStats {
+        per_port: [(PORT_A, AtomicU64::new(0)), (PORT_B, AtomicU64::new(0))]
+            .into_iter()
+            .collect(),
+        bad: AtomicU64::new(0),
+    });
+
     // Lighter loss than KCP: QUIC's loss-based congestion control backs off
     // harder, so 4%/3% keeps two concurrent streams brisk while still
     // exercising retransmission + reordering recovery.
     let mut c2r_routes = HashMap::new();
     c2r_routes.insert(PORT_A, remote_in_a_tx);
     c2r_routes.insert(PORT_B, remote_in_b_tx);
-    tokio::spawn(routing_lossy_pipe(c2r_rx, c2r_routes, 4, 3, 0xaaaa));
+    tokio::spawn(routing_lossy_pipe(
+        c2r_rx,
+        c2r_routes,
+        stats.clone(),
+        4,
+        3,
+        0xaaaa,
+    ));
 
     let mut r2c_routes = HashMap::new();
     r2c_routes.insert(PORT_A, client_in_a_tx);
     r2c_routes.insert(PORT_B, client_in_b_tx);
-    tokio::spawn(routing_lossy_pipe(r2c_rx, r2c_routes, 4, 3, 0x5555));
+    tokio::spawn(routing_lossy_pipe(
+        r2c_rx,
+        r2c_routes,
+        stats.clone(),
+        4,
+        3,
+        0x5555,
+    ));
 
     let (stop_tx, stop_rx) = watch::channel(false);
 
@@ -286,6 +342,21 @@ async fn quic_multiport_streams_survive_without_crosstalk() {
     })
     .await
     .expect("timed out waiting for both port streams");
+
+    // Tag fidelity: both ports carried correctly-tagged traffic, and no
+    // datagram was untagged or tagged for an unknown port. This turns an
+    // engine that emits a missing/garbage tag into a loud assertion instead of
+    // a silent unknown-DCID drop that would only show up as a timeout.
+    assert_eq!(
+        stats.bad.load(Ordering::Relaxed),
+        0,
+        "every engine datagram must carry a valid PORT_A/PORT_B tag"
+    );
+    assert!(
+        stats.per_port[&PORT_A].load(Ordering::Relaxed) > 0
+            && stats.per_port[&PORT_B].load(Ordering::Relaxed) > 0,
+        "both ports must have carried tagged datagrams (each engine pair ran)"
+    );
 
     let _ = stop_tx.send(true);
 }

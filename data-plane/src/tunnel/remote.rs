@@ -2120,3 +2120,96 @@ fn spawn_idle_sweeper(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    //! Deterministic coverage of the production multi-port TCP-forward upload
+    //! routing (`TcpUploadRouter::route`). The loopback integration tests use
+    //! their own routing pipe and run separate QUIC endpoints per port, so a
+    //! misroute there only ever surfaces as a timeout (v4.0.0 caveat). This
+    //! exercises the REAL router decode directly, so a tag/route regression
+    //! fails loudly and instantly instead of as a slow timeout.
+
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Single-port: the whole datagram is the body and goes to the one inbox.
+    #[test]
+    fn router_single_delivers_whole_datagram() {
+        let (tx, mut rx) = forward::inbound_channel();
+        let router = TcpUploadRouter::Single(tx);
+        let dg = b"opaque-kcp-or-quic-bytes";
+        let (inbox, body) = router.route(dg, 1).expect("single must route");
+        assert_eq!(body, dg, "single-port body is the whole datagram (no tag)");
+        inbox.try_send(b"probe".to_vec()).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), b"probe".to_vec());
+    }
+
+    /// Multi-port: a correctly-tagged datagram strips the 2-byte tag and routes
+    /// to exactly that port's inbox — and to no other.
+    #[test]
+    fn router_multi_routes_by_tag_to_the_right_inbox() {
+        let (tx_a, mut rx_a) = forward::inbound_channel();
+        let (tx_b, mut rx_b) = forward::inbound_channel();
+        let mut map: HashMap<u16, forward::InboundTx> = HashMap::new();
+        map.insert(8001, tx_a);
+        map.insert(8002, tx_b);
+        let router = TcpUploadRouter::Multi(Arc::new(map));
+
+        // Port 8001 payload.
+        let mut dg_a = Vec::new();
+        multiport::encode_tag(8001, b"alpha", &mut dg_a);
+        let (inbox_a, body_a) = router.route(&dg_a, 1).expect("port 8001 must route");
+        assert_eq!(body_a, b"alpha", "tag must be stripped, leaving the body");
+        inbox_a.try_send(b"to-a".to_vec()).unwrap();
+        assert_eq!(
+            rx_a.try_recv().unwrap(),
+            b"to-a".to_vec(),
+            "routed to A's inbox"
+        );
+        assert!(rx_b.try_recv().is_err(), "must NOT cross-deliver to B");
+
+        // Port 8002 payload.
+        let mut dg_b = Vec::new();
+        multiport::encode_tag(8002, b"bravo", &mut dg_b);
+        let (inbox_b, body_b) = router.route(&dg_b, 1).expect("port 8002 must route");
+        assert_eq!(body_b, b"bravo");
+        inbox_b.try_send(b"to-b".to_vec()).unwrap();
+        assert_eq!(
+            rx_b.try_recv().unwrap(),
+            b"to-b".to_vec(),
+            "routed to B's inbox"
+        );
+        assert!(rx_a.try_recv().is_err(), "must NOT cross-deliver to A");
+    }
+
+    /// Multi-port: a datagram tagged with a port not in the configured set is
+    /// dropped (config drift between the two sides), not misrouted.
+    #[test]
+    fn router_multi_drops_unknown_port() {
+        let (tx_a, _rx_a) = forward::inbound_channel();
+        let mut map: HashMap<u16, forward::InboundTx> = HashMap::new();
+        map.insert(8001, tx_a);
+        let router = TcpUploadRouter::Multi(Arc::new(map));
+        let mut dg = Vec::new();
+        multiport::encode_tag(9999, b"orphan", &mut dg);
+        assert!(
+            router.route(&dg, 1).is_none(),
+            "unknown port must be dropped"
+        );
+    }
+
+    /// Multi-port: a datagram too short to carry the 2-byte tag is dropped.
+    #[test]
+    fn router_multi_drops_too_short() {
+        let (tx_a, _rx_a) = forward::inbound_channel();
+        let mut map: HashMap<u16, forward::InboundTx> = HashMap::new();
+        map.insert(8001, tx_a);
+        let router = TcpUploadRouter::Multi(Arc::new(map));
+        assert!(
+            router.route(&[0u8], 1).is_none(),
+            "too-short must be dropped"
+        );
+        assert!(router.route(&[], 1).is_none(), "empty must be dropped");
+    }
+}
