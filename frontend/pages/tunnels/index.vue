@@ -45,8 +45,13 @@ onMounted(async () => {
   // refresh doesn't reopen it.
   const editQ = route.query.edit
   const newQ = route.query.new
-  if (typeof editQ === 'string' && editQ) openEdit(Number(editQ))
-  else if (newQ) openCreate()
+  if (typeof editQ === 'string' && editQ) {
+    // Validate the id: a malformed ?edit=abc would otherwise become
+    // openEdit(NaN) and pop a confusing empty/Create-looking modal. Only open
+    // the edit modal for a real positive integer id; ignore garbage links.
+    const id = Number(editQ)
+    if (Number.isInteger(id) && id > 0) openEdit(id)
+  } else if (newQ) openCreate()
   if (editQ || newQ) router.replace({ query: {} })
 })
 
