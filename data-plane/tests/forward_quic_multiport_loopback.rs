@@ -156,6 +156,7 @@ async fn spawn_port_pair(
         QuicConfig {
             tunnel_id: port as i64,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: balanced_tuning(),
         },
         EngineRole::Client {
@@ -173,6 +174,7 @@ async fn spawn_port_pair(
         QuicConfig {
             tunnel_id: 1000 + port as i64,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: balanced_tuning(),
         },
         EngineRole::Remote {

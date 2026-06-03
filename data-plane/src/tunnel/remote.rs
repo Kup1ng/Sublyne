@@ -74,6 +74,12 @@ use super::{sampled, sleep_or_stopped, MutableConfigSlot, ReasonSlot, StateSlot}
 static OVERSIZED_UPLOAD_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SESSION_FULL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FORWARD_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// TCP-forward upload frames dropped because the engine inbox was full
+/// (a slow/stalled reliability engine). Sampled like the UDP-path drop
+/// counters so a sustained stall doesn't flood the log; counted as an
+/// upload drop so it isn't also recorded as a delivered upload.
+static TCP_UPLOAD_INBOX_FULL_DROPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Per-seal-worker input channel cap. Bounds how far a slow seal
 /// worker can fall behind its peers: at most `SEAL_WORKER_CHANNEL_CAP`
@@ -570,6 +576,7 @@ fn spawn_remote_forward_engine(
     engine: TcpReliabilityEngine,
     tunnel_id: i64,
     idle_timeout_sec: u32,
+    max_connections: u32,
     kcp_tuning: crate::spec::KcpTuning,
     quic_tuning: &crate::spec::QuicTuning,
     forward_target: SocketAddr,
@@ -585,6 +592,7 @@ fn spawn_remote_forward_engine(
                 forward::EngineConfig {
                     tunnel_id,
                     idle_timeout_sec,
+                    max_connections,
                     tuning: kcp_tuning,
                 },
                 role,
@@ -597,6 +605,7 @@ fn spawn_remote_forward_engine(
                 forward::QuicConfig {
                     tunnel_id,
                     idle_timeout_sec,
+                    max_connections,
                     tuning: quic_tuning.clone(),
                 },
                 role,
@@ -777,6 +786,7 @@ async fn spawn_tcp_forward_remote(
                 engine,
                 id,
                 spec.idle_timeout_sec,
+                spec.max_connections,
                 kcp_tuning,
                 &quic_tuning,
                 target,
@@ -804,6 +814,7 @@ async fn spawn_tcp_forward_remote(
             engine,
             id,
             spec.idle_timeout_sec,
+            spec.max_connections,
             kcp_tuning,
             &quic_tuning,
             forward_target,
@@ -921,6 +932,12 @@ fn spawn_tcp_upload_udp(
                     let body_len = body.len();
                     if inbox.try_send(body.to_vec()).is_ok() {
                         metrics.record_upload(body_len, now_unix());
+                    } else {
+                        metrics.record_upload_drop();
+                        if let Some(total) = sampled(&TCP_UPLOAD_INBOX_FULL_DROPS) {
+                            warn!(tunnel_id = id, dropped_total = total,
+                                "remote: tcp-forward upload dropped — engine inbox full (slow reliability engine)");
+                        }
                     }
                 }
             }
@@ -1036,6 +1053,12 @@ async fn drive_socks5_upload_to_inbox(
                 let body_len = body.len();
                 if inbox.try_send(body.to_vec()).is_ok() {
                     metrics.record_upload(body_len, now_unix());
+                } else {
+                    metrics.record_upload_drop();
+                    if let Some(total) = sampled(&TCP_UPLOAD_INBOX_FULL_DROPS) {
+                        warn!(tunnel_id = id, dropped_total = total,
+                            "remote: tcp-forward socks5 upload dropped — engine inbox full (slow reliability engine)");
+                    }
                 }
             }
         }

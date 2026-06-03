@@ -74,6 +74,10 @@ pub struct EngineStats {
     pub active_conns: AtomicU64,
     pub conv_opens: AtomicU64,
     pub idle_teardowns: AtomicU64,
+    /// New convs refused because the tunnel was at `max_connections` or the
+    /// process was over the memory soft cap (`memory::pressure_active`).
+    /// Best-effort drop — the peer's reliability layer retransmits / backs off.
+    pub conv_rejects: AtomicU64,
     /// Segments dropped at the egress staging boundary (channel full).
     pub egress_drops: AtomicU64,
     /// Datagrams the sink dropped pre-wire (best-effort channel).
@@ -96,6 +100,10 @@ pub struct EngineConfig {
     /// Idle timeout (seconds) — a conv with no traffic for this long is
     /// reaped. Reuses the tunnel's `idle_timeout_sec`.
     pub idle_timeout_sec: u32,
+    /// Per-tunnel connection ceiling (the tunnel's `max_connections`). A new
+    /// conv is refused once the live conv count reaches this, mirroring the
+    /// UDP path's session-table cap so a TCP tunnel honours the same limit.
+    pub max_connections: u32,
     /// Resolved KCP tuning (preset + Advanced overrides) from the spec.
     pub tuning: KcpTuning,
 }
@@ -379,6 +387,22 @@ fn handle_inbound(
         return;
     }
 
+    // Admission control, mirroring the UDP path's session-table gate
+    // (session.rs insert_or_refresh): refuse a new conv when the tunnel is at
+    // max_connections OR the process is over the memory soft cap. Without this
+    // a TCP-forward Remote would keep minting convs and dialing forward_target
+    // under pressure — violating the "RSS > ~70% → refuse new sessions, never
+    // self-kill" invariant. Best-effort drop: the Client's KCP retransmits, so
+    // the conv opens once headroom returns. (max_connections == 0 ⇒ no cap.)
+    {
+        let cap = cfg.max_connections as usize;
+        let at_cap = cap > 0 && convs.lock().expect("conv map").len() >= cap;
+        if at_cap || crate::memory::pressure_active() {
+            stats.conv_rejects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
     let (conv, app_rx) = build_conv(conv_id, cfg, mtu, egress_tx, stats.clone(), now);
     let kcp = conv.kcp.clone();
     let app_tx = conv.app_tx.clone();
@@ -588,6 +612,30 @@ fn spawn_accept_loop(
                         }
                     };
                     let _ = stream.set_nodelay(true);
+                    // Admission control before opening a conv: refuse a new
+                    // user connection when the tunnel is at max_connections or
+                    // the process is over the memory soft cap. Dropping
+                    // `stream` here closes the user's TCP cleanly (a clear
+                    // rejection) instead of opening a conv whose segments the
+                    // Remote would just drop under the same pressure.
+                    // (max_connections == 0 ⇒ no cap.)
+                    let cap = cfg.max_connections as usize;
+                    let at_cap = cap > 0 && convs.lock().expect("conv map").len() >= cap;
+                    if at_cap || crate::memory::pressure_active() {
+                        // Sample the warn off the reject counter so a sustained
+                        // overload doesn't flood the log; every reject is still
+                        // counted.
+                        let prev = stats.conv_rejects.fetch_add(1, Ordering::Relaxed);
+                        if prev % 1000 == 0 {
+                            warn!(
+                                tunnel_id = cfg.tunnel_id,
+                                rejected_total = prev + 1,
+                                at_cap,
+                                "kcp: refusing new TCP connection (at max_connections or memory pressure)"
+                            );
+                        }
+                        continue;
+                    }
                     let conv_id = conv_counter.fetch_add(1, Ordering::Relaxed);
                     let (conv, app_rx) = build_conv(
                         conv_id,
@@ -706,6 +754,9 @@ mod tests {
         EngineConfig {
             tunnel_id: 1,
             idle_timeout_sec,
+            // High cap so the reap/idle tests below aren't gated by admission
+            // control; the cap itself is exercised by the dedicated test.
+            max_connections: 10_000,
             tuning: KcpTuning::default(),
         }
     }
@@ -785,5 +836,64 @@ mod tests {
             1,
             "idle_timeout_sec=0 must clamp to >=1 s, not reap a fresh conv immediately"
         );
+    }
+
+    /// v4-audit B1: the Remote refuses a brand-new conv once the tunnel is at
+    /// max_connections, mirroring the UDP session-table cap, instead of minting
+    /// convs without bound. (Memory-pressure is the other half of the gate; it
+    /// is false on a normal test host so the cap path is what we exercise.)
+    #[test]
+    fn remote_refuses_new_conv_at_max_connections() {
+        // Cap of 2; pre-fill the map to the cap with dummy convs.
+        let c = Arc::new(EngineConfig {
+            tunnel_id: 1,
+            idle_timeout_sec: 300,
+            max_connections: 2,
+            tuning: KcpTuning::default(),
+        });
+        let stats = Arc::new(EngineStats::default());
+        let (egress_tx, _egress_rx) = mpsc::channel::<Vec<u8>>(16);
+        let convs = empty_convs();
+        for id in [100u32, 101u32] {
+            let (conv, _rx) = build_conv(id, &c, 1200, &egress_tx, stats.clone(), 0);
+            convs.lock().unwrap().insert(id, conv);
+        }
+
+        // A valid-looking KCP segment for a NEW conv id (first 4 bytes = conv
+        // id LE; padded to the header length so peek_conv accepts it).
+        let mut dg = vec![0u8; KCP_OVERHEAD];
+        dg[..4].copy_from_slice(&200u32.to_le_bytes());
+
+        let clock = Instant::now();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let forward_target: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mut recently_closed = VecDeque::new();
+        let mut recv_buf = vec![0u8; RECV_BUF];
+
+        handle_inbound(
+            &dg,
+            1_000,
+            &c,
+            1200,
+            clock,
+            &convs,
+            &egress_tx,
+            &stats,
+            Some(forward_target),
+            &mut recently_closed,
+            &mut recv_buf,
+            &stop_rx,
+        );
+
+        assert_eq!(
+            convs.lock().unwrap().len(),
+            2,
+            "a new conv must be refused when the tunnel is at max_connections"
+        );
+        assert!(
+            !convs.lock().unwrap().contains_key(&200),
+            "the over-cap conv must not be inserted"
+        );
+        assert_eq!(stats.conv_rejects.load(Ordering::Relaxed), 1);
     }
 }

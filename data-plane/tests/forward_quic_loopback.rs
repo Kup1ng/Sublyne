@@ -139,6 +139,7 @@ async fn quic_stream_survives_lossy_reordering_channel() {
         QuicConfig {
             tunnel_id: 1,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: balanced_tuning(),
         },
         EngineRole::Client {
@@ -155,6 +156,7 @@ async fn quic_stream_survives_lossy_reordering_channel() {
         QuicConfig {
             tunnel_id: 2,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: balanced_tuning(),
         },
         EngineRole::Remote {

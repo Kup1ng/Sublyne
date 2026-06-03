@@ -154,6 +154,7 @@ async fn kcp_stream_survives_lossy_reordering_channel() {
         EngineConfig {
             tunnel_id: 1,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: lossy_tuning(),
         },
         EngineRole::Client {
@@ -171,6 +172,7 @@ async fn kcp_stream_survives_lossy_reordering_channel() {
         EngineConfig {
             tunnel_id: 2,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: lossy_tuning(),
         },
         EngineRole::Remote {

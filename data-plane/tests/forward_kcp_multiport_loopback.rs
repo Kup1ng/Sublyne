@@ -171,6 +171,7 @@ async fn spawn_port_pair(
         EngineConfig {
             tunnel_id: port as i64,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: lossy_tuning(),
         },
         EngineRole::Client {
@@ -189,6 +190,7 @@ async fn spawn_port_pair(
         EngineConfig {
             tunnel_id: 1000 + port as i64,
             idle_timeout_sec: 300,
+            max_connections: 10_000,
             tuning: lossy_tuning(),
         },
         EngineRole::Remote {

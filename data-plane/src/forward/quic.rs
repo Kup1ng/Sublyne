@@ -66,6 +66,14 @@ fn peer_addr() -> SocketAddr {
 pub struct QuicConfig {
     pub tunnel_id: i64,
     pub idle_timeout_sec: u32,
+    /// Per-tunnel connection ceiling (the tunnel's `max_connections`). A new
+    /// stream is refused once `active_conns` reaches it. `0` ⇒ no cap. NOTE:
+    /// this cap is *approximate* — `active_conns` is incremented only after a
+    /// stream fully opens, so a burst of simultaneous accepts can briefly
+    /// overshoot by the number of in-flight opens. KCP's equivalent cap is
+    /// exact (it gates on the live conv-map length under lock). The overshoot
+    /// is bounded by in-flight accepts and the gate is best-effort by design.
+    pub max_connections: u32,
     pub tuning: QuicTuning,
 }
 
@@ -460,6 +468,20 @@ async fn run_client(
                         Err(e) => { warn!(tunnel_id = cfg.tunnel_id, err = %e, "quic: tcp accept"); continue; }
                     };
                     let _ = tcp.set_nodelay(true);
+                    // Admission control before opening a stream: refuse when the
+                    // tunnel is at max_connections or the process is over the
+                    // memory soft cap. Dropping `tcp` closes the user's TCP
+                    // cleanly. (max_connections == 0 ⇒ no cap.)
+                    let cap = cfg.max_connections as usize;
+                    let at_cap = cap > 0 && stats.active_conns.load(Ordering::Relaxed) as usize >= cap;
+                    if at_cap || crate::memory::pressure_active() {
+                        let prev = stats.conv_rejects.fetch_add(1, Ordering::Relaxed);
+                        if prev % 1000 == 0 {
+                            warn!(tunnel_id = cfg.tunnel_id, rejected_total = prev + 1, at_cap,
+                                "quic: refusing new TCP connection (at max_connections or memory pressure)");
+                        }
+                        continue;
+                    }
                     let conn = conn.clone();
                     let stats = stats.clone();
                     tokio::spawn(async move {
@@ -496,11 +518,12 @@ async fn run_remote(
                 let stats = stats.clone();
                 let stop = stop.clone();
                 let tunnel_id = cfg.tunnel_id;
+                let max_connections = cfg.max_connections;
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
                             info!(tunnel_id, "quic: connection accepted");
-                            handle_remote_conn(conn, forward_target, stats, stop).await;
+                            handle_remote_conn(conn, forward_target, max_connections, stats, stop).await;
                         }
                         Err(e) => debug!(tunnel_id, err = %e, "quic: incoming handshake failed"),
                     }
@@ -515,6 +538,7 @@ async fn run_remote(
 async fn handle_remote_conn(
     conn: Connection,
     forward_target: SocketAddr,
+    max_connections: u32,
     stats: Arc<EngineStats>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -527,6 +551,17 @@ async fn handle_remote_conn(
                     Ok(v) => v,
                     Err(_) => break,
                 };
+                // Admission control before dialing forward_target: refuse a new
+                // stream when the tunnel is at max_connections or the process is
+                // over the memory soft cap. Dropping `send`/`recv` resets the
+                // stream so the Client's bridge sees it refused. (0 ⇒ no cap.)
+                let cap = max_connections as usize;
+                let at_cap = cap > 0 && stats.active_conns.load(Ordering::Relaxed) as usize >= cap;
+                if at_cap || crate::memory::pressure_active() {
+                    stats.conv_rejects.fetch_add(1, Ordering::Relaxed);
+                    drop((send, recv));
+                    continue;
+                }
                 let stats = stats.clone();
                 tokio::spawn(async move {
                     match TcpStream::connect(forward_target).await {
