@@ -125,21 +125,47 @@ A6 with explicit documentation** (called out for operator sign-off).
 
 ---
 
-## Engine observability (the deferred v4.1.0 item) — decision pending Checkpoint 3
+## Engine observability — DEFERRED to a later release (decision: ship v4.0.1)
 
-`EngineStats` (`active_conns`, `conv_opens`, `idle_teardowns`, `egress_drops`,
-`sink_drops`) exists per engine but has **no IPC surface** — `PerTunnelStats`
-can't report it, so an operator can't see at a glance whether a TCP tunnel's
-engine is healthy (SPEC-4; also the root of B14's misleading session count).
+`EngineStats` (`active_conns`, `conv_opens`, `idle_teardowns`, `conv_rejects`,
+`egress_drops`, `sink_drops`) exists per engine but has **no IPC surface** —
+`PerTunnelStats` can't report it (SPEC-4; also the root of B14's misleading
+session count).
 
-**Tentative decision:** because Checkpoint 2 makes these counters *correct*
-(fixes A5's `active_conns` drift and adds B1's `conv_rejects`), surfacing a
-**minimal, observability-only** subset (aggregated `active_conns` + `conv_opens`
-+ `idle_teardowns` per tunnel) is the natural, low-risk feature that justifies a
-**v4.1.0** rather than a v4.0.1. It is an *additive* IPC field + an extension of
-the existing per-tunnel stats display — **no DB schema change, no new dashboard
-panel.** Final go/no-go is made in Checkpoint 3 after the bug fixes are CI-green;
-if it grows or risks the release, it is deferred and the release is **v4.0.1**.
+**Decision (operator's call): NOT shipped in this release.** This hardening pass
+stays a **bug-fix-only v4.0.1**; surfacing engine stats is a new feature and is
+deferred to a future v4.1.0. Checkpoint 2/3 still made the underlying counters
+*correct* (A5's `active_conns` drift fixed; B1 added `conv_rejects`), so the
+feature is cheaper and safer to add later. No schema or wire change was made
+for it now.
+
+## Deferred to a follow-up (documented, not fixed in v4.0.1)
+
+These confirmed items are intentionally left for a later release — either they
+depend on the deferred metrics surface, are CI-infrastructure changes with their
+own risk, or are low-value relative to the risk of touching a critical component
+this close to a release:
+
+- **B2 (OPS-2)** musl compile gate on PR CI. The PR `rust` job already runs
+  clippy `--all-targets` + tests on linux-gnu (catches type/borrow errors) and
+  the `cargo tree -i aws-lc-rs` gate covers the main musl-specific breaker, so
+  the remaining gap (a musl-only compile error not involving aws-lc-rs) is
+  narrow; adding a full musl target build to every PR is a CI-cost/infra change
+  for a follow-up.
+- **B4 (OPS-6)** privileged-port `EACCES` is mis-mapped to `RAW_SOCKET_FORBIDDEN`
+  — an error-message nicety (rare config), deferred.
+- **B10 (ENG-5)** closing-conv linger is dominated by the coarse reap cadence —
+  low-value timing tweak.
+- **B11 (FE-3)** two-tab last-write-wins — nice-to-have optimistic concurrency.
+- **B14 (REM-4)** the Remote session table is a misleading per-connection count
+  on the TCP path — tied to the deferred engine-stats surface; documented.
+- **B15 (GOI-5)** `Supervisor.Stop` is dead code (production teardown is the
+  robust context-cancellation path); cleaning it up touches the critical
+  supervisor for no production benefit — deferred.
+- **C5 (GOT-4)** validating a leftover tuning blob on a UDP tunnel — **rejected**:
+  an existing test (`TestValidate_ForwardUDPIgnoresTuning`) encodes the
+  deliberate decision that a UDP tunnel ignores the inert blob (so import/clone
+  of a once-TCP tunnel doesn't fail). Left as-is.
 
 ---
 
@@ -169,13 +195,11 @@ re-litigated):
 
 ---
 
-## Release-version recommendation (preliminary)
+## Release-version decision: v4.0.1 (patch)
 
-- If only bug fixes ship (buckets a/b/c) → **v4.0.1** (patch).
-- If engine observability is added (the SPEC-4 feature) → **v4.1.0** (minor).
-
-Leaning **v4.1.0**, contingent on the Checkpoint-3 observability work landing
-cleanly. Justified in the release notes at Checkpoint 4.
+This pass ships **bug + smell + polish fixes only** — no new feature — so it is
+a **v4.0.1** patch release. Engine observability (the one candidate feature) is
+deferred to a future v4.1.0 per the operator's decision.
 
 > **Caveat (carried to the final report):** none of this is a substitute for
 > the operator's hardware validation on the two real VPS hosts — these are
