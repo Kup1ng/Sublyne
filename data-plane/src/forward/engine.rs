@@ -42,6 +42,10 @@ static UNKNOWN_PORT_TCP_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Shared map of live conversations for one engine.
 pub(crate) type ConvMap = Arc<StdMutex<HashMap<u32, ConvHandle>>>;
 
+/// Recently-reaped conv ids (id, reaped-at) so a late Remote segment
+/// drops instead of resurrecting a dead conv.
+pub(crate) type RecentlyClosed = Arc<StdMutex<VecDeque<(u32, Instant)>>>;
+
 /// One conversation's engine-facing handle.
 pub(crate) struct ConvHandle {
     pub inbound_tx: InboundTx,
@@ -55,7 +59,7 @@ pub(crate) struct ConvCleanup {
     pub convs: ConvMap,
     pub conv_id: u32,
     pub active: Arc<AtomicU64>,
-    pub recently_closed: Option<Arc<StdMutex<VecDeque<(u32, Instant)>>>>,
+    pub recently_closed: Option<RecentlyClosed>,
 }
 
 /// Which edge of the tunnel an engine terminates.
@@ -91,7 +95,7 @@ pub struct Engine {
     active: Arc<AtomicU64>,
     metrics: Arc<TunnelMetrics>,
     conv_counter: AtomicU32,
-    recently_closed: Arc<StdMutex<VecDeque<(u32, Instant)>>>,
+    recently_closed: RecentlyClosed,
     clock: Instant,
     stop_rx: watch::Receiver<bool>,
 }
@@ -171,8 +175,10 @@ impl Engine {
         let Some(conv_id) = tuning::peek_conv(seg) else {
             return;
         };
-        let mut spawn_new: Option<InboundRx> = None;
-        {
+        // The lock block yields the inbound receiver of a freshly-created
+        // Remote conv (so we can spawn its dial task AFTER releasing the
+        // map lock); every other path returns from the function.
+        let rx: InboundRx = {
             let mut map = self.convs.lock().expect("conv map");
             if let Some(h) = map.get(&conv_id) {
                 let _ = h.inbound_tx.try_send(seg.to_vec());
@@ -192,14 +198,12 @@ impl Engine {
                     let _ = tx.try_send(seg.to_vec());
                     map.insert(conv_id, ConvHandle { inbound_tx: tx });
                     self.active.fetch_add(1, Ordering::Relaxed);
-                    spawn_new = Some(rx);
+                    rx
                 }
             }
-        }
-        if let Some(rx) = spawn_new {
-            self.publish_active();
-            self.clone().spawn_remote_conv(conv_id, rx);
-        }
+        };
+        self.publish_active();
+        self.clone().spawn_remote_conv(conv_id, rx);
     }
 
     /// Dial forward_target for a newly-learned Remote conv, then run it.
