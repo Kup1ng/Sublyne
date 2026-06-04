@@ -399,6 +399,7 @@ pub(super) async fn spawn(
                 name.clone(),
                 upload_sock.clone(),
                 UploadDest::Forward(forwarder.clone()),
+                keepalive_magic_for(spec),
                 session_table.clone(),
                 mutable_config.clone(),
                 metrics.clone(),
@@ -435,6 +436,7 @@ pub(super) async fn spawn(
                 name.clone(),
                 tcp_listener,
                 UploadDest::Forward(forwarder.clone()),
+                keepalive_magic_for(spec),
                 session_table.clone(),
                 mutable_config.clone(),
                 metrics.clone(),
@@ -568,6 +570,16 @@ impl SendTarget {
     }
 }
 
+/// The per-tunnel keep-alive magic the upload ingress matches on, or
+/// `None` when keep-alive is off for this tunnel (v4.0.0).
+fn keepalive_magic_for(spec: &TunnelSpec) -> Option<[u8; hmac::KEEPALIVE_MAGIC_LEN]> {
+    if spec.keep_alive {
+        Some(hmac::keepalive_magic(&spec.psk))
+    } else {
+        None
+    }
+}
+
 fn open_send_socket_for_transport(t: Transport) -> Result<socket2::Socket, SpawnError> {
     match t {
         Transport::Udp => udp::open_raw_udp_send_socket().map_err(SpawnError::Io),
@@ -584,6 +596,7 @@ fn spawn_upload_task(
     name: Arc<String>,
     upload_sock: Arc<UdpSocket>,
     dest: UploadDest,
+    keepalive_magic: Option<[u8; hmac::KEEPALIVE_MAGIC_LEN]>,
     session_table: Arc<SessionTable>,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
@@ -606,6 +619,15 @@ fn spawn_upload_task(
                             continue;
                         }
                     };
+                    // v4.0.0 keep-alive: a datagram equal to the PSK magic is
+                    // a heartbeat — mark the tunnel keep-alive-active and
+                    // absorb it (never forward to forward_target).
+                    if let Some(magic) = &keepalive_magic {
+                        if buf[..n] == magic[..] {
+                            metrics.set_keep_alive_active(true);
+                            continue;
+                        }
+                    }
                     match &dest {
                         UploadDest::Forward(forwarder) => {
                             // Resolve the forward socket + target (and strip
@@ -743,6 +765,7 @@ fn spawn_socks5_upload_listener(
     name: Arc<String>,
     listener: TcpListener,
     dest: UploadDest,
+    keepalive_magic: Option<[u8; hmac::KEEPALIVE_MAGIC_LEN]>,
     session_table: Arc<SessionTable>,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
@@ -784,6 +807,7 @@ fn spawn_socks5_upload_listener(
                             stream,
                             peer,
                             dest,
+                            keepalive_magic,
                             session_table,
                             mutable_config,
                             metrics,
@@ -813,6 +837,7 @@ async fn drive_socks5_upload_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     dest: UploadDest,
+    keepalive_magic: Option<[u8; hmac::KEEPALIVE_MAGIC_LEN]>,
     session_table: Arc<SessionTable>,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
@@ -869,6 +894,13 @@ async fn drive_socks5_upload_connection(
                     payload.resize(n, 0);
                 }
                 stream.read_exact(&mut payload[..n]).await?;
+                // v4.0.0 keep-alive: absorb a PSK-magic heartbeat frame.
+                if let Some(magic) = &keepalive_magic {
+                    if payload[..n] == magic[..] {
+                        metrics.set_keep_alive_active(true);
+                        continue;
+                    }
+                }
                 match &dest {
                     UploadDest::Forward(forwarder) => {
                         // Resolve the forward socket + target (and strip the
@@ -1330,6 +1362,7 @@ async fn spawn_tcp(
                 name.clone(),
                 upload_sock,
                 dest,
+                keepalive_magic_for(spec),
                 session_table.clone(),
                 mutable_config.clone(),
                 metrics.clone(),
@@ -1350,6 +1383,7 @@ async fn spawn_tcp(
                 name.clone(),
                 tcp_listener,
                 dest,
+                keepalive_magic_for(spec),
                 session_table.clone(),
                 mutable_config.clone(),
                 metrics.clone(),

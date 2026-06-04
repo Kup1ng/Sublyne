@@ -250,6 +250,24 @@ pub fn derive_key(psk: &str) -> [u8; 32] {
     out
 }
 
+/// Length of the per-tunnel keep-alive magic prefix (v4.0.0).
+pub const KEEPALIVE_MAGIC_LEN: usize = 8;
+
+/// Derive the per-tunnel keep-alive magic from the PSK. The keep-alive
+/// path (v4.0.0) sends a datagram equal to exactly these 8 bytes through
+/// the upload pipeline; the Remote recognises it with one constant-length
+/// compare and absorbs it instead of forwarding to `forward_target`.
+/// Derived from the PSK (different info string than the HMAC key) so it's
+/// unguessable to anyone without the PSK and astronomically unlikely
+/// (2^-64) to collide with a real datagram's first 8 bytes.
+pub fn keepalive_magic(psk: &str) -> [u8; KEEPALIVE_MAGIC_LEN] {
+    let hkdf = Hkdf::<Sha256>::new(None, psk.as_bytes());
+    let mut out = [0u8; KEEPALIVE_MAGIC_LEN];
+    hkdf.expand(b"sublyne keepalive v1", &mut out)
+        .expect("hkdf expand 8 bytes never fails");
+    out
+}
+
 /// Build the spoof body (`HMAC || session_id || seq || payload`) using a
 /// pre-derived [`HmacKey`]. Hot path: clones the keyed hasher rather
 /// than calling `new_from_slice` per packet.
@@ -546,6 +564,23 @@ mod tests {
     fn derive_key_is_deterministic() {
         assert_eq!(derive_key("x"), derive_key("x"));
         assert_ne!(derive_key("x"), derive_key("y"));
+    }
+
+    #[test]
+    fn keepalive_magic_is_deterministic_and_psk_bound() {
+        // Same PSK -> same magic (the two sides agree by sharing the PSK).
+        assert_eq!(keepalive_magic("shared"), keepalive_magic("shared"));
+        // Different PSK -> different magic (unguessable without the PSK).
+        assert_ne!(keepalive_magic("shared"), keepalive_magic("other"));
+        // Exactly the advertised length.
+        assert_eq!(keepalive_magic("shared").len(), KEEPALIVE_MAGIC_LEN);
+        // The magic is NOT the HMAC key prefix (different HKDF info), so a
+        // captured magic can't be used to forge a sealed packet.
+        let key32 = derive_key("shared");
+        assert_ne!(
+            &keepalive_magic("shared")[..],
+            &key32[..KEEPALIVE_MAGIC_LEN]
+        );
     }
 
     #[test]

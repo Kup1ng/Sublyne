@@ -389,10 +389,72 @@ pub(super) async fn spawn(
         stop_rx.clone(),
     );
 
+    // v4.0.0 keep-alive: when enabled, a heartbeat task pushes a tiny
+    // PSK-derived magic datagram up the same upload pipeline every N
+    // seconds. It keeps the upload path (WG/SOCKS5 NAT bindings, SOCKS5
+    // pool) warm and marks the tunnel keep-alive-active so the panel shows
+    // it held warm without real users. The Remote recognises the magic
+    // and absorbs it (never reaches forward_target); see remote.rs.
+    if spec.keep_alive {
+        spawn_client_keepalive(
+            tasks,
+            id,
+            name.clone(),
+            upload_transport.clone(),
+            crate::hmac::keepalive_magic(&spec.psk),
+            spec.keep_alive_interval_sec,
+            local,
+            metrics.clone(),
+            stop_rx.clone(),
+        );
+    }
+
     // Return the upload transport so the caller (`spawn_tunnel`) can
     // park it on the `TunnelHandle` for the manager's hot-reload path
     // to reach (Phase R9b live SOCKS5 pool resize).
     Ok(upload_transport)
+}
+
+/// v4.0.0 keep-alive heartbeat (Client). Pushes the per-tunnel PSK-magic
+/// datagram up the upload pipeline every `interval_sec` seconds and marks
+/// the tunnel keep-alive-active. The magic is sent UNTAGGED (exactly the
+/// magic bytes) so the Remote recognises it with one constant-length
+/// compare before any port-tag decode, on both single- and multi-port
+/// tunnels. It never reaches `forward_target`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_client_keepalive(
+    tasks: &mut JoinSet<()>,
+    id: i64,
+    name: Arc<String>,
+    upload: Arc<dyn UploadTransport>,
+    magic: [u8; crate::hmac::KEEPALIVE_MAGIC_LEN],
+    interval_sec: u32,
+    local: SocketAddr,
+    metrics: Arc<TunnelMetrics>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let session = SessionKey {
+        client_addr: local,
+        local_port: local.port(),
+    };
+    let interval = Duration::from_secs(interval_sec.max(1) as u64);
+    tasks.spawn(async move {
+        metrics.set_keep_alive_active(true);
+        // Fire once immediately so the path warms promptly.
+        let _ = upload.send(session, &magic).await;
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    info!(tunnel_id = id, name = %name, "client: keep-alive task stopping");
+                    return;
+                }
+                _ = tokio::time::sleep(interval) => {
+                    let _ = upload.send(session, &magic).await;
+                    metrics.set_keep_alive_active(true);
+                }
+            }
+        }
+    });
 }
 
 fn address_family_label(addr: SocketAddr) -> &'static str {

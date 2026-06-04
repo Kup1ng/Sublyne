@@ -144,6 +144,11 @@ pub(crate) struct SpecSnapshot {
     /// derives its frozen segment size from it, so for tcp tunnels an
     /// MTU change is an internal restart.
     pub mtu: u32,
+    /// v4.0.0 — keep-alive on/off + interval. The keep-alive heartbeat
+    /// task is spawned at tunnel start, so toggling it (or changing the
+    /// interval) is an internal restart rather than a live mutate.
+    pub keep_alive: bool,
+    pub keep_alive_interval_sec: u32,
 }
 
 impl SpecSnapshot {
@@ -164,6 +169,8 @@ impl SpecSnapshot {
             forward_protocol: spec.forward_protocol,
             kcp_tuning: spec.kcp_tuning,
             mtu: spec.mtu,
+            keep_alive: spec.keep_alive,
+            keep_alive_interval_sec: spec.keep_alive_interval_sec,
         }
     }
 
@@ -230,6 +237,8 @@ impl SpecSnapshot {
             || self.wireguard_fwmark != spec.wireguard_fwmark
             || self.forward_protocol != spec.forward_protocol
             || (tcp_involved && (self.kcp_tuning != spec.kcp_tuning || self.mtu != spec.mtu))
+            || self.keep_alive != spec.keep_alive
+            || self.keep_alive_interval_sec != spec.keep_alive_interval_sec
     }
 
     /// True iff `spec` is identical to the snapshot across every field

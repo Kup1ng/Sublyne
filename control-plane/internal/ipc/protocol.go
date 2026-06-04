@@ -254,6 +254,7 @@ type PerTunnelStats struct {
 	PacketsIn                uint64           `json:"packets_in"`
 	PacketsOut               uint64           `json:"packets_out"`
 	ActiveSessions           uint32           `json:"active_sessions"`
+	KeepAliveActive          bool             `json:"keep_alive_active"`
 	LastPacketReceivedAtUnix uint64           `json:"last_packet_received_at_unix"`
 	LastPacketSentAtUnix     uint64           `json:"last_packet_sent_at_unix"`
 	UploadRTTMsEWMA          float64          `json:"upload_rtt_ms_ewma"`

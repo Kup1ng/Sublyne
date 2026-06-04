@@ -114,6 +114,7 @@ async fn spawn_echo() -> SocketAddr {
     addr
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_engine(
     role: EngineRole,
     tunnel_id: i64,
