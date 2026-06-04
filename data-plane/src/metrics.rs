@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -104,6 +104,14 @@ pub struct TunnelMetrics {
     /// hot path.
     pub active_sessions: AtomicU32,
 
+    /// v4.0.0 keep-alive: true while the per-tunnel keep-alive is
+    /// actively pinging (Client: the heartbeat task is running; Remote: a
+    /// keep-alive datagram arrived recently). Reported separately from
+    /// `active_sessions` so the panel can show a distinct badge and the
+    /// operator can tell a tunnel held warm by keep-alive from one with
+    /// real user sessions.
+    pub keep_alive_active: AtomicBool,
+
     /// Pair-matching state used to compute the EWMA RTTs cheaply. We
     /// remember the wall-clock at which the most recent up/down event
     /// fired; the next event in the opposite direction subtracts to
@@ -153,6 +161,7 @@ impl TunnelMetrics {
             icmp_packets: AtomicU64::new(0),
             icmpv6_packets: AtomicU64::new(0),
             active_sessions: AtomicU32::new(0),
+            keep_alive_active: AtomicBool::new(false),
             rtt_inner: Mutex::new(RttInner::default()),
         }
     }
@@ -259,6 +268,11 @@ impl TunnelMetrics {
         self.active_sessions.store(n, Ordering::Relaxed);
     }
 
+    /// Set the v4.0.0 keep-alive indicator for the next report.
+    pub fn set_keep_alive_active(&self, active: bool) {
+        self.keep_alive_active.store(active, Ordering::Relaxed);
+    }
+
     /// Snapshot every counter into a `PerTunnelStats` ready to ship over
     /// IPC. Reads are `Relaxed` because a stats sample is by definition
     /// approximate.
@@ -291,6 +305,7 @@ impl TunnelMetrics {
             packets_in,
             packets_out,
             active_sessions: self.active_sessions.load(Ordering::Relaxed),
+            keep_alive_active: self.keep_alive_active.load(Ordering::Relaxed),
             last_packet_received_at_unix: self.last_packet_received_at_unix.load(Ordering::Relaxed),
             last_packet_sent_at_unix: self.last_packet_sent_at_unix.load(Ordering::Relaxed),
             upload_rtt_ms_ewma: ewma_micros_to_ms(
@@ -361,6 +376,7 @@ pub struct PerTunnelStats {
     pub packets_in: u64,
     pub packets_out: u64,
     pub active_sessions: u32,
+    pub keep_alive_active: bool,
     pub last_packet_received_at_unix: u64,
     pub last_packet_sent_at_unix: u64,
     pub upload_rtt_ms_ewma: f64,

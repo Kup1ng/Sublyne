@@ -98,6 +98,7 @@ export function useMetrics() {
         bps_up,
         bps_down,
         sessions: t.active_sessions,
+        keep_alive_active: t.keep_alive_active ?? false,
         status: t.health_badge,
         enabled: t.enabled,
       })

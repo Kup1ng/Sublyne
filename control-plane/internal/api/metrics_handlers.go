@@ -88,6 +88,7 @@ type LiveTunnel struct {
 	PacketsIn                uint64               `json:"packets_in"`
 	PacketsOut               uint64               `json:"packets_out"`
 	ActiveSessions           uint32               `json:"active_sessions"`
+	KeepAliveActive          bool                 `json:"keep_alive_active"`
 	UploadRTTMsEWMA          float64              `json:"upload_rtt_ms_ewma"`
 	DownloadRTTMsEWMA        float64              `json:"download_rtt_ms_ewma"`
 	PacketLossEstimate       float64              `json:"packet_loss_estimate"`
@@ -461,6 +462,7 @@ func buildLiveSnapshot(ctx context.Context, deps MetricsDeps, snap metrics.Snaps
 			PacketsIn:                s.PacketsIn,
 			PacketsOut:               s.PacketsOut,
 			ActiveSessions:           s.ActiveSessions,
+			KeepAliveActive:          s.KeepAliveActive,
 			UploadRTTMsEWMA:          s.UploadRTTMsEWMA,
 			DownloadRTTMsEWMA:        s.DownloadRTTMsEWMA,
 			PacketLossEstimate:       s.PacketLossEstimate,

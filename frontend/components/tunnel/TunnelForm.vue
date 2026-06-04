@@ -3,6 +3,8 @@ import { Save, Trash2 } from 'lucide-vue-next'
 import { computed, ref, watch, watchEffect } from 'vue'
 import type {
   DownloadTransport,
+  ForwardEnginePreset,
+  ForwardProtocol,
   IcmpEchoMode,
   Tunnel,
   UploadMode,
@@ -58,6 +60,10 @@ const draft = ref<Partial<Tunnel>>({
   pacing_enabled: false,
   pacing_target_ms: 60,
   upload_listen_mode: 'udp',
+  forward_protocol: 'udp',
+  forward_engine_preset: 'balanced',
+  keep_alive: false,
+  keep_alive_interval_sec: 20,
   ...props.initial,
 })
 
@@ -158,6 +164,96 @@ const resolvedMechanism = computed(() =>
 )
 const matrixHelp = MATRIX_HELP
 
+// --- v4.0.0 forward protocol + KCP engine tuning --------------------
+const forwardProtocolOptions: { value: ForwardProtocol; label: string }[] = [
+  { value: 'udp', label: 'UDP (default)' },
+  { value: 'tcp', label: 'TCP — KCP reliability' },
+]
+const enginePresetOptions: { value: ForwardEnginePreset; label: string }[] = [
+  { value: 'balanced', label: 'Balanced (recommended)' },
+  { value: 'interactive', label: 'Interactive — lower latency' },
+  { value: 'lossy', label: 'Lossy — high packet loss' },
+]
+const isTcpForward = computed(() => draft.value.forward_protocol === 'tcp')
+const showAdvanced = ref(false)
+
+// Advanced per-knob KCP overrides. null = use the preset's value. The set
+// serializes to the forward_engine_tuning JSON on submit; an all-unset set
+// sends '' (use the preset verbatim). Blank inputs round-trip as null.
+type KcpKnob = 'nodelay' | 'interval' | 'resend' | 'nc' | 'snd_wnd' | 'rcv_wnd' | 'mtu'
+const advanced = ref<Record<KcpKnob, number | null>>({
+  nodelay: null,
+  interval: null,
+  resend: null,
+  nc: null,
+  snd_wnd: null,
+  rcv_wnd: null,
+  mtu: null,
+})
+const advancedKnobs: { key: KcpKnob; label: string; help: string }[] = [
+  {
+    key: 'snd_wnd',
+    label: 'Send window',
+    help: 'KCP send window, packets (preset 2048). Bigger fills high-latency links.',
+  },
+  { key: 'rcv_wnd', label: 'Receive window', help: 'KCP receive window, packets (preset 2048).' },
+  {
+    key: 'interval',
+    label: 'Flush interval (ms)',
+    help: 'KCP flush cadence (preset 20). Lower = snappier, more CPU.',
+  },
+  {
+    key: 'resend',
+    label: 'Fast resend',
+    help: 'Duplicate ACKs before fast retransmit (preset 2; 1 = quicker recovery).',
+  },
+  { key: 'nodelay', label: 'No-delay (0/1)', help: '1 = fast mode (preset 1).' },
+  {
+    key: 'nc',
+    label: 'No congestion ctrl (0/1)',
+    help: '1 = disable congestion control (preset 1).',
+  },
+  {
+    key: 'mtu',
+    label: 'KCP MTU (bytes)',
+    help: 'Segment cap; blank = derive from the tunnel MTU (≤1280).',
+  },
+]
+
+// Seed advanced knobs from an existing tunnel's tuning JSON (revealing the
+// advanced section when any override is present).
+watchEffect(() => {
+  const raw = props.initial?.forward_engine_tuning
+  if (!raw) return
+  try {
+    const o = JSON.parse(raw) as Partial<Record<KcpKnob, number>>
+    const next = { ...advanced.value }
+    for (const k of Object.keys(next) as KcpKnob[]) {
+      next[k] = typeof o[k] === 'number' ? (o[k] as number) : null
+    }
+    advanced.value = next
+    if (Object.values(next).some((v) => v !== null)) {
+      showAdvanced.value = true
+    }
+  } catch {
+    // Malformed stored JSON — leave the knobs unset; the backend rejects it.
+  }
+})
+
+function buildTuning(): string {
+  if (!isTcpForward.value) return ''
+  const o: Record<string, number> = {}
+  for (const k of Object.keys(advanced.value) as KcpKnob[]) {
+    const v = advanced.value[k]
+    // null = unset; an emptied number input round-trips as undefined,
+    // which Number() turns into NaN and we skip below.
+    if (v === null) continue
+    const n = Number(v)
+    if (Number.isFinite(n)) o[k] = n
+  }
+  return Object.keys(o).length ? JSON.stringify(o) : ''
+}
+
 const wgOptions = computed(() => wg.list.value.map((c) => ({ value: c.id, label: c.name })))
 const socksOptions = computed(() =>
   socks.list.value.map((p) => ({ value: p.id, label: `${p.name} (${p.host}:${p.port})` })),
@@ -206,7 +302,11 @@ function submit() {
   // Block submit on a parse error or an empty list — every tunnel needs at
   // least one port (the Go validator enforces this too).
   if (parsed.error || parsed.ports.length === 0) return
-  emit('submit', { ...draft.value, ports: buildPorts(parsed.ports) })
+  emit('submit', {
+    ...draft.value,
+    ports: buildPorts(parsed.ports),
+    forward_engine_tuning: buildTuning(),
+  })
 }
 </script>
 
@@ -480,6 +580,51 @@ function submit() {
     </AppCard>
 
     <AppCard
+      title="Forwarding"
+      description="What the tunnel carries. UDP is byte-identical legacy; TCP adds a KCP reliability layer for TCP apps (VLESS-TCP, Trojan, WebSocket) and re-originates TCP to the forward target."
+    >
+      <div class="grid gap-5 md:grid-cols-2">
+        <FieldGroup
+          label="Forward protocol"
+          help="Both sides must match. TCP tunnels need both ends on v4.0.0+; UDP stays compatible with older builds."
+          :error="err('forward_protocol')"
+        >
+          <AppSelect v-model="draft.forward_protocol" :options="forwardProtocolOptions" />
+        </FieldGroup>
+        <FieldGroup
+          v-if="isTcpForward"
+          label="Engine preset"
+          help="KCP tuning baseline. Balanced carries the production-proven defaults."
+          :error="err('forward_engine_preset')"
+        >
+          <AppSelect v-model="draft.forward_engine_preset" :options="enginePresetOptions" />
+        </FieldGroup>
+      </div>
+      <div v-if="isTcpForward" class="mt-5">
+        <button
+          type="button"
+          class="text-[12px] font-medium text-brand hover:underline"
+          @click="showAdvanced = !showAdvanced"
+        >
+          {{ showAdvanced ? 'Hide' : 'Show' }} advanced KCP tuning
+        </button>
+        <p v-if="err('forward_engine_tuning')" class="mt-1.5 text-[12px] text-danger">
+          {{ err('forward_engine_tuning') }}
+        </p>
+        <div v-if="showAdvanced" class="mt-3 grid gap-4 md:grid-cols-3">
+          <FieldGroup
+            v-for="knob in advancedKnobs"
+            :key="knob.key"
+            :label="knob.label"
+            :help="knob.help"
+          >
+            <AppInput v-model="advanced[knob.key]" type="number" placeholder="preset" monospace />
+          </FieldGroup>
+        </div>
+      </div>
+    </AppCard>
+
+    <AppCard
       title="Security"
       description="The PSK is shared by both sides; rotation requires both at once."
     >
@@ -514,6 +659,30 @@ function submit() {
           help="Sessions idle longer than this are evicted."
         >
           <AppInput v-model="draft.idle_timeout" type="number" monospace />
+        </FieldGroup>
+      </div>
+      <div class="mt-5 grid gap-5 md:grid-cols-2">
+        <FieldGroup
+          label="Keep-alive"
+          help="Hold the tunnel warm with no real users: a tiny heartbeat keeps the upload path and dataplane state active, and the dashboard shows a 'keep-alive' badge. It never reaches the forward target."
+        >
+          <div class="flex h-10 items-center gap-2.5">
+            <AppSwitch v-model="draft.keep_alive" />
+            <span class="text-[12.5px] text-subtle">{{ draft.keep_alive ? 'On' : 'Off' }}</span>
+          </div>
+        </FieldGroup>
+        <FieldGroup
+          v-if="draft.keep_alive"
+          label="Keep-alive interval (seconds)"
+          help="How often the heartbeat fires. Must be less than the idle timeout."
+          :error="err('keep_alive_interval_sec')"
+        >
+          <AppInput
+            v-model="draft.keep_alive_interval_sec"
+            type="number"
+            placeholder="20"
+            monospace
+          />
         </FieldGroup>
       </div>
     </AppCard>

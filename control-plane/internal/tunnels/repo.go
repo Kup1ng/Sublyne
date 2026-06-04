@@ -60,7 +60,12 @@ forward_target,
 download_send_port,
 client_real_ip,
 upload_listen_mode,
-ports
+ports,
+forward_protocol,
+keep_alive,
+keep_alive_interval_sec,
+forward_engine_preset,
+forward_engine_tuning
 `
 
 // scanTunnel reads one row in the order the SELECT above lays them out.
@@ -69,7 +74,7 @@ func scanTunnel(row interface {
 	Scan(dest ...any) error
 }) (Tunnel, error) {
 	var t Tunnel
-	var enabled, pingSmoothing, pacing int
+	var enabled, pingSmoothing, pacing, keepAlive int
 	var portsCSV string
 	err := row.Scan(
 		&t.ID,
@@ -101,6 +106,11 @@ func scanTunnel(row interface {
 		&t.ClientRealIP,
 		&t.UploadListenMode,
 		&portsCSV,
+		&t.ForwardProtocol,
+		&keepAlive,
+		&t.KeepAliveIntervalSec,
+		&t.ForwardEnginePreset,
+		&t.ForwardEngineTuning,
 	)
 	if err != nil {
 		return Tunnel{}, err
@@ -108,6 +118,7 @@ func scanTunnel(row interface {
 	t.Enabled = enabled == 1
 	t.PingSmoothingEnabled = pingSmoothing == 1
 	t.PacingEnabled = pacing == 1
+	t.KeepAlive = keepAlive == 1
 	ports, err := ParsePortsCSV(portsCSV)
 	if err != nil {
 		return Tunnel{}, err
@@ -168,6 +179,7 @@ func (r *Repo) Create(ctx context.Context, t Tunnel) (Tunnel, error) {
 	if uploadListenMode == "" {
 		uploadListenMode = string(UploadListenModeUDP)
 	}
+	forwardProtocol, keepAliveInterval, enginePreset := forwardDefaults(t)
 	res, err := r.db.ExecContext(ctx, `
 INSERT INTO tunnels (
   name, role, enabled, psk,
@@ -180,7 +192,9 @@ INSERT INTO tunnels (
   pacing_enabled, pacing_target_ms,
   upload_listen_addr, forward_target, download_send_port, client_real_ip,
   upload_listen_mode,
-  ports
+  ports,
+  forward_protocol, keep_alive, keep_alive_interval_sec,
+  forward_engine_preset, forward_engine_tuning
 ) VALUES (
   ?, ?, ?, ?,
   ?, ?, ?,
@@ -192,7 +206,9 @@ INSERT INTO tunnels (
   ?, ?,
   ?, ?, ?, ?,
   ?,
-  ?
+  ?,
+  ?, ?, ?,
+  ?, ?
 )`,
 		t.Name, string(t.Role), boolToInt(t.Enabled), t.PSK,
 		t.DownloadSpoofSourceIP, t.DownloadSpoofSourcePort, string(t.DownloadTransport),
@@ -205,6 +221,8 @@ INSERT INTO tunnels (
 		t.UploadListenAddr, t.ForwardTarget, t.DownloadSendPort, t.ClientRealIP,
 		uploadListenMode,
 		PortsToCSV(t.Ports),
+		forwardProtocol, boolToInt(t.KeepAlive), keepAliveInterval,
+		enginePreset, t.ForwardEngineTuning,
 	)
 	if err != nil {
 		if isUniqueConstraint(err, "tunnels.name") {
@@ -254,6 +272,7 @@ func (r *Repo) Update(ctx context.Context, t Tunnel, keepPSK bool) (Tunnel, erro
 	if uploadListenMode == "" {
 		uploadListenMode = string(UploadListenModeUDP)
 	}
+	forwardProtocol, keepAliveInterval, enginePreset := forwardDefaults(t)
 	res, err := r.db.ExecContext(ctx, `
 UPDATE tunnels SET
   name = ?, enabled = ?,
@@ -267,6 +286,8 @@ UPDATE tunnels SET
   upload_listen_addr = ?, forward_target = ?, download_send_port = ?, client_real_ip = ?,
   upload_listen_mode = ?,
   ports = ?,
+  forward_protocol = ?, keep_alive = ?, keep_alive_interval_sec = ?,
+  forward_engine_preset = ?, forward_engine_tuning = ?,
   psk = ?,
   updated_at = CURRENT_TIMESTAMP
 WHERE id = ?`,
@@ -281,6 +302,8 @@ WHERE id = ?`,
 		t.UploadListenAddr, t.ForwardTarget, t.DownloadSendPort, t.ClientRealIP,
 		uploadListenMode,
 		PortsToCSV(t.Ports),
+		forwardProtocol, boolToInt(t.KeepAlive), keepAliveInterval,
+		enginePreset, t.ForwardEngineTuning,
 		psk,
 		t.ID,
 	)
@@ -350,6 +373,27 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// forwardDefaults coerces the v4.0.0 forward fields to their stored
+// defaults when a caller (e.g. a clone or a pre-v4 import) left them at
+// the zero value, mirroring the column DEFAULTs in
+// 0012_forward_protocol.sql. The forward_engine_tuning column has no
+// non-empty default, so it is written verbatim by the SQL.
+func forwardDefaults(t Tunnel) (forwardProtocol string, keepAliveInterval int, enginePreset string) {
+	forwardProtocol = string(t.ForwardProtocol)
+	if forwardProtocol == "" {
+		forwardProtocol = string(ForwardProtocolUDP)
+	}
+	keepAliveInterval = t.KeepAliveIntervalSec
+	if keepAliveInterval == 0 {
+		keepAliveInterval = 20
+	}
+	enginePreset = string(t.ForwardEnginePreset)
+	if enginePreset == "" {
+		enginePreset = string(DefaultForwardEnginePreset)
+	}
+	return forwardProtocol, keepAliveInterval, enginePreset
 }
 
 // isUniqueConstraint reports whether err is a SQLite UNIQUE

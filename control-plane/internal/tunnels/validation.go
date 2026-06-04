@@ -115,6 +115,45 @@ func Validate(ctx context.Context, repo *Repo, serverRole Role, t *Tunnel, exist
 		ve.Fields["idle_timeout"] = "Idle timeout must be greater than zero seconds."
 	}
 
+	// Forward protocol (v4.0.0). 'udp' (default) is byte-identical legacy
+	// behaviour; 'tcp' activates the KCP forwarding engine. It works with
+	// every download transport / upload mode, so there is no matrix gate
+	// here — only the closed-enum guard.
+	if t.ForwardProtocol == "" {
+		t.ForwardProtocol = ForwardProtocolUDP
+	}
+	if !t.ForwardProtocol.IsValid() {
+		ve.Fields["forward_protocol"] = "Forward protocol must be either 'udp' or 'tcp'."
+	}
+
+	// KCP engine preset + per-knob override JSON (only meaningful for tcp,
+	// but validated on every save so a stale value can't slip in via
+	// import/restore).
+	if t.ForwardEnginePreset == "" {
+		t.ForwardEnginePreset = DefaultForwardEnginePreset
+	}
+	if !t.ForwardEnginePreset.IsValid() {
+		ve.Fields["forward_engine_preset"] = "Engine preset must be 'balanced', 'interactive', or 'lossy'."
+	} else if _, err := ResolveKcpTuning(t.ForwardEnginePreset, t.ForwardEngineTuning); err != nil {
+		ve.Fields["forward_engine_tuning"] = "Advanced KCP tuning: " + err.Error() + "."
+	}
+
+	// Keep-alive interval (v4.0.0). Default 20 s. When keep-alive is on it
+	// must be < idle_timeout so the synthetic session is refreshed before
+	// the reaper would ever consider it — and the dataplane also exempts
+	// the keep-alive session from reaping as defence-in-depth.
+	if t.KeepAliveIntervalSec == 0 {
+		t.KeepAliveIntervalSec = 20
+	}
+	if t.KeepAlive {
+		switch {
+		case t.KeepAliveIntervalSec < 5:
+			ve.Fields["keep_alive_interval_sec"] = "Keep-alive interval must be at least 5 seconds."
+		case t.IdleTimeout > 0 && t.KeepAliveIntervalSec >= t.IdleTimeout:
+			ve.Fields["keep_alive_interval_sec"] = "Keep-alive interval must be less than the idle timeout."
+		}
+	}
+
 	// Default the Remote-side upload-listen mode from the v2 matrix so a
 	// row that omits it lands on the right listener for its download
 	// transport (udp→udp, tcp_syn→socks5_tcp, icmp/icmpv6→udp);

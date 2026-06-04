@@ -101,6 +101,80 @@ fn default_min_ready_slots() -> u32 {
     1
 }
 
+/// What the tunnel forwards at the application layer (v4.0.0). `Udp`
+/// (the default) is the historical behaviour — opaque UDP datagrams pass
+/// through byte-for-byte. `Tcp` accepts user TCP connections on the
+/// Client, frames them into KCP segments carried over the same upload +
+/// sealed-download pipeline, and re-originates TCP to `forward_target`
+/// on the Remote. It is orthogonal to `download_transport`: any of the
+/// six matrix rows can forward either udp or tcp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProtocol {
+    #[default]
+    Udp,
+    Tcp,
+}
+
+/// Resolved KCP knobs for a tcp-forwarding tunnel (v4.0.0). The Go
+/// control plane resolves these from a named preset plus per-knob
+/// overrides and sends concrete values; the dataplane applies them
+/// verbatim and never substitutes its own. Mirrors the Go
+/// `ipc.KcpTuning` struct. `Default` is the production-proven "balanced"
+/// baseline (full 2048-packet window, congestion control disabled) so a
+/// spec that omits the block still carries sane values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KcpTuning {
+    #[serde(default = "default_kcp_nodelay")]
+    pub nodelay: u32,
+    #[serde(default = "default_kcp_interval")]
+    pub interval: u32,
+    #[serde(default = "default_kcp_resend")]
+    pub resend: u32,
+    #[serde(default = "default_kcp_nc")]
+    pub nc: u32,
+    #[serde(default = "default_kcp_wnd")]
+    pub snd_wnd: u32,
+    #[serde(default = "default_kcp_wnd")]
+    pub rcv_wnd: u32,
+    /// KCP segment cap; 0 = derive from the tunnel MTU (clamped ≤1280).
+    #[serde(default)]
+    pub mtu: u32,
+}
+
+impl Default for KcpTuning {
+    fn default() -> Self {
+        Self {
+            nodelay: 1,
+            interval: 20,
+            resend: 2,
+            nc: 1,
+            snd_wnd: 2048,
+            rcv_wnd: 2048,
+            mtu: 0,
+        }
+    }
+}
+
+fn default_kcp_nodelay() -> u32 {
+    1
+}
+fn default_kcp_interval() -> u32 {
+    20
+}
+fn default_kcp_resend() -> u32 {
+    2
+}
+fn default_kcp_nc() -> u32 {
+    1
+}
+fn default_kcp_wnd() -> u32 {
+    2048
+}
+fn default_keep_alive_interval() -> u32 {
+    20
+}
+
 /// Tunnel specification carried across IPC. Mirrors the schema in
 /// `.claude/skills/rust-go-ipc/SKILL.md` §"Tunnel spec schema".
 ///
@@ -199,6 +273,24 @@ pub struct TunnelSpec {
     /// `local_listen_addr` / `forward_target`.
     #[serde(default)]
     pub ports: Vec<u16>,
+
+    /// Forward protocol (v4.0.0). `Udp` (default, and what older Go
+    /// control planes emit) takes the byte-identical legacy path; `Tcp`
+    /// activates the KCP forwarding engine.
+    #[serde(default)]
+    pub forward_protocol: ForwardProtocol,
+    /// Keep-alive (v4.0.0). When true, the dataplane maintains one
+    /// artificial internal session so the tunnel never goes idle and the
+    /// panel keeps reporting it running with zero real users.
+    #[serde(default)]
+    pub keep_alive: bool,
+    /// How often the keep-alive heartbeat fires, in seconds.
+    #[serde(default = "default_keep_alive_interval")]
+    pub keep_alive_interval_sec: u32,
+    /// Resolved KCP knobs; only meaningful when `forward_protocol` is
+    /// `Tcp`. Defaults to the balanced baseline when omitted.
+    #[serde(default)]
+    pub kcp_tuning: KcpTuning,
 }
 
 fn default_mtu() -> u32 {
@@ -346,6 +438,10 @@ impl TunnelSpec {
                     download_send_port: None,
                     client_real_ip: None,
                     ports: self.ports.clone(),
+                    forward_protocol: self.forward_protocol,
+                    keep_alive: self.keep_alive,
+                    keep_alive_interval_sec: self.keep_alive_interval_sec,
+                    kcp_tuning: self.kcp_tuning,
                 })
             }
             Role::Remote => {
@@ -381,6 +477,10 @@ impl TunnelSpec {
                     download_send_port: Some(send_port),
                     client_real_ip: Some(client_ip),
                     ports: self.ports.clone(),
+                    forward_protocol: self.forward_protocol,
+                    keep_alive: self.keep_alive,
+                    keep_alive_interval_sec: self.keep_alive_interval_sec,
+                    kcp_tuning: self.kcp_tuning,
                 })
             }
         }
@@ -411,6 +511,14 @@ pub struct ResolvedSpec {
     /// single-port legacy path; length >= 2 activates the per-port
     /// sockets + application-port tag (see [`ResolvedSpec::multiport`]).
     pub ports: Vec<u16>,
+    /// Forward protocol (v4.0.0). `Tcp` activates the KCP engine.
+    pub forward_protocol: ForwardProtocol,
+    /// Keep-alive enabled (v4.0.0).
+    pub keep_alive: bool,
+    /// Keep-alive heartbeat interval, seconds.
+    pub keep_alive_interval_sec: u32,
+    /// Resolved KCP knobs (only used when `forward_protocol` is `Tcp`).
+    pub kcp_tuning: KcpTuning,
 }
 
 impl ResolvedSpec {
@@ -419,6 +527,13 @@ impl ResolvedSpec {
     /// single-port legacy path, wire-identical to before.
     pub fn multiport(&self) -> bool {
         self.ports.len() >= 2
+    }
+
+    /// True when this tunnel forwards TCP application traffic via the
+    /// KCP engine (`forward_protocol = tcp`). `false` is the historical
+    /// opaque-UDP path.
+    pub fn forward_tcp(&self) -> bool {
+        self.forward_protocol == ForwardProtocol::Tcp
     }
 }
 
@@ -454,6 +569,10 @@ mod tests {
             socks5_target: None,
             upload_listen_mode: UploadListenMode::Udp,
             ports: Vec::new(),
+            forward_protocol: ForwardProtocol::Udp,
+            keep_alive: false,
+            keep_alive_interval_sec: 20,
+            kcp_tuning: KcpTuning::default(),
         }
     }
 
@@ -485,6 +604,10 @@ mod tests {
             socks5_target: None,
             upload_listen_mode: UploadListenMode::Udp,
             ports: Vec::new(),
+            forward_protocol: ForwardProtocol::Udp,
+            keep_alive: false,
+            keep_alive_interval_sec: 20,
+            kcp_tuning: KcpTuning::default(),
         }
     }
 

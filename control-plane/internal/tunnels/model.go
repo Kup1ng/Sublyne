@@ -106,6 +106,58 @@ func (m UploadListenMode) IsValid() bool {
 	return m == UploadListenModeUDP || m == UploadListenModeSocks5TCP
 }
 
+// ForwardProtocol selects what a tunnel forwards at the application
+// layer (v4.0.0). 'udp' (the default) is the historical behaviour:
+// opaque UDP datagrams pass through byte-for-byte. 'tcp' accepts user
+// TCP connections on the Client, carries them over a KCP reliability
+// layer through the same upload + sealed-download pipeline, and
+// re-originates TCP to forward_target on the Remote. It is orthogonal
+// to the download transport / upload mode — any of the six matrix rows
+// can forward either udp or tcp. Mirrors the migration's CHECK
+// constraint (0012_forward_protocol.sql).
+type ForwardProtocol string
+
+// ForwardProtocol values mirror the migration's CHECK constraint and the
+// Rust dataplane's enum.
+const (
+	ForwardProtocolUDP ForwardProtocol = "udp"
+	ForwardProtocolTCP ForwardProtocol = "tcp"
+)
+
+// IsValid reports whether p is one of the two supported protocols.
+func (p ForwardProtocol) IsValid() bool {
+	return p == ForwardProtocolUDP || p == ForwardProtocolTCP
+}
+
+// ForwardEnginePreset selects a named KCP tuning baseline for tcp
+// forwarding (v4.0.0). 'balanced' (the default) carries the
+// production-proven values (full window, congestion control disabled);
+// 'interactive' trades window for lower latency; 'lossy' widens the
+// window and retransmits sooner for high-loss paths. The operator may
+// override individual knobs via forward_engine_tuning. Mirrors the
+// migration's CHECK constraint (0012_forward_protocol.sql).
+type ForwardEnginePreset string
+
+// ForwardEnginePreset values mirror the migration's CHECK constraint.
+const (
+	ForwardEnginePresetBalanced    ForwardEnginePreset = "balanced"
+	ForwardEnginePresetInteractive ForwardEnginePreset = "interactive"
+	ForwardEnginePresetLossy       ForwardEnginePreset = "lossy"
+)
+
+// DefaultForwardEnginePreset is applied when a tcp tunnel omits the
+// preset. It carries the production-proven KCP defaults.
+const DefaultForwardEnginePreset = ForwardEnginePresetBalanced
+
+// IsValid reports whether p is one of the three supported presets.
+func (p ForwardEnginePreset) IsValid() bool {
+	switch p {
+	case ForwardEnginePresetBalanced, ForwardEnginePresetInteractive, ForwardEnginePresetLossy:
+		return true
+	}
+	return false
+}
+
 // --- v2 upload × download matrix -------------------------------------
 //
 // The upload path is a function of the download transport, not an
@@ -229,6 +281,28 @@ type Tunnel struct {
 	MaxConnections          int
 	IdleTimeout             int
 	IcmpEchoMode            IcmpEchoMode
+
+	// ForwardProtocol (v4.0.0): 'udp' (default) or 'tcp'. Shared by both
+	// roles — the paired Client and Remote must agree. 'tcp' activates
+	// the KCP forwarding engine; the engine sits above the seal/spoof
+	// machinery and carries opaque ≤MTU datagrams, so udp tunnels stay
+	// byte-identical.
+	ForwardProtocol ForwardProtocol
+	// KeepAlive (v4.0.0): when true the tunnel maintains one artificial
+	// internal session at all times so the dataplane stays warm and the
+	// panel keeps reporting it running even with zero real users. Off by
+	// default.
+	KeepAlive bool
+	// KeepAliveIntervalSec is how often the keep-alive heartbeat fires.
+	// When KeepAlive is on it must be < IdleTimeout so the synthetic
+	// session can never be reaped. Default 20.
+	KeepAliveIntervalSec int
+	// ForwardEnginePreset + ForwardEngineTuning configure the KCP engine
+	// when ForwardProtocol is 'tcp'. The preset is a named baseline; the
+	// tuning is an optional JSON object of per-knob overrides ("" = use
+	// the preset verbatim). Both are ignored for udp tunnels.
+	ForwardEnginePreset ForwardEnginePreset
+	ForwardEngineTuning string
 
 	// Ports is the full list of application ports this tunnel carries
 	// through the one secure download-spoof / upload pipeline, with a fixed

@@ -411,6 +411,39 @@ func buildSpec(t tunnels.Tunnel, proxy *socks5.Proxy) (ipc.TunnelSpec, error) {
 		PacingEnabled:           t.PacingEnabled,
 		PacingTargetMS:          uint32(t.PacingTargetMS), //nolint:gosec // bounded above
 	}
+	// Forward protocol (v4.0.0). Default to "udp" so a row without an
+	// explicit value (everything pre-v4) takes the byte-identical legacy
+	// path. When "tcp", resolve the KCP tuning from the preset + override
+	// JSON so the dataplane receives concrete knobs (never its own
+	// fallback defaults — the panel is the source of truth).
+	forwardProtocol := t.ForwardProtocol
+	if forwardProtocol == "" {
+		forwardProtocol = tunnels.ForwardProtocolUDP
+	}
+	spec.ForwardProtocol = string(forwardProtocol)
+	spec.KeepAlive = t.KeepAlive
+	if t.KeepAliveIntervalSec > 0 {
+		spec.KeepAliveIntervalSec = uint32(t.KeepAliveIntervalSec) //nolint:gosec // validator bounds > 0
+	}
+	if forwardProtocol == tunnels.ForwardProtocolTCP {
+		preset := t.ForwardEnginePreset
+		if preset == "" {
+			preset = tunnels.DefaultForwardEnginePreset
+		}
+		kt, err := tunnels.ResolveKcpTuning(preset, t.ForwardEngineTuning)
+		if err != nil {
+			return ipc.TunnelSpec{}, fmt.Errorf("resolve kcp tuning: %w", err)
+		}
+		spec.KcpTuning = &ipc.KcpTuning{
+			NoDelay:  uint32(kt.NoDelay),  //nolint:gosec // bounded by ResolveKcpTuning
+			Interval: uint32(kt.Interval), //nolint:gosec // bounded by ResolveKcpTuning
+			Resend:   uint32(kt.Resend),   //nolint:gosec // bounded by ResolveKcpTuning
+			NC:       uint32(kt.NC),       //nolint:gosec // bounded by ResolveKcpTuning
+			SndWnd:   uint32(kt.SndWnd),   //nolint:gosec // bounded by ResolveKcpTuning
+			RcvWnd:   uint32(kt.RcvWnd),   //nolint:gosec // bounded by ResolveKcpTuning
+			MTU:      uint32(kt.MTU),      //nolint:gosec // bounded by ResolveKcpTuning
+		}
+	}
 	// Multi-port (v2.5.0): carry the app-port list to the dataplane only
 	// when the tunnel is genuinely multi-port (>= 2 ports). A 0- or
 	// 1-element list is single-port — leave spec.Ports empty so the

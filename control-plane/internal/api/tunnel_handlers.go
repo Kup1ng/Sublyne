@@ -135,6 +135,15 @@ type tunnelDTO struct {
 	// Client tunnels carry the default value untouched.
 	UploadListenMode string `json:"upload_listen_mode"`
 
+	// Forward protocol + keep-alive + KCP engine config (v4.0.0). Shared
+	// by both roles. ForwardEngineTuning is the raw JSON override string
+	// ("" = use the preset verbatim).
+	ForwardProtocol      string `json:"forward_protocol"`
+	KeepAlive            bool   `json:"keep_alive"`
+	KeepAliveIntervalSec int    `json:"keep_alive_interval_sec"`
+	ForwardEnginePreset  string `json:"forward_engine_preset"`
+	ForwardEngineTuning  string `json:"forward_engine_tuning"`
+
 	// RuntimeState reflects the dataplane's view of this tunnel:
 	// "stopped" (no traffic), "running" (forwarding traffic),
 	// "starting" (mid-bring-up), or "error". The enabled flag above
@@ -167,12 +176,26 @@ func toDTO(t tunnels.Tunnel, redactPSK bool) tunnelDTO {
 		PingSmoothingTargetMS:   t.PingSmoothingTargetMS,
 		PacingEnabled:           t.PacingEnabled,
 		PacingTargetMS:          t.PacingTargetMS,
+		ForwardProtocol:         string(t.ForwardProtocol),
+		KeepAlive:               t.KeepAlive,
+		KeepAliveIntervalSec:    t.KeepAliveIntervalSec,
+		ForwardEnginePreset:     string(t.ForwardEnginePreset),
+		ForwardEngineTuning:     t.ForwardEngineTuning,
 	}
 	if d.UploadMode == "" {
 		d.UploadMode = string(tunnels.UploadModeWireguard)
 	}
 	if d.UploadListenMode == "" {
 		d.UploadListenMode = string(tunnels.UploadListenModeUDP)
+	}
+	if d.ForwardProtocol == "" {
+		d.ForwardProtocol = string(tunnels.ForwardProtocolUDP)
+	}
+	if d.ForwardEnginePreset == "" {
+		d.ForwardEnginePreset = string(tunnels.DefaultForwardEnginePreset)
+	}
+	if d.KeepAliveIntervalSec == 0 {
+		d.KeepAliveIntervalSec = 20
 	}
 	if redactPSK {
 		d.PSK = RedactedPSK
@@ -284,6 +307,15 @@ type tunnelInput struct {
 	// listener that decodes [u16][bytes] frames from the paired SOCKS5
 	// Client. Mirrors UploadMode's defaulting in applyDefaults.
 	UploadListenMode string `json:"upload_listen_mode"`
+
+	// Forward protocol + keep-alive + KCP engine config (v4.0.0). Omit
+	// forward_protocol / forward_engine_preset (or send empty string) and
+	// applyDefaults coerces them to 'udp' / 'balanced'.
+	ForwardProtocol      string `json:"forward_protocol"`
+	KeepAlive            bool   `json:"keep_alive"`
+	KeepAliveIntervalSec int    `json:"keep_alive_interval_sec"`
+	ForwardEnginePreset  string `json:"forward_engine_preset"`
+	ForwardEngineTuning  string `json:"forward_engine_tuning"`
 }
 
 // applyDefaults fills in PRD-documented defaults for any field the
@@ -321,6 +353,18 @@ func (in *tunnelInput) applyDefaults() {
 	if in.UploadListenMode == "" {
 		in.UploadListenMode = string(tunnels.DefaultListenMode(dt))
 	}
+	// Forward-protocol defaults (v4.0.0): a minimal create body or an
+	// import lands on 'udp' (byte-identical legacy) with the 'balanced'
+	// engine preset and a 20 s keep-alive interval.
+	if in.ForwardProtocol == "" {
+		in.ForwardProtocol = string(tunnels.ForwardProtocolUDP)
+	}
+	if in.ForwardEnginePreset == "" {
+		in.ForwardEnginePreset = string(tunnels.DefaultForwardEnginePreset)
+	}
+	if in.KeepAliveIntervalSec == 0 {
+		in.KeepAliveIntervalSec = 20
+	}
 }
 
 // toTunnel converts the wire input into the persistence struct. The
@@ -346,6 +390,11 @@ func (in *tunnelInput) toTunnel(role tunnels.Role, psk string) tunnels.Tunnel {
 		PingSmoothingTargetMS:   in.PingSmoothingTargetMS,
 		PacingEnabled:           in.PacingEnabled,
 		PacingTargetMS:          in.PacingTargetMS,
+		ForwardProtocol:         tunnels.ForwardProtocol(in.ForwardProtocol),
+		KeepAlive:               in.KeepAlive,
+		KeepAliveIntervalSec:    in.KeepAliveIntervalSec,
+		ForwardEnginePreset:     tunnels.ForwardEnginePreset(in.ForwardEnginePreset),
+		ForwardEngineTuning:     in.ForwardEngineTuning,
 	}
 	if in.LocalListenAddr != nil {
 		t.LocalListenAddr = sql.NullString{String: *in.LocalListenAddr, Valid: true}
@@ -1047,6 +1096,14 @@ type tunnelExportBody struct {
 	PacingEnabled         bool `json:"pacing_enabled"`
 	PacingTargetMS        int  `json:"pacing_target_ms"`
 
+	// Forward protocol + keep-alive + KCP engine config (v4.0.0). Portable
+	// as-is — no by-name resolution needed.
+	ForwardProtocol      string `json:"forward_protocol"`
+	KeepAlive            bool   `json:"keep_alive"`
+	KeepAliveIntervalSec int    `json:"keep_alive_interval_sec"`
+	ForwardEnginePreset  string `json:"forward_engine_preset"`
+	ForwardEngineTuning  string `json:"forward_engine_tuning"`
+
 	// PSK is null unless ?secrets=1 was set on export. The frontend may
 	// inject a value here before posting to /import when the file lacks
 	// one.
@@ -1096,6 +1153,17 @@ func buildExportBody(ctx context.Context, deps TunnelDeps, t tunnels.Tunnel, sec
 		PingSmoothingTargetMS:   t.PingSmoothingTargetMS,
 		PacingEnabled:           t.PacingEnabled,
 		PacingTargetMS:          t.PacingTargetMS,
+		ForwardProtocol:         string(t.ForwardProtocol),
+		KeepAlive:               t.KeepAlive,
+		KeepAliveIntervalSec:    t.KeepAliveIntervalSec,
+		ForwardEnginePreset:     string(t.ForwardEnginePreset),
+		ForwardEngineTuning:     t.ForwardEngineTuning,
+	}
+	if b.ForwardProtocol == "" {
+		b.ForwardProtocol = string(tunnels.ForwardProtocolUDP)
+	}
+	if b.ForwardEnginePreset == "" {
+		b.ForwardEnginePreset = string(tunnels.DefaultForwardEnginePreset)
 	}
 	if b.UploadMode == "" {
 		b.UploadMode = string(tunnels.UploadModeWireguard)
@@ -1289,6 +1357,11 @@ func ImportTunnelHandler(deps TunnelDeps) http.HandlerFunc {
 			DownloadSendPort:        body.DownloadSendPort,
 			ClientRealIP:            body.ClientRealIP,
 			UploadListenMode:        body.UploadListenMode,
+			ForwardProtocol:         body.ForwardProtocol,
+			KeepAlive:               body.KeepAlive,
+			KeepAliveIntervalSec:    body.KeepAliveIntervalSec,
+			ForwardEnginePreset:     body.ForwardEnginePreset,
+			ForwardEngineTuning:     body.ForwardEngineTuning,
 		}
 
 		// Resolve panel-resource references by NAME against this panel.
