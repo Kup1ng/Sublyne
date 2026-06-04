@@ -128,7 +128,13 @@ onBeforeUnmount(() => {
             </p>
           </div>
 
-          <div class="min-h-0 flex-1 overflow-y-auto" :class="bodyClass ?? 'px-7 py-6'">
+          <!-- overflow-x-hidden: overflow-y-auto alone coerces overflow-x to
+               `auto`, so an absolutely-positioned field tooltip poking past the
+               edge produced a useless horizontal scrollbar. Pin it hidden. -->
+          <div
+            class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+            :class="bodyClass ?? 'px-7 py-6'"
+          >
             <slot />
           </div>
 
