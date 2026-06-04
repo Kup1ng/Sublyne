@@ -30,12 +30,15 @@
 //! parallelise the kernel-side send path; sharing one Arc<RawSocket>
 //! across workers would serialise on the kernel socket lock.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
@@ -44,6 +47,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
 use crate::batch::{self, SendBatch};
+use crate::forward::{self, DatagramSink};
 use crate::hmac;
 use crate::manager::SpawnError;
 use crate::metrics::TunnelMetrics;
@@ -148,6 +152,62 @@ enum UploadForwarder {
 static UNKNOWN_PORT_UPLOAD_DROPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// What an upload-ingest task does with each received datagram. `Forward`
+/// is the udp-forward path (decode tag → forward to forward_target via the
+/// `UploadForwarder`, byte-for-byte the legacy behaviour). `Tcp` is the
+/// v4.0.0 tcp-forward path: hand the (port-tagged) datagram — a KCP
+/// segment — to the right per-port engine, which reassembles the stream
+/// and dials forward_target itself.
+#[derive(Clone)]
+enum UploadDest {
+    Forward(UploadForwarder),
+    Tcp(Arc<forward::EngineSet>),
+}
+
+/// Download egress for a tcp-forward Remote engine: seal each KCP segment
+/// through the SAME parallel-seal → single-send pipeline the udp path uses
+/// (so PR#36 single-send-socket + PR#38 session_id + the 1024 SeqWindow
+/// are all preserved), assigning a fresh monotonic seq per segment.
+///
+/// Unlike the udp recv loop's `try_send`, this awaits a full seal channel
+/// (backpressure) so KCP output is never dropped — a dropped output
+/// segment would force a KCP retransmit storm.
+struct RemoteForwardSink {
+    seal_txs: Arc<Vec<mpsc::Sender<DownloadSpoofJob>>>,
+    seq_counter: Arc<AtomicU64>,
+    icmp_seq_counter: Arc<std::sync::atomic::AtomicU32>,
+    /// Application-port tag to prepend (multi-port), or `None` (single).
+    tag: Option<u16>,
+}
+
+#[async_trait]
+impl DatagramSink for RemoteForwardSink {
+    async fn send(&self, datagram: &[u8]) -> io::Result<bool> {
+        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
+        let icmp_seq = self.icmp_seq_counter.fetch_add(1, Ordering::Relaxed) as u16;
+        let payload = match self.tag {
+            Some(port) => {
+                let mut b = Vec::with_capacity(multiport::PORT_TAG_LEN + datagram.len());
+                multiport::encode_tag(port, datagram, &mut b);
+                b
+            }
+            None => datagram.to_vec(),
+        };
+        let n = self.seal_txs.len().max(1);
+        let worker = (seq as usize) % n;
+        let job = DownloadSpoofJob {
+            payload,
+            hmac_seq: seq,
+            icmp_seq,
+        };
+        match self.seal_txs[worker].send(job).await {
+            Ok(()) => Ok(true),
+            // Channel closed — the tunnel is stopping. Not a drop to count.
+            Err(_) => Ok(false),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn(
     spec: &TunnelSpec,
@@ -215,6 +275,37 @@ pub(super) async fn spawn(
         );
     }
     let icmp_echo_mode = spec.icmp_echo_mode;
+
+    // v4.0.0: TCP forwarding has a wholly different shape — no
+    // forward_target UDP socket and no download recv loop. The KCP engine
+    // dials forward_target as TCP per conversation and feeds the SAME
+    // shared seal pipeline (one seq stream, one session_id, single send
+    // socket — PR#36/PR#38 untouched). Branch here, before binding the UDP
+    // forward socket the udp-forward path needs.
+    if resolved.forward_tcp() {
+        return spawn_tcp(
+            tasks,
+            spec,
+            resolved,
+            stop_rx,
+            mutable_config,
+            session_table,
+            metrics,
+            id,
+            name,
+            seq_counter,
+            icmp_seq_counter,
+            session_id,
+            icmp_identifier,
+            icmp_echo_mode,
+            initial_send_target,
+            send_port,
+            client_ip,
+            forward_target,
+            upload_listen,
+        )
+        .await;
+    }
 
     // (2) Forward-target socket. Bind on the same family as the forward
     // target so v6 forward_target works. The download path uses this
@@ -307,7 +398,7 @@ pub(super) async fn spawn(
                 id,
                 name.clone(),
                 upload_sock.clone(),
-                forwarder.clone(),
+                UploadDest::Forward(forwarder.clone()),
                 session_table.clone(),
                 mutable_config.clone(),
                 metrics.clone(),
@@ -343,7 +434,7 @@ pub(super) async fn spawn(
                 id,
                 name.clone(),
                 tcp_listener,
-                forwarder.clone(),
+                UploadDest::Forward(forwarder.clone()),
                 session_table.clone(),
                 mutable_config.clone(),
                 metrics.clone(),
@@ -492,7 +583,7 @@ fn spawn_upload_task(
     id: i64,
     name: Arc<String>,
     upload_sock: Arc<UdpSocket>,
-    forwarder: UploadForwarder,
+    dest: UploadDest,
     session_table: Arc<SessionTable>,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
@@ -515,48 +606,61 @@ fn spawn_upload_task(
                             continue;
                         }
                     };
-                    // Resolve the forward socket + target (and strip the
-                    // application-port tag in multi-port mode) BEFORE the
-                    // MTU cap check, so the cap applies to the UNTAGGED
-                    // body exactly as on the single-port path.
-                    let (fwd_sock, fwd_target, body) =
-                        match resolve_upload_forward(&forwarder, &buf[..n], id) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                    // Sample mtu fresh so hot-reload of mtu takes effect
-                    // on the next packet.
-                    let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
-                    let payload_cap = mtu.max(64);
-                    if body.len() > payload_cap {
-                        if let Some(total) = sampled(&OVERSIZED_UPLOAD_DROPS) {
-                            warn!(tunnel_id = id, n = body.len(), max = payload_cap, dropped_total = total,
-                                "remote: dropping oversized upload packet (raise tunnel MTU or shrink app packet)");
+                    match &dest {
+                        UploadDest::Forward(forwarder) => {
+                            // Resolve the forward socket + target (and strip
+                            // the application-port tag in multi-port mode)
+                            // BEFORE the MTU cap check, so the cap applies to
+                            // the UNTAGGED body exactly as on the single-port
+                            // path.
+                            let (fwd_sock, fwd_target, body) =
+                                match resolve_upload_forward(forwarder, &buf[..n], id) {
+                                    Some(v) => v,
+                                    None => continue,
+                                };
+                            // Sample mtu fresh so hot-reload of mtu takes
+                            // effect on the next packet.
+                            let mtu =
+                                mutable_config.read().expect("mutable_config read").mtu as usize;
+                            let payload_cap = mtu.max(64);
+                            if body.len() > payload_cap {
+                                if let Some(total) = sampled(&OVERSIZED_UPLOAD_DROPS) {
+                                    warn!(tunnel_id = id, n = body.len(), max = payload_cap, dropped_total = total,
+                                        "remote: dropping oversized upload packet (raise tunnel MTU or shrink app packet)");
+                                }
+                                continue;
+                            }
+                            let outcome = session_table.insert_or_refresh(src, src);
+                            if matches!(outcome, InsertOutcome::Rejected) {
+                                if let Some(total) = sampled(&SESSION_FULL_DROPS) {
+                                    warn!(tunnel_id = id, %src, dropped_total = total,
+                                        "remote: session table full, dropping new session (at max_connections)");
+                                }
+                                metrics.record_session_reject();
+                                continue;
+                            }
+                            if let Err(e) = fwd_sock.send_to(body, fwd_target).await {
+                                if let Some(total) = sampled(&FORWARD_FAILS) {
+                                    warn!(tunnel_id = id, target = %fwd_target, err = %e, dropped_total = total,
+                                        "remote: forward to target failed");
+                                }
+                            } else {
+                                // From the Remote's perspective the upstream
+                                // direction (toward the forward target)
+                                // carries the user's request — that's
+                                // "upload-ish" in the Client's framing.
+                                metrics.record_upload(body.len(), now_unix());
+                            }
                         }
-                        continue;
-                    }
-                    let outcome = session_table.insert_or_refresh(src, src);
-                    if matches!(outcome, InsertOutcome::Rejected) {
-                        if let Some(total) = sampled(&SESSION_FULL_DROPS) {
-                            warn!(tunnel_id = id, %src, dropped_total = total,
-                                "remote: session table full, dropping new session (at max_connections)");
+                        UploadDest::Tcp(engines) => {
+                            // The datagram is a KCP segment (possibly
+                            // port-tagged); route it to the right engine,
+                            // which reassembles the stream and dials
+                            // forward_target itself. Upload bytes are metered
+                            // by the engine when it writes to forward_target.
+                            // (`src` is consumed by the Forward arm only.)
+                            engines.route_tagged(&buf[..n]);
                         }
-                        metrics.record_session_reject();
-                        continue;
-                    }
-                    if let Err(e) = fwd_sock.send_to(body, fwd_target).await {
-                        if let Some(total) = sampled(&FORWARD_FAILS) {
-                            warn!(tunnel_id = id, target = %fwd_target, err = %e, dropped_total = total,
-                                "remote: forward to target failed");
-                        }
-                    } else {
-                        // From the Remote's perspective the upstream
-                        // direction (toward the forward target) carries
-                        // the user's request — that's "upload-ish" in
-                        // the Client's framing. Record it on the same
-                        // counter so both sides' dashboards report a
-                        // symmetric bytes-out number.
-                        metrics.record_upload(body.len(), now_unix());
                     }
                 }
             }
@@ -638,7 +742,7 @@ fn spawn_socks5_upload_listener(
     id: i64,
     name: Arc<String>,
     listener: TcpListener,
-    forwarder: UploadForwarder,
+    dest: UploadDest,
     session_table: Arc<SessionTable>,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
@@ -667,7 +771,7 @@ fn spawn_socks5_upload_listener(
                     // rather than ~120 s.
                     crate::perf::tune_socks5_tcp_socket(&stream, "socks5/remote-in", keepalive);
                     info!(tunnel_id = id, %peer, "remote: socks5 upload connection accepted");
-                    let forwarder = forwarder.clone();
+                    let dest = dest.clone();
                     let session_table = session_table.clone();
                     let mutable_config = mutable_config.clone();
                     let metrics = metrics.clone();
@@ -679,7 +783,7 @@ fn spawn_socks5_upload_listener(
                             name,
                             stream,
                             peer,
-                            forwarder,
+                            dest,
                             session_table,
                             mutable_config,
                             metrics,
@@ -708,7 +812,7 @@ async fn drive_socks5_upload_connection(
     name: Arc<String>,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
-    forwarder: UploadForwarder,
+    dest: UploadDest,
     session_table: Arc<SessionTable>,
     mutable_config: MutableConfigSlot,
     metrics: Arc<TunnelMetrics>,
@@ -765,46 +869,53 @@ async fn drive_socks5_upload_connection(
                     payload.resize(n, 0);
                 }
                 stream.read_exact(&mut payload[..n]).await?;
-                // Resolve the forward socket + target (and strip the
-                // application-port tag in multi-port mode) BEFORE the MTU
-                // cap check so the cap applies to the UNTAGGED body.
-                let (fwd_sock, fwd_target, body) =
-                    match resolve_upload_forward(&forwarder, &payload[..n], id) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
-                let payload_cap = mtu.max(64);
-                if body.len() > payload_cap {
-                    if let Some(total) = sampled(&OVERSIZED_UPLOAD_DROPS) {
-                        warn!(tunnel_id = id, n = body.len(), max = payload_cap, dropped_total = total,
-                            "remote: dropping oversized socks5_tcp upload frame (raise tunnel MTU)");
+                match &dest {
+                    UploadDest::Forward(forwarder) => {
+                        // Resolve the forward socket + target (and strip the
+                        // application-port tag in multi-port mode) BEFORE the
+                        // MTU cap check so the cap applies to the UNTAGGED body.
+                        let (fwd_sock, fwd_target, body) =
+                            match resolve_upload_forward(forwarder, &payload[..n], id) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                        let mtu = mutable_config.read().expect("mutable_config read").mtu as usize;
+                        let payload_cap = mtu.max(64);
+                        if body.len() > payload_cap {
+                            if let Some(total) = sampled(&OVERSIZED_UPLOAD_DROPS) {
+                                warn!(tunnel_id = id, n = body.len(), max = payload_cap, dropped_total = total,
+                                    "remote: dropping oversized socks5_tcp upload frame (raise tunnel MTU)");
+                            }
+                            continue;
+                        }
+                        // The SOCKS5 upload doesn't carry a real source peer
+                        // per frame — every frame from this TCP connection is
+                        // logically the same upstream session. Use the TCP
+                        // peer as the session key so insert/refresh increments
+                        // sessions sensibly and idle eviction can sweep when
+                        // the connection drops.
+                        let outcome = session_table.insert_or_refresh(peer, peer);
+                        if matches!(outcome, InsertOutcome::Rejected) {
+                            if let Some(total) = sampled(&SESSION_FULL_DROPS) {
+                                warn!(tunnel_id = id, %peer, dropped_total = total,
+                                    "remote: session table full, dropping new socks5 upload session (at max_connections)");
+                            }
+                            metrics.record_session_reject();
+                            continue;
+                        }
+                        if let Err(e) = fwd_sock.send_to(body, fwd_target).await {
+                            if let Some(total) = sampled(&FORWARD_FAILS) {
+                                warn!(tunnel_id = id, target = %fwd_target, err = %e, dropped_total = total,
+                                    "remote: socks5_tcp forward to target failed");
+                            }
+                        } else {
+                            metrics.record_upload(body.len(), now_unix());
+                        }
                     }
-                    continue;
-                }
-                // The SOCKS5 upload doesn't carry a real source
-                // peer per frame — every frame from this TCP
-                // connection is logically the same upstream session
-                // from the operator's perspective. Use the TCP peer
-                // as the session key so insert/refresh increments
-                // sessions sensibly and idle eviction can sweep when
-                // the connection drops.
-                let outcome = session_table.insert_or_refresh(peer, peer);
-                if matches!(outcome, InsertOutcome::Rejected) {
-                    if let Some(total) = sampled(&SESSION_FULL_DROPS) {
-                        warn!(tunnel_id = id, %peer, dropped_total = total,
-                            "remote: session table full, dropping new socks5 upload session (at max_connections)");
+                    UploadDest::Tcp(engines) => {
+                        // KCP segment (possibly port-tagged) → engine.
+                        engines.route_tagged(&payload[..n]);
                     }
-                    metrics.record_session_reject();
-                    continue;
-                }
-                if let Err(e) = fwd_sock.send_to(body, fwd_target).await {
-                    if let Some(total) = sampled(&FORWARD_FAILS) {
-                        warn!(tunnel_id = id, target = %fwd_target, err = %e, dropped_total = total,
-                            "remote: socks5_tcp forward to target failed");
-                    }
-                } else {
-                    metrics.record_upload(body.len(), now_unix());
                 }
             }
         }
@@ -983,6 +1094,270 @@ fn spawn_download_pipeline(
         stop_rx.clone(),
         send_batch_size,
     ));
+    Ok(())
+}
+
+/// Build the parallel-seal → single-send download egress pipeline and
+/// return the per-worker seal-job senders. This is the seal/send half of
+/// [`spawn_download_pipeline`] (the recv-loop half is the udp-forward
+/// producer); the tcp-forward path uses it directly, feeding the same
+/// `seal_txs` from the KCP engines instead of from a forward-socket recv
+/// loop. Keeping the wire-order-critical seal+send stage in one place
+/// preserves PR#36 (single send socket) and PR#38 (one session_id) across
+/// both forward protocols. If you change the worker-count math or the
+/// SeqWindow coupling here, mirror it in `spawn_download_pipeline`.
+#[allow(clippy::too_many_arguments)]
+fn build_seal_send_pipeline(
+    tasks: &mut JoinSet<()>,
+    transport: Transport,
+    label: &'static str,
+    icmp_echo_mode: crate::spec::IcmpEchoMode,
+    icmp_identifier: u16,
+    id: i64,
+    name: Arc<String>,
+    mutable_config: MutableConfigSlot,
+    metrics: Arc<TunnelMetrics>,
+    session_id: u64,
+    initial_send_target: SendTarget,
+    send_port: u16,
+    client_ip_for_log: IpAddr,
+    stop_rx: watch::Receiver<bool>,
+) -> Result<Vec<mpsc::Sender<DownloadSpoofJob>>, SpawnError> {
+    let send_batch_size = crate::perf::send_batch();
+    // Cap the seal fan-out so `SEAL_WORKER_CHANNEL_CAP * n_workers` stays
+    // within Iran's 1024-slot SeqWindow — identical reasoning to
+    // `spawn_download_pipeline`.
+    let requested_workers = crate::perf::per_core_sockets().max(1);
+    let max_seal_workers = (hmac::SEQ_WINDOW_SIZE as usize / SEAL_WORKER_CHANNEL_CAP).max(1);
+    let n_workers = requested_workers.min(max_seal_workers);
+    if n_workers < requested_workers {
+        info!(
+            tunnel_id = id,
+            transport = label,
+            requested = requested_workers,
+            seal_workers = n_workers,
+            "remote: seal pool capped to keep the fan-out reorder budget within Iran's SeqWindow"
+        );
+    }
+
+    let mut seal_txs: Vec<mpsc::Sender<DownloadSpoofJob>> = Vec::with_capacity(n_workers);
+    let mut seal_rxs: Vec<mpsc::Receiver<DownloadSpoofJob>> = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let (tx, rx) = mpsc::channel::<DownloadSpoofJob>(SEAL_WORKER_CHANNEL_CAP);
+        seal_txs.push(tx);
+        seal_rxs.push(rx);
+    }
+
+    let (sealed_tx, sealed_rx) = mpsc::channel::<SealedPacket>(SEND_QUEUE_CAP);
+
+    // One raw send socket — exclusively owned by the send worker so wire
+    // FIFO is preserved at the syscall layer.
+    let raw_send = open_send_socket_for_transport(transport)?;
+    let raw_send_fd = std::os::fd::OwnedFd::from(raw_send);
+    let send_sock = Arc::new(AsyncFd::new(raw_send_fd).map_err(SpawnError::Io)?);
+
+    info!(
+        tunnel_id = id,
+        transport = label,
+        dst = %client_ip_for_log,
+        port = send_port,
+        send_batch = send_batch_size,
+        seal_workers = n_workers,
+        "remote: seal+send pipeline ready (shared by udp-forward recv loops / tcp-forward engines)"
+    );
+
+    for (worker_id, rx) in seal_rxs.into_iter().enumerate() {
+        tasks.spawn(download_seal_worker(
+            rx,
+            sealed_tx.clone(),
+            initial_send_target,
+            send_port,
+            transport,
+            icmp_echo_mode,
+            icmp_identifier,
+            session_id,
+            label,
+            mutable_config.clone(),
+            metrics.clone(),
+            id,
+            worker_id,
+            name.clone(),
+            stop_rx.clone(),
+        ));
+    }
+    drop(sealed_tx);
+
+    tasks.spawn(download_send_worker(
+        sealed_rx,
+        send_sock,
+        label,
+        metrics.clone(),
+        mutable_config.clone(),
+        id,
+        name.clone(),
+        stop_rx.clone(),
+        send_batch_size,
+    ));
+    Ok(seal_txs)
+}
+
+/// Remote-side bring-up for a `forward_protocol=tcp` tunnel. No
+/// forward_target UDP socket and no download recv loop: the KCP engine
+/// dials forward_target as TCP per conv and feeds the shared seal
+/// pipeline. The upload listener (UDP or SOCKS5/TCP) routes inbound KCP
+/// segments to the right per-port engine.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_tcp(
+    tasks: &mut JoinSet<()>,
+    spec: &TunnelSpec,
+    resolved: &ResolvedSpec,
+    stop_rx: watch::Receiver<bool>,
+    mutable_config: MutableConfigSlot,
+    session_table: Arc<SessionTable>,
+    metrics: Arc<TunnelMetrics>,
+    id: i64,
+    name: Arc<String>,
+    seq_counter: Arc<AtomicU64>,
+    icmp_seq_counter: Arc<std::sync::atomic::AtomicU32>,
+    session_id: u64,
+    icmp_identifier: u16,
+    icmp_echo_mode: crate::spec::IcmpEchoMode,
+    initial_send_target: SendTarget,
+    send_port: u16,
+    client_ip: IpAddr,
+    forward_target: SocketAddr,
+    upload_listen: SocketAddr,
+) -> Result<(), SpawnError> {
+    let transport = spec.download_transport;
+    let label: &'static str = match transport {
+        Transport::Udp => "udp",
+        Transport::TcpSyn => "tcp_syn",
+        Transport::Icmp => "icmp",
+        Transport::Icmpv6 => "icmpv6",
+    };
+
+    // Download egress: the shared parallel-seal → single-send pipeline.
+    let seal_txs = Arc::new(build_seal_send_pipeline(
+        tasks,
+        transport,
+        label,
+        icmp_echo_mode,
+        icmp_identifier,
+        id,
+        name.clone(),
+        mutable_config.clone(),
+        metrics.clone(),
+        session_id,
+        initial_send_target,
+        send_port,
+        client_ip,
+        stop_rx.clone(),
+    )?);
+
+    // One KCP engine per application port (single-port = one engine). All
+    // engines share one tunnel-wide active-conv counter so the dashboard
+    // session count is the sum across ports.
+    let active = Arc::new(AtomicU64::new(0));
+    let clock = Instant::now();
+    let kcp_mtu = forward::kcp_mtu(spec.mtu, &spec.kcp_tuning);
+    let max_conns = (spec.max_connections as usize).max(1);
+    let forward_host = forward_target.ip();
+
+    let make_engine = |target: SocketAddr, tag: Option<u16>| -> Arc<forward::Engine> {
+        let sink: Arc<dyn DatagramSink> = Arc::new(RemoteForwardSink {
+            seal_txs: seal_txs.clone(),
+            seq_counter: seq_counter.clone(),
+            icmp_seq_counter: icmp_seq_counter.clone(),
+            tag,
+        });
+        forward::Engine::new(
+            forward::EngineRole::Remote {
+                forward_target: target,
+            },
+            forward::EngineConfig {
+                tunnel_id: id,
+                tuning: spec.kcp_tuning,
+                kcp_mtu,
+                idle_timeout_sec: spec.idle_timeout_sec,
+                max_conns,
+            },
+            sink,
+            active.clone(),
+            metrics.clone(),
+            clock,
+            stop_rx.clone(),
+        )
+    };
+
+    let engine_set = if resolved.multiport() {
+        let mut engines: HashMap<u16, Arc<forward::Engine>> =
+            HashMap::with_capacity(resolved.ports.len());
+        for &port in &resolved.ports {
+            if engines.contains_key(&port) {
+                continue;
+            }
+            let target = SocketAddr::new(forward_host, port);
+            engines.insert(port, make_engine(target, Some(port)));
+        }
+        info!(
+            tunnel_id = id,
+            ports = engines.len(),
+            "remote: tcp-forward multi-port engines ready"
+        );
+        forward::EngineSet::multi(engines, id)
+    } else {
+        info!(tunnel_id = id, target = %forward_target,
+            "remote: tcp-forward single-port engine ready");
+        forward::EngineSet::single(make_engine(forward_target, None), id)
+    };
+
+    // Upload ingest: same listener shapes as the udp-forward path, but the
+    // decoded datagrams (KCP segments) route to the engines instead of a
+    // forward socket.
+    let dest = UploadDest::Tcp(engine_set);
+    match spec.upload_listen_mode {
+        UploadListenMode::Udp => {
+            let upload_sock = bind_dualstack_udp(upload_listen).map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "remote/upload", upload_listen))
+            })?;
+            crate::perf::tune_socket(&upload_sock, "remote/upload");
+            let upload_sock = Arc::new(upload_sock);
+            info!(tunnel_id = id, addr = %upload_listen,
+                "remote: tcp-forward upload_listen bound (UDP)");
+            spawn_upload_task(
+                tasks,
+                id,
+                name.clone(),
+                upload_sock,
+                dest,
+                session_table.clone(),
+                mutable_config.clone(),
+                metrics.clone(),
+                stop_rx.clone(),
+            );
+        }
+        UploadListenMode::Socks5Tcp => {
+            let tcp_listener = TcpListener::bind(upload_listen).await.map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "remote/upload", upload_listen))
+            })?;
+            crate::perf::tune_socket(&tcp_listener, "socks5/remote-listen");
+            let keepalive = Socks5Profile::for_download(spec.download_transport).keepalive;
+            info!(tunnel_id = id, addr = %upload_listen,
+                "remote: tcp-forward upload_listen bound (SOCKS5/TCP)");
+            spawn_socks5_upload_listener(
+                tasks,
+                id,
+                name.clone(),
+                tcp_listener,
+                dest,
+                session_table.clone(),
+                mutable_config.clone(),
+                metrics.clone(),
+                keepalive,
+                stop_rx.clone(),
+            );
+        }
+    }
     Ok(())
 }
 

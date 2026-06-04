@@ -41,16 +41,19 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tokio::io::unix::AsyncFd;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::batch::{self, RecvBatch};
+use crate::forward::{self, DatagramSink};
 use crate::hmac::{self, HmacKey, OpenError, SeqWindow};
 use crate::manager::SpawnError;
 use crate::metrics::TunnelMetrics;
@@ -129,6 +132,11 @@ enum PortRouter {
         sessions: Arc<SessionTable>,
     },
     Multi(Arc<HashMap<u16, PortBinding>>),
+    /// forward_protocol=tcp (v4.0.0): verified KCP segments are routed to
+    /// the per-port KCP engine(s) instead of delivered to a UDP socket.
+    /// The [`forward::EngineSet`] handles single- vs multi-port internally
+    /// (decoding the 2-byte app-port tag).
+    Tcp(Arc<forward::EngineSet>),
 }
 
 /// Process-wide sampled counter for multi-port download packets whose
@@ -224,7 +232,23 @@ pub(super) async fn spawn(
     // single `upload_transport` egress) and tags every datagram with the
     // 2-byte application-port tag; the single-port path is left
     // byte-for-byte identical to before. See [`crate::multiport`].
-    let router = if resolved.multiport() {
+    let router = if resolved.forward_tcp() {
+        // v4.0.0: forward_protocol=tcp. Bind TCP listener(s) and a KCP
+        // engine per app port instead of the UDP listener + upload task;
+        // the download verify workers route verified KCP segments into the
+        // engine(s). The upload transport is shared, exactly as on the UDP
+        // path.
+        build_tcp_client_router(
+            tasks,
+            spec,
+            resolved,
+            id,
+            local,
+            upload_transport.clone(),
+            metrics.clone(),
+            stop_rx.clone(),
+        )?
+    } else if resolved.multiport() {
         let local_host = local.ip();
         let mut bindings: HashMap<u16, PortBinding> = HashMap::with_capacity(resolved.ports.len());
         for &port in &resolved.ports {
@@ -397,6 +421,157 @@ fn bind_dualstack_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
     UdpSocket::from_std(sock.into())
+}
+
+/// Bind a TCP listener on `addr`, dual-stack for IPv6 wildcards (so a
+/// `[::]:port` listener accepts both v4 and v6 user connections). Used by
+/// the tcp-forward path's per-port engines.
+fn bind_dualstack_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(false)?;
+    }
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    TcpListener::from_std(sock.into())
+}
+
+/// Client UPLOAD egress for a tcp-forward conversation: prepend the
+/// 2-byte application-port tag (multi-port) and hand the KCP segment to
+/// the shared upload transport (WireGuard / SOCKS5). One sink per engine
+/// (shared across that port's conversations). Upload bytes are metered by
+/// the conv on TCP read, so this only records pre-wire drops.
+struct ClientForwardSink {
+    upload: Arc<dyn UploadTransport>,
+    session: SessionKey,
+    tag: Option<u16>,
+    metrics: Arc<TunnelMetrics>,
+}
+
+#[async_trait]
+impl DatagramSink for ClientForwardSink {
+    async fn send(&self, datagram: &[u8]) -> io::Result<bool> {
+        let outcome = match self.tag {
+            Some(port) => {
+                let mut buf = Vec::with_capacity(multiport::PORT_TAG_LEN + datagram.len());
+                multiport::encode_tag(port, datagram, &mut buf);
+                self.upload.send(self.session, &buf).await
+            }
+            None => self.upload.send(self.session, datagram).await,
+        };
+        match outcome {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.metrics.record_upload_drop();
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Build the tcp-forward client router: bind a TCP listener per
+/// application port (single-port = one), wire each to its own KCP engine
+/// (Client role) over the shared upload transport, spawn each engine's
+/// accept loop, and return the [`PortRouter::Tcp`] the download verify
+/// workers route verified KCP segments into. All engines share one
+/// tunnel-wide active-conv counter.
+#[allow(clippy::too_many_arguments)]
+fn build_tcp_client_router(
+    tasks: &mut JoinSet<()>,
+    spec: &TunnelSpec,
+    resolved: &ResolvedSpec,
+    id: i64,
+    local: SocketAddr,
+    upload_transport: Arc<dyn UploadTransport>,
+    metrics: Arc<TunnelMetrics>,
+    stop_rx: watch::Receiver<bool>,
+) -> Result<PortRouter, SpawnError> {
+    let active = Arc::new(AtomicU64::new(0));
+    let clock = Instant::now();
+    let kcp_mtu = forward::kcp_mtu(spec.mtu, &spec.kcp_tuning);
+    let max_conns = (spec.max_connections as usize).max(1);
+    let local_host = local.ip();
+
+    let engine_set = if resolved.multiport() {
+        let mut engines: HashMap<u16, Arc<forward::Engine>> =
+            HashMap::with_capacity(resolved.ports.len());
+        for &port in &resolved.ports {
+            if engines.contains_key(&port) {
+                continue;
+            }
+            let listen = SocketAddr::new(local_host, port);
+            let listener = bind_dualstack_tcp(listen).map_err(|e| {
+                SpawnError::Io(crate::perf::bind_err(e, "client/tcp-listen", listen))
+            })?;
+            let sink: Arc<dyn DatagramSink> = Arc::new(ClientForwardSink {
+                upload: upload_transport.clone(),
+                session: SessionKey {
+                    client_addr: listen,
+                    local_port: port,
+                },
+                tag: Some(port),
+                metrics: metrics.clone(),
+            });
+            let engine = forward::Engine::new(
+                forward::EngineRole::Client,
+                forward::EngineConfig {
+                    tunnel_id: id,
+                    tuning: spec.kcp_tuning,
+                    kcp_mtu,
+                    idle_timeout_sec: spec.idle_timeout_sec,
+                    max_conns,
+                },
+                sink,
+                active.clone(),
+                metrics.clone(),
+                clock,
+                stop_rx.clone(),
+            );
+            tasks.spawn(engine.clone().accept_loop(listener));
+            info!(tunnel_id = id, addr = %listen, "client: tcp-forward listener bound");
+            engines.insert(port, engine);
+        }
+        forward::EngineSet::multi(engines, id)
+    } else {
+        let listener = bind_dualstack_tcp(local)
+            .map_err(|e| SpawnError::Io(crate::perf::bind_err(e, "client/tcp-listen", local)))?;
+        let sink: Arc<dyn DatagramSink> = Arc::new(ClientForwardSink {
+            upload: upload_transport.clone(),
+            session: SessionKey {
+                client_addr: local,
+                local_port: local.port(),
+            },
+            tag: None,
+            metrics: metrics.clone(),
+        });
+        let engine = forward::Engine::new(
+            forward::EngineRole::Client,
+            forward::EngineConfig {
+                tunnel_id: id,
+                tuning: spec.kcp_tuning,
+                kcp_mtu,
+                idle_timeout_sec: spec.idle_timeout_sec,
+                max_conns,
+            },
+            sink,
+            active.clone(),
+            metrics.clone(),
+            clock,
+            stop_rx.clone(),
+        );
+        tasks.spawn(engine.clone().accept_loop(listener));
+        info!(tunnel_id = id, addr = %local, "client: tcp-forward listener bound");
+        forward::EngineSet::single(engine, id)
+    };
+    Ok(PortRouter::Tcp(engine_set))
 }
 
 /// Upload listener task. When `tag_port` is `None` (single-port) the
@@ -986,6 +1161,17 @@ async fn deliver_verified_job(
     let verify_result = hmac::open_with(psk, sealed, window);
     match verify_result {
         Ok(payload) => {
+            // forward_protocol=tcp: the verified payload IS a KCP segment
+            // (still app-port-tagged in multi-port mode). Stamp the health
+            // metrics on verified arrival exactly like the UDP deliver path,
+            // then route it to the engine — which demuxes by conv id and
+            // reassembles the TCP stream. No UDP delivery.
+            if let PortRouter::Tcp(engine_set) = router {
+                metrics.record_download(payload.len(), now_unix());
+                metrics.record_transport_packet(transport_label);
+                engine_set.route_tagged(payload);
+                return;
+            }
             // Resolve the delivery target. Single-port: deliver the whole
             // verified payload via the one listener (wire-identical to
             // before). Multi-port: decode the authenticated 2-byte
@@ -993,6 +1179,7 @@ async fn deliver_verified_job(
             // set, and deliver the untagged body via that port's listener.
             let (listener, session_table, body): (&UdpSocket, &SessionTable, &[u8]) = match router {
                 PortRouter::Single { listener, sessions } => (listener, sessions, payload),
+                PortRouter::Tcp(_) => unreachable!("tcp router handled above"),
                 PortRouter::Multi(bindings) => {
                     let (port, body) = match multiport::decode_tag(payload) {
                         Some(v) => v,
