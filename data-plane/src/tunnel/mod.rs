@@ -45,7 +45,10 @@ use crate::manager::StateBroadcast;
 use crate::metrics::TunnelMetrics;
 use crate::protocol::TunnelState;
 use crate::rst_suppress::RstSuppressGuard;
-use crate::spec::{IcmpEchoMode, Role, Socks5Target, Transport, TunnelSpec, UploadListenMode};
+use crate::spec::{
+    ForwardProtocol, IcmpEchoMode, KcpTuning, Role, Socks5Target, Transport, TunnelSpec,
+    UploadListenMode,
+};
 
 /// Shared state slot used by the tunnel actor to publish its
 /// lifecycle status. Wrapped in `Arc<Mutex<T>>` so the spawn function
@@ -128,6 +131,19 @@ pub(crate) struct SpecSnapshot {
     /// UDP and SOCKS5/TCP rebinds the listener (different socket type
     /// entirely), so a change is operator-visible restart-required.
     pub upload_listen_mode: UploadListenMode,
+    /// v4.0.0 — forward protocol (udp / tcp). A udp↔tcp flip changes
+    /// the entire forwarding shape (UDP socket vs TCP listener + KCP
+    /// engine), so it is an internal restart.
+    pub forward_protocol: ForwardProtocol,
+    /// v4.0.0 — resolved KCP knobs. The engine freezes these at spawn,
+    /// so a tuning edit on a running tcp tunnel is an internal restart.
+    /// Tracked but only compared when tcp is involved (see
+    /// [`Self::internal_restart_field_differs`]).
+    pub kcp_tuning: KcpTuning,
+    /// Tunnel MTU. Hot-reloadable for udp tunnels; but the KCP engine
+    /// derives its frozen segment size from it, so for tcp tunnels an
+    /// MTU change is an internal restart.
+    pub mtu: u32,
 }
 
 impl SpecSnapshot {
@@ -145,6 +161,9 @@ impl SpecSnapshot {
             wireguard_fwmark: spec.wireguard_fwmark,
             socks5_target: spec.socks5_target.clone(),
             upload_listen_mode: spec.upload_listen_mode,
+            forward_protocol: spec.forward_protocol,
+            kcp_tuning: spec.kcp_tuning,
+            mtu: spec.mtu,
         }
     }
 
@@ -192,6 +211,15 @@ impl SpecSnapshot {
     ///   `Socks5Upload::resize_pool` (the manager handles this on the
     ///   hot-reload branch).
     pub fn internal_restart_field_differs(&self, spec: &TunnelSpec) -> bool {
+        // v4.0.0 — the KCP engine, its TCP listener/dialer, and its
+        // frozen segment size are all spawn-time-only. A forward-protocol
+        // flip, or (for a tcp tunnel) a KCP-tuning or MTU edit, must go
+        // through a clean Stop+Start — NOT a silent hot-reload no-op (the
+        // bug that shipped in the rolled-back v4). `kcp_tuning` and `mtu`
+        // are compared only when tcp is involved on either side, so a
+        // plain MTU edit on a udp tunnel stays hot-reloadable.
+        let tcp_involved = self.forward_protocol == ForwardProtocol::Tcp
+            || spec.forward_protocol == ForwardProtocol::Tcp;
         self.transport != Some(spec.download_transport)
             || self.icmp_echo_mode != spec.icmp_echo_mode
             || self.upload_target_addr != spec.upload_target_addr
@@ -200,6 +228,8 @@ impl SpecSnapshot {
             || self.download_send_port != spec.download_send_port
             || self.client_real_ip != spec.client_real_ip
             || self.wireguard_fwmark != spec.wireguard_fwmark
+            || self.forward_protocol != spec.forward_protocol
+            || (tcp_involved && (self.kcp_tuning != spec.kcp_tuning || self.mtu != spec.mtu))
     }
 
     /// True iff `spec` is identical to the snapshot across every field
@@ -679,6 +709,10 @@ mod classification_tests {
             socks5_target: None,
             upload_listen_mode: crate::spec::UploadListenMode::Udp,
             ports: Vec::new(),
+            forward_protocol: ForwardProtocol::Udp,
+            keep_alive: false,
+            keep_alive_interval_sec: 20,
+            kcp_tuning: KcpTuning::default(),
         }
     }
 

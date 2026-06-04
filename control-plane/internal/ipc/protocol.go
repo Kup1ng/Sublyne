@@ -148,6 +148,37 @@ type TunnelSpec struct {
 	PingSmoothingTargetMS uint32 `json:"ping_smoothing_target_ms,omitempty"`
 	PacingEnabled         bool   `json:"pacing_enabled,omitempty"`
 	PacingTargetMS        uint32 `json:"pacing_target_ms,omitempty"`
+
+	// ForwardProtocol (v4.0.0) — "udp" (default) or "tcp". Shared by both
+	// roles. Omitted (empty) means "udp": the dataplane takes the
+	// byte-for-byte-identical legacy path. "tcp" activates the KCP
+	// forwarding engine and KcpTuning carries the resolved knobs.
+	ForwardProtocol string `json:"forward_protocol,omitempty"`
+	// KeepAlive + KeepAliveIntervalSec (v4.0.0). When KeepAlive is true the
+	// dataplane maintains one artificial internal session so the tunnel
+	// never goes idle. The interval is how often the heartbeat fires
+	// (seconds). Both default to off / 20 s on the Rust side.
+	KeepAlive            bool   `json:"keep_alive,omitempty"`
+	KeepAliveIntervalSec uint32 `json:"keep_alive_interval_sec,omitempty"`
+	// KcpTuning carries the fully-resolved KCP knobs; set only when
+	// ForwardProtocol is "tcp". nil for udp tunnels.
+	KcpTuning *KcpTuning `json:"kcp_tuning,omitempty"`
+}
+
+// KcpTuning carries the resolved KCP knobs for a tcp-forwarding tunnel.
+// The Go side resolves them from the preset + per-knob overrides before
+// they reach the wire; the dataplane applies them verbatim. Mirrors the
+// Rust `KcpTuning` struct in data-plane/src/spec.rs.
+type KcpTuning struct {
+	NoDelay  uint32 `json:"nodelay"`
+	Interval uint32 `json:"interval"`
+	Resend   uint32 `json:"resend"`
+	NC       uint32 `json:"nc"`
+	SndWnd   uint32 `json:"snd_wnd"`
+	RcvWnd   uint32 `json:"rcv_wnd"`
+	// MTU caps the KCP segment size; 0 tells the dataplane to derive it
+	// from the tunnel MTU (clamped to ≤1280).
+	MTU uint32 `json:"mtu,omitempty"`
 }
 
 // Socks5Target carries everything the Rust dataplane needs to open

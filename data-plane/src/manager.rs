@@ -525,6 +525,10 @@ mod tests {
             socks5_target: None,
             upload_listen_mode: crate::spec::UploadListenMode::Udp,
             ports: Vec::new(),
+            forward_protocol: crate::spec::ForwardProtocol::Udp,
+            keep_alive: false,
+            keep_alive_interval_sec: 20,
+            kcp_tuning: crate::spec::KcpTuning::default(),
         };
         // This test requires CAP_NET_RAW for the raw socket open;
         // mark it ignored so unprivileged CI still passes. The
@@ -605,6 +609,10 @@ mod tests {
             socks5_target: None,
             upload_listen_mode: crate::spec::UploadListenMode::Udp,
             ports: vec![p_a, p_b],
+            forward_protocol: crate::spec::ForwardProtocol::Udp,
+            keep_alive: false,
+            keep_alive_interval_sec: 20,
+            kcp_tuning: crate::spec::KcpTuning::default(),
         };
         match mgr.start_tunnel(spec).await {
             Ok(()) => {
