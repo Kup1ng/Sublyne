@@ -53,8 +53,11 @@ const overlayClass = computed(() =>
 )
 
 const panelClass = computed(() => {
+  // overflow-hidden clips children to the rounded corners — without it the
+  // pinned footer's solid bg-surface paints square bottom corners over the
+  // panel's rounding.
   const base =
-    'relative flex w-full flex-col border border-line bg-surface outline-none shadow-[0_24px_64px_-24px_rgba(0,0,0,0.55)] animate-popIn'
+    'relative flex w-full flex-col overflow-hidden border border-line bg-surface outline-none shadow-[0_24px_64px_-24px_rgba(0,0,0,0.55)] animate-popIn'
   // A capped max-height + an overflow-y-auto body keeps the header and
   // footer pinned while only the content scrolls. mobileSheet fills the
   // screen below `sm` and snaps back to a centered card above it.
