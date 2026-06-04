@@ -16,6 +16,16 @@ asymmetric paths:
   carry a replayed sequence number, or carry an unknown session ID
   are silently dropped.
 
+Since **v4.0.0** a tunnel can forward **TCP** application traffic as well
+as UDP: set `forward_protocol = tcp` and a per-connection **KCP**
+reliability layer rides the same upload + spoofed-download pipeline and
+re-originates TCP to the destination, so a TCP proxy (VLESS-TCP, Trojan,
+WebSocket) survives the deliberately lossy download path. UDP forwarding
+remains the default and byte-for-byte unchanged. A per-tunnel
+**keep-alive** can hold a tunnel warm (and its dashboard badge green)
+with no real users connected. See
+[`docs/v4-hardware-test.md`](docs/v4-hardware-test.md).
+
 Sublyne is a clean fork of the
 [Port-Forwarding](https://github.com/Kup1ng/Port-Forwarding) project.
 It carries the same proven Rust data plane and Go control plane, with
