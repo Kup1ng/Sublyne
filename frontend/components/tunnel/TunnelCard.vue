@@ -1,5 +1,16 @@
 <script setup lang="ts">
-import { ArrowDown, ArrowUp, Activity, Cable, Play, Square, Pencil, Download, Copy } from 'lucide-vue-next'
+import {
+  ArrowDown,
+  ArrowUp,
+  Activity,
+  Cable,
+  Play,
+  Square,
+  Pencil,
+  Download,
+  Copy,
+  Zap,
+} from 'lucide-vue-next'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useTunnelActions } from '~/composables/useTunnelActions'
@@ -39,15 +50,17 @@ const portsLabel = computed(() => {
   const ports = props.tunnel.ports
   return ports && ports.length >= 1 ? ports.join(', ') : null
 })
+
+// v4.0.0: the keep-alive holds the tunnel warm with no real users. Shown
+// as a distinct chip so the operator can tell "Sessions: 0 + keep-alive"
+// (held warm) apart from a tunnel with real user sessions.
+const keepAliveActive = computed(() => props.rate?.keep_alive_active ?? false)
 </script>
 
 <template>
   <div class="surface-card group p-5 transition hover:border-line/100">
     <div class="flex items-start justify-between gap-3">
-      <NuxtLink
-        :to="`/tunnels/${tunnel.id}`"
-        class="flex min-w-0 items-center gap-3 outline-none"
-      >
+      <NuxtLink :to="`/tunnels/${tunnel.id}`" class="flex min-w-0 items-center gap-3 outline-none">
         <div class="grid size-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand">
           <Cable class="size-4" />
         </div>
@@ -65,26 +78,38 @@ const portsLabel = computed(() => {
       <TunnelStatusBadge :status="status" />
     </div>
 
-    <div v-if="portsLabel" class="mt-3">
-      <AppBadge tone="brand">Ports: {{ portsLabel }}</AppBadge>
+    <div v-if="portsLabel || keepAliveActive" class="mt-3 flex flex-wrap items-center gap-2">
+      <AppBadge v-if="portsLabel" tone="brand">Ports: {{ portsLabel }}</AppBadge>
+      <AppBadge
+        v-if="keepAliveActive"
+        tone="accent"
+        :pulse="true"
+        title="Held warm by the keep-alive — no real users connected"
+      >
+        <Zap class="size-3" />
+        keep-alive
+      </AppBadge>
     </div>
 
     <dl class="mt-4 grid grid-cols-3 gap-2 text-[12px]">
       <div class="rounded-lg bg-elevated/40 px-2.5 py-2">
         <dt class="flex items-center gap-1 text-faint">
-          <ArrowUp class="size-3" /> Upload
+          <ArrowUp class="size-3" />
+          Upload
         </dt>
         <dd class="tabular mt-0.5 text-[13.5px] font-medium text-ink">{{ upLabel }}</dd>
       </div>
       <div class="rounded-lg bg-elevated/40 px-2.5 py-2">
         <dt class="flex items-center gap-1 text-faint">
-          <ArrowDown class="size-3" /> Download
+          <ArrowDown class="size-3" />
+          Download
         </dt>
         <dd class="tabular mt-0.5 text-[13.5px] font-medium text-ink">{{ downLabel }}</dd>
       </div>
       <div class="rounded-lg bg-elevated/40 px-2.5 py-2">
         <dt class="flex items-center gap-1 text-faint">
-          <Activity class="size-3" /> Sessions
+          <Activity class="size-3" />
+          Sessions
         </dt>
         <dd class="tabular mt-0.5 text-[13.5px] font-medium text-ink">{{ sessionsLabel }}</dd>
       </div>

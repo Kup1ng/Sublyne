@@ -56,6 +56,12 @@ export type DownloadTransport = 'udp' | 'tcp_syn' | 'icmp' | 'icmpv6'
 export type IcmpEchoMode = 'reply' | 'request'
 export type UploadMode = 'wireguard' | 'socks5'
 export type UploadListenMode = 'udp' | 'socks5_tcp'
+// v4.0.0: what the tunnel forwards at the application layer. 'udp'
+// (default) is byte-identical legacy behaviour; 'tcp' carries a TCP
+// stream over a KCP reliability layer.
+export type ForwardProtocol = 'udp' | 'tcp'
+// v4.0.0: named KCP tuning baseline for tcp forwarding.
+export type ForwardEnginePreset = 'balanced' | 'interactive' | 'lossy'
 
 export interface Tunnel {
   id: number
@@ -91,6 +97,14 @@ export interface Tunnel {
   mtu?: number
   max_connections?: number
   idle_timeout?: number
+  // v4.0.0 forward protocol + keep-alive + KCP engine config. Shared by
+  // both roles. forward_engine_tuning is the raw JSON override string
+  // ('' = use the preset verbatim).
+  forward_protocol?: ForwardProtocol
+  keep_alive?: boolean
+  keep_alive_interval_sec?: number
+  forward_engine_preset?: ForwardEnginePreset
+  forward_engine_tuning?: string
   // Multi-port: the full authoritative list of application ports this
   // tunnel carries (INCLUDING the main port from local_listen_addr /
   // forward_target), with a fixed 1:1 same-number mapping on both sides.
@@ -206,6 +220,10 @@ export interface LiveTunnel {
   packets_in: number
   packets_out: number
   active_sessions: number
+  // v4.0.0: true while the per-tunnel keep-alive is holding the tunnel
+  // warm (reported separately from active_sessions, which stays
+  // user-only).
+  keep_alive_active?: boolean
   upload_rtt_ms_ewma: number
   download_rtt_ms_ewma: number
   packet_loss_estimate: number
@@ -220,6 +238,9 @@ export interface TunnelRate {
   bps_up: number
   bps_down: number
   sessions: number
+  // v4.0.0: the keep-alive indicator carried through from the live
+  // snapshot so the dashboard can show a distinct "keep-alive" badge.
+  keep_alive_active: boolean
   status: 'healthy' | 'idle' | 'down' | 'stopped'
   // The authoritative enabled flag from the live snapshot, so a tunnel
   // stopped in another tab reflects here without waiting for this tab to
